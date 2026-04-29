@@ -1,0 +1,5 @@
+threads/
+bridge-server/node_modules
+default-model
+*.log
+.DS_Store

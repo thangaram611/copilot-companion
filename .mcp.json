@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "copilot-bridge": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bridge-server/server.mjs"
+      ],
+      "env": {
+        "MCP_TOOL_TIMEOUT": "540000"
+      }
+    }
+  }
+}

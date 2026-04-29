@@ -1,0 +1,20 @@
+{
+  "name": "copilot-companion",
+  "version": "0.0.1",
+  "description": "GitHub Copilot delegation companion for Claude Code. Spawns a subagent that owns a dedicated MCP bridge + ACP daemon and delegates token-heavy tasks to Copilot CLI, freeing the parent's context.",
+  "author": {
+    "name": "thangaram611",
+    "email": "thangaram611@gmail.com",
+    "url": "https://github.com/thangaram611"
+  },
+  "homepage": "https://github.com/thangaram611/copilot-companion",
+  "repository": "https://github.com/thangaram611/copilot-companion",
+  "license": "MIT",
+  "keywords": [
+    "copilot",
+    "delegation",
+    "mcp",
+    "subagent",
+    "acp"
+  ]
+}
