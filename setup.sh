@@ -15,16 +15,20 @@ fail() { printf "${RED}[FAIL]${NC} %s\n" "$1"; }
 
 echo "=== copilot-companion v0.0.1 setup (plugin layout) ==="
 echo ""
-echo "This directory is a Claude Code plugin. Components live under the plugin"
-echo "root and load automatically on plugin enable:"
+echo "This directory is a Claude Code plugin. Subagent-scoped MCP architecture:"
 echo ""
 echo "    .claude-plugin/plugin.json       plugin manifest"
-echo "    agents/copilot-companion.md      subagent"
-echo "    .mcp.json                        copilot-bridge MCP server"
-echo "    hooks/hooks.json                 drain + dep-install hooks"
+echo "    templates/copilot-companion.md   subagent template (with inline mcpServers)"
+echo "    hooks/hooks.json                 SessionStart hooks: install-agent + prewarm + deps + drain"
+echo ""
+echo "On every session, hooks/install-agent.sh materializes the template into"
+echo "~/.claude/agents/copilot-companion.md (with \${CLAUDE_PLUGIN_ROOT} substituted)."
+echo "Because the agent lives under user scope, its inline mcpServers field is"
+echo "honored — main Claude never sees the bridge MCP, only the subagent does."
 echo ""
 echo "Preferred installation is via /plugin install (see README.md). This script"
-echo "is only needed for local-dev runs outside the plugin install flow."
+echo "is only needed if you want to materialize the agent file before the first"
+echo "Claude Code session, e.g. local-dev tinkering."
 echo ""
 
 # --- Step 1: Verify prerequisites -------------------------------------------
@@ -85,11 +89,12 @@ echo ""
 printf "Checking plugin surface...\n"
 for path in \
     "$SCRIPT_DIR/.claude-plugin/plugin.json" \
-    "$SCRIPT_DIR/agents/copilot-companion.md" \
-    "$SCRIPT_DIR/.mcp.json" \
+    "$SCRIPT_DIR/templates/copilot-companion.md" \
     "$SCRIPT_DIR/hooks/hooks.json" \
     "$SCRIPT_DIR/hooks/drain-completions.sh" \
-    "$SCRIPT_DIR/hooks/install-deps.sh"; do
+    "$SCRIPT_DIR/hooks/install-deps.sh" \
+    "$SCRIPT_DIR/hooks/install-agent.sh" \
+    "$SCRIPT_DIR/hooks/prewarm-daemon.sh"; do
   if [ -f "$path" ]; then
     ok "$(basename "$path")"
   else
@@ -97,6 +102,17 @@ for path in \
     exit 1
   fi
 done
+
+# Materialize the subagent now (instead of waiting for first SessionStart) —
+# matters when the user wants to invoke /agents in their very first session
+# without /reload-plugins. Idempotent.
+printf "Materializing subagent at ~/.claude/agents/copilot-companion.md...\n"
+CLAUDE_PLUGIN_ROOT="$SCRIPT_DIR" bash "$SCRIPT_DIR/hooks/install-agent.sh"
+if [ -f "$HOME/.claude/agents/copilot-companion.md" ]; then
+  ok "subagent installed at ~/.claude/agents/copilot-companion.md"
+else
+  warn "subagent install hook ran but file not found — check $SCRIPT_DIR/hooks/install-agent.sh"
+fi
 
 echo ""
 

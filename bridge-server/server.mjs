@@ -700,11 +700,13 @@ const mcp = new Server(
     capabilities: { tools: {} },
     instructions:
       'Internal MCP server for the copilot-companion subagent. Spawned inline ' +
-      'per invocation via subagent frontmatter (not registered at user scope). ' +
-      'Actions: send (blocking), wait, status, reply, cancel. The companion uses ' +
-      'send for kickoff then loops on wait until terminal. Completion events are ' +
-      'also appended to /tmp/copilot-completions.jsonl for the subagent\'s ' +
-      'frontmatter PostToolUse drain hook.',
+      'per invocation via the subagent\'s `mcpServers` frontmatter (the standalone ' +
+      'agent at ~/.claude/agents/copilot-companion.md, materialized by the ' +
+      'plugin\'s install-agent.sh SessionStart hook). Not registered at session ' +
+      'scope — main Claude does not see this tool surface. Actions: send ' +
+      '(blocking), wait, status, reply, cancel. The companion uses send for ' +
+      'kickoff then loops on wait until terminal. Completion events are also ' +
+      'appended to /tmp/copilot-completions.jsonl for the plugin\'s drain hooks.',
   },
 );
 
