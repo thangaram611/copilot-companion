@@ -18,6 +18,7 @@ import {
   coalesceTextChunks,
   buildPromptInspection,
 } from '../lib/prompt-inspect.mjs';
+import { socketPath, eventsPath, SECURE_FILE_MODE } from '../lib/paths.mjs';
 
 // --- Constants ---------------------------------------------------------------
 
@@ -42,7 +43,7 @@ const COPILOT_BIN = (() => {
     'copilot binary not found on PATH. Install GitHub Copilot CLI or set $COPILOT_BIN.'
   );
 })();
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
+const SOCKET_PATH = socketPath();
 const LOG_FILE = '/tmp/copilot-acp-daemon.log';
 const LOG_MAX_BYTES = 1024 * 1024; // 1 MB
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — safely above the 10-min prompt cap
@@ -533,7 +534,7 @@ class AcpConnection {
 // --- SessionManager ----------------------------------------------------------
 
 function eventsFilePath(promptId) {
-  return `/tmp/copilot-acp-${promptId}.jsonl`;
+  return eventsPath(promptId);
 }
 
 // Set of all terminal status values for an in-flight prompt. The long-poll
@@ -805,8 +806,9 @@ class SessionManager {
     const promptId = randomUUID();
     const eventsFile = eventsFilePath(promptId);
     const sessionMeta = this.sessions.get(sessionId);
-    // Reset / create the file
-    writeFileSync(eventsFile, '');
+    // Reset / create the file. mode 0o600 stops other local users from
+    // reading prompt content / tool I/O recorded here.
+    writeFileSync(eventsFile, '', { mode: SECURE_FILE_MODE });
 
     const state = {
       promptId,

@@ -17,9 +17,11 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
 
+import { socketPath } from '../lib/paths.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
+const SOCKET_PATH = socketPath();
 const DAEMON_PATH = process.env.COPILOT_DAEMON_PATH || (() => {
   const pluginPath = pathResolve(__dirname, '..', 'scripts', 'copilot-acp-daemon.mjs');
   if (existsSync(pluginPath)) return pluginPath;

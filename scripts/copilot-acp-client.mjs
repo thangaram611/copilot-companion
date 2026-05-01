@@ -10,7 +10,9 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
 
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
+import { socketPath } from '../lib/paths.mjs';
+
+const SOCKET_PATH = socketPath();
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DAEMON_PATH = pathResolve(__dirname, 'copilot-acp-daemon.mjs');
 const DAEMON_BOOT_TIMEOUT_MS = 8_000;

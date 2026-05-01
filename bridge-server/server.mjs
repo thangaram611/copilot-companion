@@ -44,20 +44,23 @@ import {
   DEFAULT_MODEL,
 } from '../lib/state.mjs';
 import { createReqId, withReq, logEvent } from '../lib/log.mjs';
+import { queuePath, eventsPath, SECURE_FILE_MODE } from '../lib/paths.mjs';
 
 // --- Queue (replaces dev-channel notifications) -----------------------------
 
-const QUEUE_PATH = process.env.COPILOT_QUEUE_PATH || '/tmp/copilot-completions.jsonl';
+const QUEUE_PATH = queuePath();
 
 function enqueueEvent(event) {
   // Synchronous append; writes are small (~1-5KB). `consumed:false` lets the
   // drain script filter out events already surfaced by a wait-terminal MCP
   // response — the subagent never sees the same event twice.
+  // mode 0o600 only applies on file creation; redundant on subsequent appends
+  // but cheap insurance.
   try {
     appendFileSync(
       QUEUE_PATH,
       JSON.stringify({ ts: Date.now(), consumed: false, ...event }) + '\n',
-      { encoding: 'utf8' },
+      { encoding: 'utf8', mode: SECURE_FILE_MODE },
     );
   } catch (err) {
     log('WARN', 'enqueue failed:', err.message);
@@ -78,7 +81,7 @@ function markQueueConsumed(jobId) {
     });
     if (!changed) return;
     const tmp = `${QUEUE_PATH}.consume.${process.pid}`;
-    writeFileSync(tmp, updated.join('\n') + '\n');
+    writeFileSync(tmp, updated.join('\n') + '\n', { mode: SECURE_FILE_MODE });
     renameSync(tmp, QUEUE_PATH);
   } catch (err) {
     log('WARN', 'markQueueConsumed failed:', err.message);
@@ -535,7 +538,7 @@ async function reconcileAfterTimeout(promptId) {
 
 function failedToolsFromJsonl(promptId) {
   try {
-    const content = readFileSync(`/tmp/copilot-acp-${promptId}.jsonl`, 'utf8');
+    const content = readFileSync(eventsPath(promptId), 'utf8');
     const byId = new Map();
     const names = new Set();
     for (const line of content.split('\n')) {
@@ -706,7 +709,7 @@ const mcp = new Server(
       'scope — main Claude does not see this tool surface. Actions: send ' +
       '(blocking), wait, status, reply, cancel. The companion uses send for ' +
       'kickoff then loops on wait until terminal. Completion events are also ' +
-      'appended to /tmp/copilot-completions.jsonl for the plugin\'s drain hooks.',
+      `appended to ${QUEUE_PATH} for the plugin's drain hooks.`,
   },
 );
 

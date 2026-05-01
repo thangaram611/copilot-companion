@@ -8,7 +8,26 @@
 # Empty queue → emits nothing → no injection, no context pollution.
 
 set -e
-QUEUE="${COPILOT_QUEUE_PATH:-/tmp/copilot-completions.jsonl}"
+
+# Per-user namespace — must match lib/paths.mjs::computeNamespace().
+# Three-tier fallback identical to the Node side:
+#   1. Numeric uid via `id -u` (the same value process.getuid() returns)
+#   2. Username via `id -un`, gated by the same regex Node uses
+#   3. 'shared' sentinel (last resort)
+# A divergence here causes the bridge and the drain hook to read/write
+# different files, which silently breaks completion surfacing.
+NS=""
+if NS_UID=$(id -u 2>/dev/null) && [ -n "$NS_UID" ] && [ "$NS_UID" -ge 0 ] 2>/dev/null; then
+  NS="uid${NS_UID}"
+elif NS_USER=$(id -un 2>/dev/null) && [ -n "$NS_USER" ] \
+     && printf '%s' "$NS_USER" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; then
+  NS="user-${NS_USER}"
+else
+  NS="shared"
+fi
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="${TMP_BASE%/}"
+QUEUE="${COPILOT_QUEUE_PATH:-${TMP_BASE}/copilot-completions-${NS}.jsonl}"
 
 # Read stdin payload so we can echo the firing event's name back in the
 # response. Claude Code drops additionalContext when hookEventName doesn't
