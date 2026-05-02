@@ -125,8 +125,21 @@ Expect ~1–3 prompts on a fresh install before the classifier settles — these
 ## Public surface
 
 You don't call the MCP tool directly. Main Claude reads the subagent's
-`description` and spawns it via `Agent()` when the user asks for Copilot
-delegation, status checks, replies, or cancellation.
+`description` and decides for itself when to spawn it via `Agent()`. Two
+dispatch paths:
+
+- **Explicit** — if your request mentions "copilot", "delegate", or "use
+  copilot", main Claude routes to the subagent immediately.
+- **Inferred** — for everything else, main Claude applies a 1-of-5
+  decision rule: dispatch if the task involves multi-file scope,
+  is self-contained, returns a code summary, asks for a second opinion,
+  or uses big-task verbs ("implement", "refactor", "audit", "build",
+  "migrate", "scan", "explore"). When uncertain, the framework biases
+  toward dispatch — that's why the plugin exists.
+
+See the subagent's [`templates/copilot-companion.md`](templates/copilot-companion.md)
+for the full decision criteria and calibration examples. Status checks,
+replies, and cancellations on running jobs follow the same routing.
 
 ### Internal MCP surface (subagent-only)
 

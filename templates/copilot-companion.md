@@ -1,10 +1,66 @@
 ---
 name: copilot-companion
 description: |
-  GitHub Copilot delegation companion. Spawn this subagent whenever the user
-  wants to delegate a task to Copilot, check a running Copilot job's state,
-  reply to (re-steer) an in-flight Copilot job, or cancel one. It owns the
-  entire copilot-bridge MCP surface — main Claude has no direct MCP access.
+  GitHub Copilot delegation companion. USE PROACTIVELY — make the dispatch
+  call yourself, do not wait for the user to ask. The plugin exists precisely
+  so token-heavy work is pushed out of the parent context.
+
+  Owns the entire copilot-bridge MCP surface — main Claude has no direct MCP
+  access, so dispatch is the only way to reach Copilot.
+
+  ## When to dispatch (apply on every user request)
+
+  ### Path 1 — User explicitly mentioned copilot
+  If the request contains "copilot", "delegate", "GitHub Copilot", "use
+  copilot", or any direct reference to delegation: dispatch immediately.
+  Skip the framework. The user named the tool.
+
+  ### Path 2 — No explicit signal
+  Dispatch if ANY ONE of these is true (1-of-5 eager rule):
+
+  1. **File breadth** — likely needs reading >5 files or scanning across
+     the codebase to locate something.
+  2. **Self-contained** — runs end-to-end without checking back with the
+     user mid-task.
+  3. **Output shape** — response is primarily a SUMMARY of code, not
+     REASONING the user is iterating on.
+  4. **Second opinion** — code review, plan critique, "is this approach
+     sound?" requests.
+  5. **Big task** — user verb implies scope: "implement", "refactor",
+     "audit", "build", "migrate", "scan", "explore", or estimated >5
+     minutes of work.
+
+  ### Override (NOT delegating, even if Path 2 says yes)
+  - User is iterating in a tight loop — refining, debugging step-by-step,
+    asking incremental follow-ups
+  - Task needs THIS conversation's context ("fix the bug we just
+    discussed", "match the style we agreed on")
+  - User says "do it yourself", "don't delegate", or "show your reasoning"
+  - Trivial work (<30 seconds)
+
+  ### Tiebreaker
+  If uncertain → dispatch. Over-delegation costs some latency; under-
+  delegation silently defeats the plugin's purpose.
+
+  Don't ask permission. Don't say "should I delegate this?". Decide and
+  dispatch. The user installed this plugin specifically so you'd make
+  the call.
+
+  ## Calibration examples
+
+  | Request | Path | Decision |
+  |---|---|---|
+  | "use copilot to scan the repo"           | 1 (explicit)          | dispatch |
+  | "delegate this audit"                    | 1 (explicit)          | dispatch |
+  | "scan the repo for unused exports"       | 2 — Q1, Q3, Q5        | dispatch |
+  | "refactor the auth middleware"           | 2 — Q1, Q5            | dispatch |
+  | "review my plan in docs/x.md"            | 2 — Q4                | dispatch |
+  | "implement feature Y" (multi-file)       | 2 — Q5                | dispatch |
+  | "audit error handling across the API"    | 2 — Q1, Q5            | dispatch |
+  | "what does foo() do?" (one file)         | 2 — none              | do directly |
+  | "fix this typo"                          | 2 — none; <30s        | do directly |
+  | "let's debug why this test fails"        | override (tight loop) | do directly |
+  | "tell me what changed last commit"       | 2 — none              | do directly |
 
   ## Invocation
 
