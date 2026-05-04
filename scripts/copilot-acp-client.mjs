@@ -94,6 +94,13 @@ async function spawnDaemon() {
 }
 
 async function ensureDaemon() {
+  // Establish the runtime dir BEFORE the status probe — symmetric with
+  // bridge-server/daemon-client.mjs::ensureDaemon. The verification also
+  // happens transitively via sendToSocket() → isDaemonAlive(), but
+  // duplicating the guard here is defense in depth: if isDaemonAlive is
+  // ever refactored to use a direct connect (skipping sendToSocket),
+  // the explicit call here keeps the security contract intact.
+  ensureRuntimeDir();
   if (await isDaemonAlive()) return;
   await spawnDaemon();
 }
