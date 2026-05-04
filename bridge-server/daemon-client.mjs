@@ -17,9 +17,11 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
 
+import { socketPath, ensureRuntimeDir } from '../lib/paths.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
+const SOCKET_PATH = socketPath();
 const DAEMON_PATH = process.env.COPILOT_DAEMON_PATH || (() => {
   const pluginPath = pathResolve(__dirname, '..', 'scripts', 'copilot-acp-daemon.mjs');
   if (existsSync(pluginPath)) return pluginPath;
@@ -32,6 +34,20 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 6 * 60 * 1000;
 
 export function sendToSocket(message, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
+    // Defense-in-depth: ensure the runtime dir on every connect, not only
+    // from ensureDaemon. Closes the class of bug where a future caller
+    // reaches sendToSocket directly (skipping ensureDaemon) and probes
+    // an attacker-planted socket inside an unverified parent dir.
+    // Wrapped inside the Promise so verification failures become Promise
+    // rejections rather than synchronous throws — keeps the API contract
+    // consistent (always returns a Promise) and lets assert.rejects /
+    // .catch handlers see the error uniformly.
+    try {
+      ensureRuntimeDir();
+    } catch (err) {
+      reject(err);
+      return;
+    }
     const sock = connectSocket(SOCKET_PATH);
     let buf = '';
     const timer = setTimeout(() => {
@@ -98,6 +114,15 @@ async function spawnDaemon() {
 }
 
 export async function ensureDaemon({ reqId } = {}) {
+  // Establish the runtime dir BEFORE the status probe. This is the
+  // critical call site for closing the socket pre-bind attack: without
+  // a verified 0o700 parent dir, a status probe could connect to a
+  // rogue UDS another local user planted at the predictable path and
+  // get back ok:true, causing us to skip the spawn and send subsequent
+  // prompts to the attacker. Once the dir is owner-only, no other uid
+  // can plant anything inside.
+  ensureRuntimeDir();
+
   // Try a short probe first — if the daemon is already up the cost is one
   // round-trip on the socket. Skip the longer status timeout since "alive"
   // here means "socket accepts a connection", not "everything healthy".

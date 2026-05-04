@@ -18,6 +18,7 @@ import {
   coalesceTextChunks,
   buildPromptInspection,
 } from '../lib/prompt-inspect.mjs';
+import { socketPath, eventsPath, ensureRuntimeDir, daemonLogPath, otelTracesPath, SECURE_FILE_MODE } from '../lib/paths.mjs';
 
 // --- Constants ---------------------------------------------------------------
 
@@ -42,8 +43,7 @@ const COPILOT_BIN = (() => {
     'copilot binary not found on PATH. Install GitHub Copilot CLI or set $COPILOT_BIN.'
   );
 })();
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
-const LOG_FILE = '/tmp/copilot-acp-daemon.log';
+const SOCKET_PATH = socketPath();
 const LOG_MAX_BYTES = 1024 * 1024; // 1 MB
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — safely above the 10-min prompt cap
 const PROMPT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per prompt — must be >= MAX_LONG_POLL_WAIT_MS or legitimate long prompts are killed and surface as "prompt timeout" failures instead of real answers
@@ -107,19 +107,53 @@ const LOG_LEVEL = (process.env.COPILOT_DAEMON_LOG_LEVEL || 'INFO').toUpperCase()
 const LOG_LEVEL_RANK = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40, FATAL: 50 };
 const LOG_THRESHOLD = LOG_LEVEL_RANK[LOG_LEVEL] ?? LOG_LEVEL_RANK.INFO;
 
+// One-shot tracking of an ensureRuntimeDir() failure so log() doesn't go
+// completely silent after the first hostile-dir verification reject. The
+// daemon log itself is unwritable in that case, but writing the diagnostic
+// to stderr at least surfaces the failure to the operator's terminal /
+// systemd journal / Claude Code transcript.
+let _logSecuritySurfaced = false;
+
 function log(level, ...args) {
   // Always write WARN/ERROR/FATAL and any non-standard level (e.g. COPILOT_STDERR).
   const rank = LOG_LEVEL_RANK[level];
   if (rank !== undefined && rank < LOG_THRESHOLD) return;
+  const ts = new Date().toISOString();
+  const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+  const line = `${ts} [${level}] ${msg}\n`;
+
+  // Establish the per-user 0o700 runtime dir before writing. Lazy here
+  // so log() can be called from boot-time code paths (model resolution,
+  // copilot-bin lookup, etc.) before IpcServer.start() has run.
+  //
+  // Critical: a security failure here (dir owned by attacker, wrong mode,
+  // symlink planted) MUST NOT be silently swallowed — that would let an
+  // attacker who can fail the invariants prevent ALL daemon logging
+  // without leaving a trail. Surface to stderr once and stop logging.
   try {
-    if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > LOG_MAX_BYTES) {
-      writeFileSync(LOG_FILE, '');
+    ensureRuntimeDir();
+  } catch (err) {
+    if (!_logSecuritySurfaced) {
+      _logSecuritySurfaced = true;
+      try {
+        process.stderr.write(
+          `[copilot-acp-daemon] ensureRuntimeDir failed; daemon log disabled: ${err.message}\n`
+        );
+      } catch {}
     }
-    const ts = new Date().toISOString();
-    const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-    appendFileSync(LOG_FILE, `${ts} [${level}] ${msg}\n`);
+    return;
+  }
+
+  // I/O failures (disk full, file permission flake) ARE best-effort —
+  // we don't want logging to crash the daemon over transient errors.
+  try {
+    const LOG_FILE = daemonLogPath();
+    if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > LOG_MAX_BYTES) {
+      writeFileSync(LOG_FILE, '', { mode: SECURE_FILE_MODE });
+    }
+    appendFileSync(LOG_FILE, line, { mode: SECURE_FILE_MODE });
   } catch {
-    // best-effort logging
+    // best-effort I/O — distinct from the security failure above
   }
 }
 
@@ -189,7 +223,11 @@ class AcpConnection {
 
   async spawn(cwd) {
     logSpawn(COPILOT_BIN, COPILOT_FLAGS);
-    const OTEL_TRACES_PATH = '/tmp/copilot-otel-traces.jsonl';
+    // Materialize the runtime dir before computing the OTel traces path.
+    // The traces file records prompt content + tool I/O — same secrets-y
+    // surface as daemon.log, so it MUST live inside the 0o700 dir.
+    ensureRuntimeDir();
+    const OTEL_TRACES_PATH = otelTracesPath();
     // Rotate OTel traces file if it exceeds 1 MB (same threshold as daemon log).
     try {
       if (existsSync(OTEL_TRACES_PATH) && statSync(OTEL_TRACES_PATH).size > LOG_MAX_BYTES) {
@@ -533,7 +571,7 @@ class AcpConnection {
 // --- SessionManager ----------------------------------------------------------
 
 function eventsFilePath(promptId) {
-  return `/tmp/copilot-acp-${promptId}.jsonl`;
+  return eventsPath(promptId);
 }
 
 // Set of all terminal status values for an in-flight prompt. The long-poll
@@ -805,8 +843,14 @@ class SessionManager {
     const promptId = randomUUID();
     const eventsFile = eventsFilePath(promptId);
     const sessionMeta = this.sessions.get(sessionId);
-    // Reset / create the file
-    writeFileSync(eventsFile, '');
+    // ensureRuntimeDir before creating the events file. Defense-in-depth:
+    // if the daemon was launched standalone (without prior bridge call),
+    // this is the first time we materialize anything in the runtime dir.
+    ensureRuntimeDir();
+    // Reset / create the file. mode 0o600 + parent dir mode 0o700 means
+    // other local users can neither read this file nor pre-create it as
+    // a symlink to redirect our writes.
+    writeFileSync(eventsFile, '', { mode: SECURE_FILE_MODE });
 
     const state = {
       promptId,
@@ -1229,6 +1273,11 @@ class IpcServer {
   }
 
   async start() {
+    // Establish the per-user 0o700 runtime dir before any socket probe
+    // or bind. Without a verified parent dir, the stale-socket detection
+    // below could be tricked by a rogue UDS another local user planted.
+    ensureRuntimeDir();
+
     // Stale socket detection: try to connect; if refused, unlink
     if (existsSync(SOCKET_PATH)) {
       const inUse = await new Promise((resolve) => {

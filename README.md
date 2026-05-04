@@ -144,13 +144,18 @@ Only useful if you want to inspect the bridge or daemon logs without prompts:
     "allow": [
       "Bash(tail:*)",
       "Bash(ps:*)",
+      "Bash(node:*)",
+      "Read(//var/folders/**)",
+      "Read(//run/user/**)",
       "Read(//tmp/**)"
     ]
   }
 }
 ```
 
-> **Note on glob syntax**: `Read(//tmp/**)` uses a **double slash** because Claude Code treats `/x` as project-relative and `//x` as an absolute path. `Read(/tmp/**)` would silently fail to match. See the [permissions docs](https://code.claude.com/docs/en/permissions) for the full path-prefix rules.
+> **Note on glob syntax**: `Read(//var/folders/**)` and the other path entries use a **double slash** because Claude Code treats `/x` as project-relative and `//x` as an absolute path. `Read(/tmp/**)` would silently fail to match. See the [permissions docs](https://code.claude.com/docs/en/permissions) for the full path-prefix rules.
+
+> **Why three Read paths?** Log/queue files live inside a per-user `0o700` runtime directory whose location depends on the platform: `/var/folders/.../T/` on macOS (the default `os.tmpdir()`), `/run/user/<uid>/` on Linux desktops with `$XDG_RUNTIME_DIR` set, or `/tmp/` as a fallback. The three glob entries cover all three cases. The `Bash(node:*)` entry is for the diagnostic one-liner that resolves the runtime dir at runtime (`node -e "import('${CLAUDE_PLUGIN_ROOT}/lib/paths.mjs').then(p=>console.log(p.runtimeDirPath()))"`) — used by the subagent's `mcp_unreachable` recovery path. If you've set a custom `$TMPDIR` outside the three covered locations, add `Read(//<your-tmpdir>/**)` accordingly, or accept a one-time prompt the first time the subagent diagnoses a daemon issue.
 
 ### Project-scope alternative
 
@@ -210,7 +215,7 @@ The same rule applies to the Agent-spawn `prompt` field: pass the JSON payload a
 1. **Strict isolation.** The `copilot-bridge` MCP server is bundled with the plugin but the subagent's `tools:` list is the only path through which it's invoked. Main never calls the bridge directly.
 2. **No activation lifecycle.** The bridge is spawned per subagent invocation by Claude Code's plugin MCP machinery. There's nothing to `start`, `stop`, or `pause`.
 3. **Bounded blocking.** `send` / `wait` always return within `max_wait_sec ≤ 540` so the MCP transport never hits the 600s idle cap.
-4. **Orphan safety net.** Completion events are appended to `/tmp/copilot-completions.jsonl` with `consumed:false`; wait-terminal responses flip to `consumed:true`; the drain hook surfaces only unconsumed entries.
+4. **Orphan safety net.** Completion events are appended to `<runtime-dir>/completions.jsonl` — a per-user `0o700` directory under `$XDG_RUNTIME_DIR` on Linux desktops (or `os.tmpdir()` elsewhere); see `lib/paths.mjs`. Each event is written with `consumed:false`; wait-terminal responses flip to `consumed:true`; the drain hook surfaces only unconsumed entries.
 5. **Rubber-duck always on.** Appended to every `send` server-side for every template except `plan_review` (which has its own critique instructions baked in). Not in the schema.
 6. **Model is config.** Read from `default-model` at worker start. Never a tool parameter.
 7. **Node deps persist, code doesn't.** `bridge-server/node_modules` lives under `${CLAUDE_PLUGIN_DATA}` and survives plugin updates; bundled code under `${CLAUDE_PLUGIN_ROOT}` is re-copied on update.

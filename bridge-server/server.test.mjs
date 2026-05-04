@@ -114,3 +114,84 @@ test('classifyRubberDuck: ignores unrelated words after prefix', async () => {
   assert.equal(classifyRubberDuck('RUBBER-DUCK: clear signal'), 'missing');
   assert.equal(classifyRubberDuck('RUBBER-DUCK: revival'), 'missing');
 });
+
+// ───── markQueueConsumed cold-start (regression guard for commit 213af04) ─────
+//
+// The 213af04 commit moved ensureRuntimeDir() to the top of markQueueConsumed
+// so the function is self-contained even when called against a queue file
+// that doesn't exist yet (e.g. cancel arrives before any enqueue).
+// A regression that re-orders existsSync above ensureRuntimeDir would
+// silently skip the security boundary in the cold-start case. Without this
+// test, that regression would go undetected.
+
+test('markQueueConsumed cold-start: creates runtime dir even when queue file absent', async () => {
+  const { mkdtempSync, lstatSync, rmSync, existsSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  if (typeof process.getuid !== 'function') return; // POSIX-only invariant
+
+  const beforeBase = process.env.COPILOT_RUNTIME_BASE;
+  const isolated = mkdtempSync(join(tmpdir(), 'mqc-test-'));
+  process.env.COPILOT_RUNTIME_BASE = isolated;
+
+  try {
+    // Cache-bust to capture per-test env (server.mjs caches QUEUE_PATH at load).
+    const mod = await import(`./server.mjs?cb=${Math.random()}`);
+
+    // Cold start: no queue file exists yet. Function should not throw,
+    // should create the runtime dir at 0o700, and should not create the
+    // queue file (no entries to mark).
+    mod.markQueueConsumed('nonexistent-job-id');
+
+    const dir = join(isolated, `copilot-companion-uid${process.getuid()}`);
+    assert.ok(existsSync(dir), `runtime dir not created at ${dir}`);
+    const st = lstatSync(dir);
+    assert.equal(st.mode & 0o777, 0o700,
+      `runtime dir mode must be 0o700, got ${(st.mode & 0o777).toString(8)}`);
+
+    // The queue file itself should NOT exist — there was nothing to consume.
+    const queueFile = join(dir, 'completions.jsonl');
+    assert.ok(!existsSync(queueFile),
+      `queue file should not be created on cold-start markQueueConsumed`);
+  } finally {
+    if (beforeBase === undefined) delete process.env.COPILOT_RUNTIME_BASE;
+    else process.env.COPILOT_RUNTIME_BASE = beforeBase;
+    try { rmSync(isolated, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('enqueueEvent cold-start: creates runtime dir + queue file at 0o600', async () => {
+  const { mkdtempSync, lstatSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  if (typeof process.getuid !== 'function') return;
+
+  const beforeBase = process.env.COPILOT_RUNTIME_BASE;
+  const isolated = mkdtempSync(join(tmpdir(), 'eq-test-'));
+  process.env.COPILOT_RUNTIME_BASE = isolated;
+
+  try {
+    const mod = await import(`./server.mjs?cb=${Math.random()}`);
+
+    mod.enqueueEvent({ kind: 'test', jobId: 'test-1', content: 'hello' });
+
+    const dir = join(isolated, `copilot-companion-uid${process.getuid()}`);
+    const queueFile = join(dir, 'completions.jsonl');
+    const dirSt = lstatSync(dir);
+    const fileSt = lstatSync(queueFile);
+
+    assert.equal(dirSt.mode & 0o777, 0o700, 'runtime dir must be 0o700');
+    assert.equal(fileSt.mode & 0o777, 0o600, 'queue file must be 0o600');
+
+    const body = readFileSync(queueFile, 'utf8');
+    const entry = JSON.parse(body.split('\n')[0]);
+    assert.equal(entry.kind, 'test');
+    assert.equal(entry.consumed, false);
+  } finally {
+    if (beforeBase === undefined) delete process.env.COPILOT_RUNTIME_BASE;
+    else process.env.COPILOT_RUNTIME_BASE = beforeBase;
+    try { rmSync(isolated, { recursive: true, force: true }); } catch {}
+  }
+});

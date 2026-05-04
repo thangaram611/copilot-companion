@@ -10,7 +10,9 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
 
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
+import { socketPath, ensureRuntimeDir } from '../lib/paths.mjs';
+
+const SOCKET_PATH = socketPath();
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DAEMON_PATH = pathResolve(__dirname, 'copilot-acp-daemon.mjs');
 const DAEMON_BOOT_TIMEOUT_MS = 8_000;
@@ -20,6 +22,19 @@ const REQUEST_TIMEOUT_MS = 6 * 60 * 1000; // a bit longer than daemon's prompt t
 
 function sendToSocket(message, timeoutMs = REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
+    // Establish the per-user 0o700 runtime dir BEFORE every connect.
+    // Centralized here so any code path that reaches the socket — status,
+    // watch, inspect, cancel, forget, stop, prompt-* — gets the security
+    // boundary verified, even when invoked standalone without going
+    // through ensureDaemon. Wrapped inside the Promise so verification
+    // failures become rejections rather than synchronous throws,
+    // matching the bridge-side sendToSocket contract.
+    try {
+      ensureRuntimeDir();
+    } catch (err) {
+      reject(err);
+      return;
+    }
     const sock = connectSocket(SOCKET_PATH);
     let buf = '';
     const timer = setTimeout(() => {
@@ -79,6 +94,13 @@ async function spawnDaemon() {
 }
 
 async function ensureDaemon() {
+  // Establish the runtime dir BEFORE the status probe — symmetric with
+  // bridge-server/daemon-client.mjs::ensureDaemon. The verification also
+  // happens transitively via sendToSocket() → isDaemonAlive(), but
+  // duplicating the guard here is defense in depth: if isDaemonAlive is
+  // ever refactored to use a direct connect (skipping sendToSocket),
+  // the explicit call here keeps the security contract intact.
+  ensureRuntimeDir();
   if (await isDaemonAlive()) return;
   await spawnDaemon();
 }
