@@ -21,14 +21,20 @@ const REQUEST_TIMEOUT_MS = 6 * 60 * 1000; // a bit longer than daemon's prompt t
 // --- Socket I/O --------------------------------------------------------------
 
 function sendToSocket(message, timeoutMs = REQUEST_TIMEOUT_MS) {
-  // Establish the per-user 0o700 runtime dir BEFORE every connect.
-  // Centralized here so any code path that reaches the socket — status,
-  // watch, inspect, cancel, forget, stop, prompt-* — gets the security
-  // boundary verified, even when invoked standalone without going
-  // through ensureDaemon. Closes the same pre-bound rogue socket attack
-  // class as the bridge-side fix in daemon-client.mjs.
-  ensureRuntimeDir();
   return new Promise((resolve, reject) => {
+    // Establish the per-user 0o700 runtime dir BEFORE every connect.
+    // Centralized here so any code path that reaches the socket — status,
+    // watch, inspect, cancel, forget, stop, prompt-* — gets the security
+    // boundary verified, even when invoked standalone without going
+    // through ensureDaemon. Wrapped inside the Promise so verification
+    // failures become rejections rather than synchronous throws,
+    // matching the bridge-side sendToSocket contract.
+    try {
+      ensureRuntimeDir();
+    } catch (err) {
+      reject(err);
+      return;
+    }
     const sock = connectSocket(SOCKET_PATH);
     let buf = '';
     const timer = setTimeout(() => {

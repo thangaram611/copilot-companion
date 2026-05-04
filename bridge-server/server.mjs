@@ -50,7 +50,9 @@ import { queuePath, eventsPath, ensureRuntimeDir, SECURE_FILE_MODE } from '../li
 
 const QUEUE_PATH = queuePath();
 
-function enqueueEvent(event) {
+// Exported for tests in server.test.mjs. The function is otherwise an
+// internal helper of this module; the export does not change behaviour.
+export function enqueueEvent(event) {
   // Synchronous append; writes are small (~1-5KB). `consumed:false` lets the
   // drain script filter out events already surfaced by a wait-terminal MCP
   // response — the subagent never sees the same event twice.
@@ -72,7 +74,9 @@ function enqueueEvent(event) {
   }
 }
 
-function markQueueConsumed(jobId) {
+// Exported for tests. Internal helper; external callers should not depend
+// on this — it may be refactored when the queue moves to a shared module.
+export function markQueueConsumed(jobId) {
   try {
     // Verify the runtime dir BEFORE the read. The dir's 0o700 perms gate
     // any pre-planted symlink at QUEUE_PATH; without this, a cold-start

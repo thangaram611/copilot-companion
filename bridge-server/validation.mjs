@@ -7,7 +7,7 @@
 //
 // Nothing in here opens sockets, spawns processes, or reads state files —
 // it's safe to import from tests without side effects other than appending
-// a line to /tmp/copilot-bridge.log on the `log()` helper.
+// a line to <runtime-dir>/bridge.log on the `log()` helper.
 
 import {
   readdirSync,
@@ -21,9 +21,14 @@ import {
 import { isAbsolute, join, sep as pathSep } from 'node:path';
 import { homedir } from 'node:os';
 
-// --- Logger -----------------------------------------------------------------
+import { bridgeLogPath, ensureRuntimeDir, SECURE_FILE_MODE } from '../lib/paths.mjs';
 
-export const BRIDGE_LOG_FILE = '/tmp/copilot-bridge.log';
+// --- Logger -----------------------------------------------------------------
+//
+// Lives inside the per-user 0o700 runtime dir (see lib/paths.mjs). Previously
+// at /tmp/copilot-bridge.log — world-readable, contradicted the security
+// claim of the runtime-dir migration.
+
 export const BRIDGE_LOG_MAX_BYTES = 1024 * 1024;
 
 export function log(level, ...args) {
@@ -31,19 +36,28 @@ export function log(level, ...args) {
   const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
   const line = `${ts} [${level}] ${msg}\n`;
   try {
-    if (existsSync(BRIDGE_LOG_FILE) && statSync(BRIDGE_LOG_FILE).size > BRIDGE_LOG_MAX_BYTES) {
+    // ensureRuntimeDir BEFORE the write. Lazy here so log() can fire from
+    // module-init paths (e.g. config-load failures) before any explicit
+    // server.start() has a chance to materialize the dir.
+    ensureRuntimeDir();
+    const bridgeLog = bridgeLogPath();
+    if (existsSync(bridgeLog) && statSync(bridgeLog).size > BRIDGE_LOG_MAX_BYTES) {
       // v6.1 C4: keep the previous log in .bak instead of truncating in
       // place. Truncate-on-rotate dropped the most recent diagnostic data
       // exactly when something went wrong enough to fill the log.
-      try { renameSync(BRIDGE_LOG_FILE, BRIDGE_LOG_FILE + '.bak'); }
-      catch { writeFileSync(BRIDGE_LOG_FILE, ''); }
+      try { renameSync(bridgeLog, bridgeLog + '.bak'); }
+      catch { writeFileSync(bridgeLog, '', { mode: SECURE_FILE_MODE }); }
     }
-    appendFileSync(BRIDGE_LOG_FILE, line);
-  } catch { /* best-effort */ }
+    appendFileSync(bridgeLog, line, { mode: SECURE_FILE_MODE });
+  } catch { /* best-effort — security failures and I/O errors both absorbed */ }
   if (level === 'WARN' || level === 'ERROR' || level === 'FATAL') {
     try { process.stderr.write(line); } catch {}
   }
 }
+
+// Backward-compat export for tests / external callers that referenced the
+// constant. Resolves dynamically so it follows the runtime-dir resolution.
+export function getBridgeLogFile() { return bridgeLogPath(); }
 
 // --- Constants --------------------------------------------------------------
 
