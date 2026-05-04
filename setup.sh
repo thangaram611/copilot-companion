@@ -135,7 +135,27 @@ fi
 
 echo ""
 
-# --- Step 5: Agent Teams env var --------------------------------------------
+# --- Step 5: Permission allow-list ------------------------------------------
+#
+# Without an explicit allow rule, the first invocation of mcp__copilot-bridge__copilot
+# in a session can surface a permission prompt — even with defaultMode "auto".
+# Plugin-shipped settings.json cannot declare permissions (Claude Code honors
+# only `agent` and `subagentStatusLine` there), so we merge the entry into the
+# user's ~/.claude/settings.json. Pure Node — no jq dependency. Fatal on
+# failure: Node was already validated at Step 1, so a failure here means a
+# malformed settings.json or a real fs error, both of which the user must see.
+
+printf "Granting MCP permission in ~/.claude/settings.json...\n"
+if node "$SCRIPT_DIR/scripts/install-permissions.mjs" --yes; then
+  ok "permission entry present"
+else
+  fail "permission step failed — see error above; re-run \`node scripts/install-permissions.mjs --yes\` after fixing"
+  exit 1
+fi
+
+echo ""
+
+# --- Step 6: Agent Teams env var --------------------------------------------
 
 printf "Checking Agent Teams configuration...\n"
 ZSHRC="$HOME/.zshrc"
@@ -151,7 +171,7 @@ fi
 
 echo ""
 
-# --- Step 6: Syntax-check all .mjs files ------------------------------------
+# --- Step 7: Syntax-check all .mjs files ------------------------------------
 
 printf "Syntax-checking scripts...\n"
 FAIL_COUNT=0
@@ -172,7 +192,7 @@ fi
 
 echo ""
 
-# --- Step 7: Run unit tests -------------------------------------------------
+# --- Step 8: Run unit tests -------------------------------------------------
 
 printf "Running unit tests...\n"
 if [ -f "$SCRIPT_DIR/lib/prompt-supervisor.test.mjs" ]; then

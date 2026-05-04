@@ -103,13 +103,45 @@ Once submitted and approved:
 
 ## Permissions (user setup)
 
-Plugin-level `settings.json` cannot declare `permissions` — only `agent` and `subagentStatusLine`. `defaultMode: "auto"` will surface a prompt on the first invocation of each tool; click "Yes, don't ask again" and you're set. To skip the prompts entirely, pre-populate the allow-list in your own `~/.claude/settings.json` (global) or `.claude/settings.local.json` (per-project, not checked in — recommended for teammates who only want Copilot in specific repos):
+The subagent invokes one MCP tool, `mcp__copilot-bridge__copilot`. Without an explicit allow rule, the first invocation in a session can surface a permission prompt — even with `defaultMode: "auto"`. Plugin-level `settings.json` cannot declare permissions (Claude Code honors only `agent` and `subagentStatusLine` there), so the entry must live in your user or project settings.
+
+**Pick whichever fits your install path:**
+
+### A. Source checkout (cloned repo, or running `--plugin-dir`)
+
+Run once from the repo root:
+
+```bash
+node scripts/install-permissions.mjs --yes
+```
+
+`setup.sh` already runs this as Step 5; the standalone command exists so you can re-run or pre-empt without re-running the full setup. The script is idempotent, takes a timestamped backup of `~/.claude/settings.json` before writing, and preserves the existing order of your allow list.
+
+### B. Marketplace install (`/plugin install copilot-companion@…`)
+
+The plugin source lives under `~/.claude/plugins/cache/<hash>/...`, which isn't a stable path to hand-type. Use either:
+
+1. **Click "Yes, don't ask again"** on the first permission prompt — Claude Code writes the entry to `~/.claude/settings.json` for you. One-time only.
+2. **Pre-populate `~/.claude/settings.json`** before your first session:
+   ```json
+   {
+     "permissions": {
+       "allow": [
+         "mcp__copilot-bridge__copilot"
+       ]
+     }
+   }
+   ```
+   Or use `/permissions` inside Claude Code to add the rule via UI.
+
+### Optional log-tailing diagnostics
+
+Only useful if you want to inspect the bridge or daemon logs without prompts:
 
 ```json
 {
   "permissions": {
     "allow": [
-      "mcp__plugin_copilot-companion_copilot-bridge__copilot",
       "Bash(tail:*)",
       "Bash(ps:*)",
       "Read(//tmp/**)"
@@ -120,7 +152,9 @@ Plugin-level `settings.json` cannot declare `permissions` — only `agent` and `
 
 > **Note on glob syntax**: `Read(//tmp/**)` uses a **double slash** because Claude Code treats `/x` as project-relative and `//x` as an absolute path. `Read(/tmp/**)` would silently fail to match. See the [permissions docs](https://code.claude.com/docs/en/permissions) for the full path-prefix rules.
 
-Expect ~1–3 prompts on a fresh install before the classifier settles — these are one-time.
+### Project-scope alternative
+
+Drop the same JSON into `.claude/settings.local.json` per repo if you'd rather only allow Copilot in specific projects (the file is gitignored by default and not checked in).
 
 ## Public surface
 
@@ -186,10 +220,10 @@ The same rule applies to the Agent-spawn `prompt` field: pass the JSON payload a
 The subagent declares these tools (full list in this plugin's `agents/copilot-companion.md` frontmatter):
 
 ```
-mcp__plugin_copilot-companion_copilot-bridge__copilot, Bash, Read, Write, Edit, Grep, Glob, WebFetch, TodoWrite
+mcp__copilot-bridge__copilot, Bash, Read, Write, Edit, Grep, Glob, WebFetch, TodoWrite
 ```
 
-`mcp__plugin_copilot-companion_copilot-bridge__copilot` is the canonical dispatch tool. All others exist for diagnostics, artifact handling, and self-sufficiency. See the frontmatter "Tool surface" and "Forbidden" sections for when each is appropriate.
+`mcp__copilot-bridge__copilot` is the canonical dispatch tool. All others exist for diagnostics, artifact handling, and self-sufficiency. See the frontmatter "Tool surface" and "Forbidden" sections for when each is appropriate.
 
 ## Development
 
