@@ -66,7 +66,21 @@ BASE="${BASE%/}"
 # the queue file won't exist and the `[ -s "$QUEUE" ]` check below
 # exits 0 cleanly. Re-creating the dir here would introduce a TOCTOU
 # (chmod 700 after mkdir is racy in shell).
-QUEUE="${COPILOT_QUEUE_PATH:-${BASE}/copilot-companion-${NS}/completions.jsonl}"
+#
+# Queue path: COPILOT_QUEUE_PATH wins if set, but goes through
+# validate_env_value() so empty/whitespace/control-char values fall
+# through to the computed runtime queue — matches Node's queuePath()
+# behaviour. The third env override that needs the same treatment as
+# COPILOT_RUNTIME_BASE and XDG_RUNTIME_DIR; missing it would let
+# `COPILOT_QUEUE_PATH=' /tmp/q.jsonl '` (whitespace) or
+# `COPILOT_QUEUE_PATH=$'/tmp/q.jsonl\n'` (newline) silently route the
+# drain to a different file than the bridge writes to.
+COPILOT_QUEUE_PATH_VALID="$(validate_env_value "${COPILOT_QUEUE_PATH:-}")"
+if [ -n "$COPILOT_QUEUE_PATH_VALID" ]; then
+  QUEUE="$COPILOT_QUEUE_PATH_VALID"
+else
+  QUEUE="${BASE}/copilot-companion-${NS}/completions.jsonl"
+fi
 
 # Read stdin payload so we can echo the firing event's name back in the
 # response. Claude Code drops additionalContext when hookEventName doesn't
