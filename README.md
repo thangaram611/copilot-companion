@@ -112,13 +112,18 @@ Plugin-level `settings.json` cannot declare `permissions` — only `agent` and `
       "mcp__plugin_copilot-companion_copilot-bridge__copilot",
       "Bash(tail:*)",
       "Bash(ps:*)",
+      "Bash(node:*)",
+      "Read(//var/folders/**)",
+      "Read(//run/user/**)",
       "Read(//tmp/**)"
     ]
   }
 }
 ```
 
-> **Note on glob syntax**: `Read(//tmp/**)` uses a **double slash** because Claude Code treats `/x` as project-relative and `//x` as an absolute path. `Read(/tmp/**)` would silently fail to match. See the [permissions docs](https://code.claude.com/docs/en/permissions) for the full path-prefix rules.
+> **Note on glob syntax**: `Read(//var/folders/**)` and the other path entries use a **double slash** because Claude Code treats `/x` as project-relative and `//x` as an absolute path. `Read(/tmp/**)` would silently fail to match. See the [permissions docs](https://code.claude.com/docs/en/permissions) for the full path-prefix rules.
+
+> **Why three Read paths?** As of v0.0.2, log/queue files live inside a per-user `0o700` runtime directory whose location depends on the platform: `/var/folders/.../T/` on macOS (the default `os.tmpdir()`), `/run/user/<uid>/` on Linux desktops with `$XDG_RUNTIME_DIR` set, or `/tmp/` as a fallback. The three glob entries cover all three cases. The `Bash(node:*)` entry is for the diagnostic one-liner that resolves the runtime dir at runtime (`node -e "import('${CLAUDE_PLUGIN_ROOT}/lib/paths.mjs').then(p=>console.log(p.runtimeDirPath()))"`) — used by the subagent's `mcp_unreachable` recovery path. If you've set a custom `$TMPDIR` outside the three covered locations, add `Read(//<your-tmpdir>/**)` accordingly, or accept a one-time prompt the first time the subagent diagnoses a daemon issue.
 
 Expect ~1–3 prompts on a fresh install before the classifier settles — these are one-time.
 
