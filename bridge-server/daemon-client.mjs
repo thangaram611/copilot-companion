@@ -33,6 +33,12 @@ const DAEMON_BOOT_TIMEOUT_MS = Number(process.env.COPILOT_DAEMON_BOOT_MS) || 8_0
 const DEFAULT_REQUEST_TIMEOUT_MS = 6 * 60 * 1000;
 
 export function sendToSocket(message, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+  // Defense-in-depth: ensure the runtime dir on every connect, not only
+  // from ensureDaemon. Closes the class of bug where a future caller
+  // reaches sendToSocket directly (skipping ensureDaemon) and probes
+  // an attacker-planted socket inside an unverified parent dir.
+  // Idempotent and cheap (mkdir+lstat).
+  ensureRuntimeDir();
   return new Promise((resolve, reject) => {
     const sock = connectSocket(SOCKET_PATH);
     let buf = '';

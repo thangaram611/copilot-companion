@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
 
-import { socketPath } from '../lib/paths.mjs';
+import { socketPath, ensureRuntimeDir } from '../lib/paths.mjs';
 
 const SOCKET_PATH = socketPath();
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,6 +21,13 @@ const REQUEST_TIMEOUT_MS = 6 * 60 * 1000; // a bit longer than daemon's prompt t
 // --- Socket I/O --------------------------------------------------------------
 
 function sendToSocket(message, timeoutMs = REQUEST_TIMEOUT_MS) {
+  // Establish the per-user 0o700 runtime dir BEFORE every connect.
+  // Centralized here so any code path that reaches the socket — status,
+  // watch, inspect, cancel, forget, stop, prompt-* — gets the security
+  // boundary verified, even when invoked standalone without going
+  // through ensureDaemon. Closes the same pre-bound rogue socket attack
+  // class as the bridge-side fix in daemon-client.mjs.
+  ensureRuntimeDir();
   return new Promise((resolve, reject) => {
     const sock = connectSocket(SOCKET_PATH);
     let buf = '';
