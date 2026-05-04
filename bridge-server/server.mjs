@@ -74,6 +74,12 @@ function enqueueEvent(event) {
 
 function markQueueConsumed(jobId) {
   try {
+    // Verify the runtime dir BEFORE the read. The dir's 0o700 perms gate
+    // any pre-planted symlink at QUEUE_PATH; without this, a cold-start
+    // read of an attacker-planted file is theoretically possible. In
+    // practice enqueueEvent always runs first and verifies, but the
+    // function should be self-contained.
+    ensureRuntimeDir();
     if (!existsSync(QUEUE_PATH)) return;
     const lines = readFileSync(QUEUE_PATH, 'utf8').split('\n').filter(Boolean);
     let changed = false;
@@ -85,9 +91,6 @@ function markQueueConsumed(jobId) {
       } catch { return line; }
     });
     if (!changed) return;
-    // Same security boundary: tmp file lives inside the runtime dir, and
-    // the rename is intra-dir so atomic.
-    ensureRuntimeDir();
     const tmp = `${QUEUE_PATH}.consume.${process.pid}`;
     writeFileSync(tmp, updated.join('\n') + '\n', { mode: SECURE_FILE_MODE });
     renameSync(tmp, QUEUE_PATH);

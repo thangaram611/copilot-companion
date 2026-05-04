@@ -18,7 +18,7 @@ import {
   coalesceTextChunks,
   buildPromptInspection,
 } from '../lib/prompt-inspect.mjs';
-import { socketPath, eventsPath, ensureRuntimeDir, SECURE_FILE_MODE } from '../lib/paths.mjs';
+import { socketPath, eventsPath, ensureRuntimeDir, daemonLogPath, SECURE_FILE_MODE } from '../lib/paths.mjs';
 
 // --- Constants ---------------------------------------------------------------
 
@@ -44,7 +44,6 @@ const COPILOT_BIN = (() => {
   );
 })();
 const SOCKET_PATH = socketPath();
-const LOG_FILE = '/tmp/copilot-acp-daemon.log';
 const LOG_MAX_BYTES = 1024 * 1024; // 1 MB
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — safely above the 10-min prompt cap
 const PROMPT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per prompt — must be >= MAX_LONG_POLL_WAIT_MS or legitimate long prompts are killed and surface as "prompt timeout" failures instead of real answers
@@ -113,6 +112,11 @@ function log(level, ...args) {
   const rank = LOG_LEVEL_RANK[level];
   if (rank !== undefined && rank < LOG_THRESHOLD) return;
   try {
+    // Establish the per-user 0o700 runtime dir before writing. Lazy here
+    // so log() can be called from boot-time code paths (model resolution,
+    // copilot-bin lookup, etc.) before IpcServer.start() has run.
+    ensureRuntimeDir();
+    const LOG_FILE = daemonLogPath();
     if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > LOG_MAX_BYTES) {
       writeFileSync(LOG_FILE, '');
     }
@@ -120,7 +124,8 @@ function log(level, ...args) {
     const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
     appendFileSync(LOG_FILE, `${ts} [${level}] ${msg}\n`);
   } catch {
-    // best-effort logging
+    // best-effort logging — the catch absorbs any ensureRuntimeDir
+    // verification failure too, keeping log() side-effect-only.
   }
 }
 
