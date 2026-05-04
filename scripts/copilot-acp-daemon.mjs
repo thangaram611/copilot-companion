@@ -18,7 +18,7 @@ import {
   coalesceTextChunks,
   buildPromptInspection,
 } from '../lib/prompt-inspect.mjs';
-import { socketPath, eventsPath, SECURE_FILE_MODE } from '../lib/paths.mjs';
+import { socketPath, eventsPath, ensureRuntimeDir, SECURE_FILE_MODE } from '../lib/paths.mjs';
 
 // --- Constants ---------------------------------------------------------------
 
@@ -806,8 +806,13 @@ class SessionManager {
     const promptId = randomUUID();
     const eventsFile = eventsFilePath(promptId);
     const sessionMeta = this.sessions.get(sessionId);
-    // Reset / create the file. mode 0o600 stops other local users from
-    // reading prompt content / tool I/O recorded here.
+    // ensureRuntimeDir before creating the events file. Defense-in-depth:
+    // if the daemon was launched standalone (without prior bridge call),
+    // this is the first time we materialize anything in the runtime dir.
+    ensureRuntimeDir();
+    // Reset / create the file. mode 0o600 + parent dir mode 0o700 means
+    // other local users can neither read this file nor pre-create it as
+    // a symlink to redirect our writes.
     writeFileSync(eventsFile, '', { mode: SECURE_FILE_MODE });
 
     const state = {
@@ -1231,6 +1236,11 @@ class IpcServer {
   }
 
   async start() {
+    // Establish the per-user 0o700 runtime dir before any socket probe
+    // or bind. Without a verified parent dir, the stale-socket detection
+    // below could be tricked by a rogue UDS another local user planted.
+    ensureRuntimeDir();
+
     // Stale socket detection: try to connect; if refused, unlink
     if (existsSync(SOCKET_PATH)) {
       const inUse = await new Promise((resolve) => {

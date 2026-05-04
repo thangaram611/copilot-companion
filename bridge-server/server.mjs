@@ -44,7 +44,7 @@ import {
   DEFAULT_MODEL,
 } from '../lib/state.mjs';
 import { createReqId, withReq, logEvent } from '../lib/log.mjs';
-import { queuePath, eventsPath, SECURE_FILE_MODE } from '../lib/paths.mjs';
+import { queuePath, eventsPath, ensureRuntimeDir, SECURE_FILE_MODE } from '../lib/paths.mjs';
 
 // --- Queue (replaces dev-channel notifications) -----------------------------
 
@@ -57,6 +57,11 @@ function enqueueEvent(event) {
   // mode 0o600 only applies on file creation; redundant on subsequent appends
   // but cheap insurance.
   try {
+    // ensureRuntimeDir before any write: the parent dir's 0o700 perms are
+    // what stop another local user from pre-creating the queue file as a
+    // symlink and redirecting our writes. Idempotent and cheap; safe to
+    // call on every enqueue.
+    ensureRuntimeDir();
     appendFileSync(
       QUEUE_PATH,
       JSON.stringify({ ts: Date.now(), consumed: false, ...event }) + '\n',
@@ -80,6 +85,9 @@ function markQueueConsumed(jobId) {
       } catch { return line; }
     });
     if (!changed) return;
+    // Same security boundary: tmp file lives inside the runtime dir, and
+    // the rename is intra-dir so atomic.
+    ensureRuntimeDir();
     const tmp = `${QUEUE_PATH}.consume.${process.pid}`;
     writeFileSync(tmp, updated.join('\n') + '\n', { mode: SECURE_FILE_MODE });
     renameSync(tmp, QUEUE_PATH);

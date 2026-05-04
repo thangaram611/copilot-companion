@@ -17,7 +17,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
 
-import { socketPath } from '../lib/paths.mjs';
+import { socketPath, ensureRuntimeDir } from '../lib/paths.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -100,6 +100,15 @@ async function spawnDaemon() {
 }
 
 export async function ensureDaemon({ reqId } = {}) {
+  // Establish the runtime dir BEFORE the status probe. This is the
+  // critical call site for closing the socket pre-bind attack: without
+  // a verified 0o700 parent dir, a status probe could connect to a
+  // rogue UDS another local user planted at the predictable path and
+  // get back ok:true, causing us to skip the spawn and send subsequent
+  // prompts to the attacker. Once the dir is owner-only, no other uid
+  // can plant anything inside.
+  ensureRuntimeDir();
+
   // Try a short probe first — if the daemon is already up the cost is one
   // round-trip on the socket. Skip the longer status timeout since "alive"
   // here means "socket accepts a connection", not "everything healthy".

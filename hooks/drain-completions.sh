@@ -25,9 +25,24 @@ elif NS_USER=$(id -un 2>/dev/null) && [ -n "$NS_USER" ] \
 else
   NS="shared"
 fi
-TMP_BASE="${TMPDIR:-/tmp}"
-TMP_BASE="${TMP_BASE%/}"
-QUEUE="${COPILOT_QUEUE_PATH:-${TMP_BASE}/copilot-completions-${NS}.jsonl}"
+
+# Runtime base — must match _runtimeDirBase() in lib/paths.mjs.
+# Resolution order: COPILOT_RUNTIME_BASE → XDG_RUNTIME_DIR (uid > 0) → TMPDIR/tmp.
+if [ -n "$COPILOT_RUNTIME_BASE" ]; then
+  BASE="$COPILOT_RUNTIME_BASE"
+elif [ -n "$XDG_RUNTIME_DIR" ] && [ "${NS_UID:-0}" -gt 0 ] 2>/dev/null; then
+  BASE="$XDG_RUNTIME_DIR"
+else
+  BASE="${TMPDIR:-/tmp}"
+fi
+BASE="${BASE%/}"
+
+# The runtime dir is created and verified by the daemon (Node side).
+# This script DOES NOT create or verify it — if the daemon never ran,
+# the queue file won't exist and the `[ -s "$QUEUE" ]` check below
+# exits 0 cleanly. Re-creating the dir here would introduce a TOCTOU
+# (chmod 700 after mkdir is racy in shell).
+QUEUE="${COPILOT_QUEUE_PATH:-${BASE}/copilot-companion-${NS}/completions.jsonl}"
 
 # Read stdin payload so we can echo the firing event's name back in the
 # response. Claude Code drops additionalContext when hookEventName doesn't
