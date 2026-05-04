@@ -553,6 +553,12 @@ async function reconcileAfterTimeout(promptId) {
 
 function failedToolsFromJsonl(promptId) {
   try {
+    // Consistency: every other access to the runtime dir invokes
+    // ensureRuntimeDir() first. The read here can't be redirected by an
+    // attacker (UUID-validated path, file written by daemon inside the
+    // verified dir), but a fresh bridge process that has never enqueued
+    // could reach this without prior verification.
+    ensureRuntimeDir();
     const content = readFileSync(eventsPath(promptId), 'utf8');
     const byId = new Map();
     const names = new Set();

@@ -20,8 +20,13 @@ import { join } from 'node:path';
 
 // Defensive: a developer with these vars exported in their shell would
 // get misleading test results. Strip them at the test-file level.
+// XDG_RUNTIME_DIR included because _runtimeDirBase() consults it; on a
+// Linux CI host with XDG_RUNTIME_DIR set, our COPILOT_RUNTIME_BASE
+// override still wins (it's checked first), but stripping XDG removes
+// the dependency on that ordering and avoids surprises if precedence
+// is ever reordered.
 before(() => {
-  for (const k of ['COPILOT_SOCKET_PATH', 'COPILOT_QUEUE_PATH']) {
+  for (const k of ['COPILOT_SOCKET_PATH', 'COPILOT_QUEUE_PATH', 'XDG_RUNTIME_DIR']) {
     delete process.env[k];
   }
 });

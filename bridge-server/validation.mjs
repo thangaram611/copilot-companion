@@ -31,33 +31,58 @@ import { bridgeLogPath, ensureRuntimeDir, SECURE_FILE_MODE } from '../lib/paths.
 
 export const BRIDGE_LOG_MAX_BYTES = 1024 * 1024;
 
+// One-shot tracking of an ensureRuntimeDir() failure so we don't spam
+// stderr on every WARN/ERROR/FATAL line after the dir verification has
+// already been rejected once. Logging recovery requires a process restart
+// once tripped — fine for the bridge since it's a per-invocation process.
+let _logSecuritySurfaced = false;
+
 export function log(level, ...args) {
   const ts = new Date().toISOString();
   const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
   const line = `${ts} [${level}] ${msg}\n`;
+
+  // Critical: a security failure here (dir owned by attacker, wrong mode,
+  // symlink planted) MUST NOT be silently swallowed — that would let an
+  // attacker who can fail the invariants prevent ALL bridge logging
+  // without leaving a trail. Surface to stderr once and disable further
+  // file logging for this process. I/O failures (disk full, etc.) stay
+  // best-effort below.
+  let dirOk = true;
   try {
-    // ensureRuntimeDir BEFORE the write. Lazy here so log() can fire from
-    // module-init paths (e.g. config-load failures) before any explicit
-    // server.start() has a chance to materialize the dir.
     ensureRuntimeDir();
-    const bridgeLog = bridgeLogPath();
-    if (existsSync(bridgeLog) && statSync(bridgeLog).size > BRIDGE_LOG_MAX_BYTES) {
-      // v6.1 C4: keep the previous log in .bak instead of truncating in
-      // place. Truncate-on-rotate dropped the most recent diagnostic data
-      // exactly when something went wrong enough to fill the log.
-      try { renameSync(bridgeLog, bridgeLog + '.bak'); }
-      catch { writeFileSync(bridgeLog, '', { mode: SECURE_FILE_MODE }); }
+  } catch (err) {
+    dirOk = false;
+    if (!_logSecuritySurfaced) {
+      _logSecuritySurfaced = true;
+      try {
+        process.stderr.write(
+          `[copilot-bridge] ensureRuntimeDir failed; bridge log disabled: ${err.message}\n`
+        );
+      } catch {}
     }
-    appendFileSync(bridgeLog, line, { mode: SECURE_FILE_MODE });
-  } catch { /* best-effort — security failures and I/O errors both absorbed */ }
+  }
+
+  if (dirOk) {
+    try {
+      const bridgeLog = bridgeLogPath();
+      if (existsSync(bridgeLog) && statSync(bridgeLog).size > BRIDGE_LOG_MAX_BYTES) {
+        // v6.1 C4: keep the previous log in .bak instead of truncating in
+        // place. Truncate-on-rotate dropped the most recent diagnostic data
+        // exactly when something went wrong enough to fill the log.
+        try { renameSync(bridgeLog, bridgeLog + '.bak'); }
+        catch { writeFileSync(bridgeLog, '', { mode: SECURE_FILE_MODE }); }
+      }
+      appendFileSync(bridgeLog, line, { mode: SECURE_FILE_MODE });
+    } catch { /* best-effort I/O — distinct from the security failure above */ }
+  }
+
+  // High-severity always also goes to stderr regardless of dir state, so
+  // operators can see errors when the log file is unreachable.
   if (level === 'WARN' || level === 'ERROR' || level === 'FATAL') {
     try { process.stderr.write(line); } catch {}
   }
 }
-
-// Backward-compat export for tests / external callers that referenced the
-// constant. Resolves dynamically so it follows the runtime-dir resolution.
-export function getBridgeLogFile() { return bridgeLogPath(); }
 
 // --- Constants --------------------------------------------------------------
 
