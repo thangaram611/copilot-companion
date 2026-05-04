@@ -27,6 +27,13 @@ validate_env_value() {
   # Trim trailing whitespace
   v="${v%"${v##*[![:space:]]}"}"
   [ -n "$v" ] && printf '%s' "$v"
+  # CRITICAL: must return 0 unconditionally. The hook runs under set -e,
+  # and command substitutions like `X=$(validate_env_value "$Y")` propagate
+  # the function's exit code. If $v is empty/whitespace-only, the
+  # `[ -n "$v" ]` test above returns 1, which would abort the entire hook
+  # before reaching the fallback resolver. Rejection is signaled by empty
+  # OUTPUT, never by exit code.
+  return 0
 }
 
 # Per-user namespace — must match lib/paths.mjs::computeNamespace().
