@@ -9,18 +9,38 @@
 
 set -e
 
+# validate_env_value — mirrors lib/paths.mjs::envOverride()
+# Returns the trimmed value if it's a valid override, empty otherwise.
+# Rejects unset/empty, values containing \r/\n/\t, and whitespace-only.
+# Trims leading/trailing whitespace from accepted values.
+# Stays in sync with the Node side; without this, the bridge writes to
+# one runtime dir while the hook drains another, silently dropping
+# completion surfacing.
+validate_env_value() {
+  local v="$1"
+  [ -z "$v" ] && return 0
+  case "$v" in
+    *$'\r'*|*$'\n'*|*$'\t'*) return 0 ;;
+  esac
+  # Trim leading whitespace
+  v="${v#"${v%%[![:space:]]*}"}"
+  # Trim trailing whitespace
+  v="${v%"${v##*[![:space:]]}"}"
+  [ -n "$v" ] && printf '%s' "$v"
+}
+
 # Per-user namespace — must match lib/paths.mjs::computeNamespace().
 # Three-tier fallback identical to the Node side:
 #   1. Numeric uid via `id -u` (the same value process.getuid() returns)
-#   2. Username via `id -un`, gated by the same regex Node uses
+#   2. Username via `id -un`, gated by the same 64-char regex Node uses
 #   3. 'shared' sentinel (last resort)
-# A divergence here causes the bridge and the drain hook to read/write
-# different files, which silently breaks completion surfacing.
+# Username cap is 64 chars (matches lib/paths.mjs after commit 213af04).
+# Earlier 32-char cap silently collapsed LDAP/AD users into 'shared'.
 NS=""
 if NS_UID=$(id -u 2>/dev/null) && [ -n "$NS_UID" ] && [ "$NS_UID" -ge 0 ] 2>/dev/null; then
   NS="uid${NS_UID}"
 elif NS_USER=$(id -un 2>/dev/null) && [ -n "$NS_USER" ] \
-     && printf '%s' "$NS_USER" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; then
+     && printf '%s' "$NS_USER" | grep -qE '^[A-Za-z0-9._-]{1,64}$'; then
   NS="user-${NS_USER}"
 else
   NS="shared"
@@ -28,10 +48,14 @@ fi
 
 # Runtime base — must match _runtimeDirBase() in lib/paths.mjs.
 # Resolution order: COPILOT_RUNTIME_BASE → XDG_RUNTIME_DIR (uid > 0) → TMPDIR/tmp.
-if [ -n "$COPILOT_RUNTIME_BASE" ]; then
-  BASE="$COPILOT_RUNTIME_BASE"
-elif [ -n "$XDG_RUNTIME_DIR" ] && [ "${NS_UID:-0}" -gt 0 ] 2>/dev/null; then
-  BASE="$XDG_RUNTIME_DIR"
+# Both env vars go through validate_env_value() so empty/whitespace/control-
+# char values fall through to the next tier — matching Node's behaviour.
+COPILOT_RUNTIME_BASE_VALID="$(validate_env_value "${COPILOT_RUNTIME_BASE:-}")"
+XDG_RUNTIME_DIR_VALID="$(validate_env_value "${XDG_RUNTIME_DIR:-}")"
+if [ -n "$COPILOT_RUNTIME_BASE_VALID" ]; then
+  BASE="$COPILOT_RUNTIME_BASE_VALID"
+elif [ -n "$XDG_RUNTIME_DIR_VALID" ] && [ "${NS_UID:-0}" -gt 0 ] 2>/dev/null; then
+  BASE="$XDG_RUNTIME_DIR_VALID"
 else
   BASE="${TMPDIR:-/tmp}"
 fi
