@@ -6,7 +6,9 @@ The entire public surface is a single Claude Code subagent shipped inside this
 plugin. Main Claude has **zero** direct MCP visibility into copilot-bridge; the
 MCP server is registered at plugin scope and only the subagent declares it in
 its `tools:` list. There is no slash command, no user-scope MCP registration,
-no main-session hooks, no skill, no session opt-in, no pause, no fleet mode.
+no main-session hooks, no skill, no session opt-in, no pause. Sends through the
+`general` template invoke Copilot's built-in `/fleet` orchestrator by default;
+see [Parallel orchestration](#parallel-orchestration) for details and opt-out.
 
 ## Architecture at a glance
 
@@ -172,10 +174,18 @@ copilot({ action: "reply",  job_id, message })
 copilot({ action: "cancel", job_id })
 ```
 
-`send` blocks up to `max_wait_sec` (default 480, max 540). If the job hasn't
-terminated, the bridge returns `status: "still_running"` and the subagent
-loops on `wait` — emitting one short line between iterations to keep Claude
-Code's 600s stream-idle watchdog from firing.
+`send` blocks up to `max_wait_sec` (default 480, max 540 — or 900 for
+`mode: "ANALYZE"` to permit longer single-turn analysis on large files).
+If the job hasn't terminated, the bridge returns `status: "still_running"`
+and the subagent loops on `wait` — emitting one short line between
+iterations to keep Claude Code's 600s stream-idle watchdog from firing.
+
+Terminal statuses returned by the bridge: `completed`, `failed`,
+`cancelled`, `stuck` (supervisor trip — model misbehavior), **`timeout`**
+(model turn did not finish within the wait budget — recoverable; main
+should decompose or pass `template_args.scope_hint`), and **`unreachable`**
+(bridge socket / daemon process dead — `meta.detail` distinguishes
+`bridge_timeout` from `bridge_daemon_unreachable`).
 
 ## Thread continuity
 
@@ -205,11 +215,47 @@ SendMessage({ to: <id>, message: {"action": "send", "task": "..."} })
 
 The same rule applies to the Agent-spawn `prompt` field: pass the JSON payload as a string.
 
+## Parallel orchestration
+
+Every `send` invokes Copilot's built-in `/fleet` orchestrator by **default**,
+regardless of template. The bridge prepends `/fleet ` to the prompt body;
+Copilot's orchestrator decomposes the task, dispatches isolated sub-agents
+in parallel where the work allows, polls for completion, and synthesizes a
+final answer. Each sub-agent runs in its own context window with shared
+filesystem access. Decomposition, dispatch, and synthesis all happen inside
+Copilot — the bridge's only contribution is the slash command.
+
+The natural fit is template-shaped:
+- **`general`** — multi-file refactors, cross-component features, parallel ANALYZE.
+- **`research`** — multi-source web research; sub-agents read different sources concurrently.
+- **`plan_review`** — per-claim verification of a plan against the codebase.
+
+**Opt-out**: pass `parallel: false` on the `send` payload when the task is
+strictly linear or single-source (one-line typo fix, one-source research
+question, trivially small plan). `/fleet`'s decomposition-analysis step
+adds turn budget even when it concludes "no parallelism here", so for
+genuinely linear work, opting out is faster.
+
+```jsonc
+// default — /fleet runs, sub-agents may dispatch in parallel
+copilot({ action: "send", task: "refactor authentication across api/, ui/, and tests/" })
+
+// opt-out for trivial linear work
+copilot({ action: "send", task: "fix the typo in foo.ts:42", parallel: false })
+
+// research with a single source — opt out
+copilot({ action: "send", template: "research", task: "what is X (per docs.example.com)?", parallel: false })
+```
+
+When a task hits `status: "timeout"`, the bridge's `content` includes a
+`parallel: false` retry suggestion as one of several recovery options —
+main decides which to try.
+
 ## Design invariants
 
 1. **Strict isolation.** The `copilot-bridge` MCP server is bundled with the plugin but the subagent's `tools:` list is the only path through which it's invoked. Main never calls the bridge directly.
 2. **No activation lifecycle.** The bridge is spawned per subagent invocation by Claude Code's plugin MCP machinery. There's nothing to `start`, `stop`, or `pause`.
-3. **Bounded blocking.** `send` / `wait` always return within `max_wait_sec ≤ 540` so the MCP transport never hits the 600s idle cap.
+3. **Bounded blocking.** `send` / `wait` always return within `max_wait_sec ≤ 540` (or `≤ 900` for ANALYZE) so the MCP transport never hits the 600s idle cap on non-ANALYZE work.
 4. **Orphan safety net.** Completion events are appended to `/tmp/copilot-completions.jsonl` with `consumed:false`; wait-terminal responses flip to `consumed:true`; the drain hook surfaces only unconsumed entries.
 5. **Rubber-duck always on.** Appended to every `send` server-side for every template except `plan_review` (which has its own critique instructions baked in). Not in the schema.
 6. **Model is config.** Read from `default-model` at worker start. Never a tool parameter.
@@ -235,5 +281,5 @@ mcp__copilot-bridge__copilot, Bash, Read, Write, Edit, Grep, Glob, WebFetch, Tod
 
 - Main Claude speaking to the bridge directly.
 - Skill file / slash commands (gone in v6.1).
-- Session opt-in, pause, fleet mode (all removed).
+- Session opt-in, pause (removed).
 - MCP elicitation (`NEEDS_USER_INPUT:` flow) — deferred to a future version.

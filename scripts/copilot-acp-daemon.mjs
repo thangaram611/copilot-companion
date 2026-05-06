@@ -783,6 +783,11 @@ class SessionManager {
     const conn = await this.ensureConnection(cwd);
     const sessionId = await conn.createSession(cwd);
     this.sessions.set(sessionId, { cwd, promptCount: 0, createdAt: Date.now() });
+    // Echo the resolved cwd into the daemon log so post-mortems can
+    // confirm Copilot rooted where the bridge intended. ACP's session/new
+    // accepts cwd silently and gives no read-back, so a daemon-side log
+    // line is the only observable signal that the value was honored.
+    log('INFO', `session/new cwd=${cwd || '(none)'} sessionId=${sessionId}`);
     this._resetInactivityTimer();
     return sessionId;
   }

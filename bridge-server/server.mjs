@@ -47,7 +47,13 @@ import { createReqId, withReq, logEvent } from '../lib/log.mjs';
 
 // --- Queue (replaces dev-channel notifications) -----------------------------
 
-const QUEUE_PATH = process.env.COPILOT_QUEUE_PATH || '/tmp/copilot-completions.jsonl';
+// Resolved per-call so tests can flip COPILOT_QUEUE_PATH before each
+// scenario. The const-at-module-load form locked the path for the lifetime
+// of the process and made queue-write tests unrunnable from node:test
+// without subprocesses.
+function getQueuePath() {
+  return process.env.COPILOT_QUEUE_PATH || '/tmp/copilot-completions.jsonl';
+}
 
 function enqueueEvent(event) {
   // Synchronous append; writes are small (~1-5KB). `consumed:false` lets the
@@ -55,7 +61,7 @@ function enqueueEvent(event) {
   // response — the subagent never sees the same event twice.
   try {
     appendFileSync(
-      QUEUE_PATH,
+      getQueuePath(),
       JSON.stringify({ ts: Date.now(), consumed: false, ...event }) + '\n',
       { encoding: 'utf8' },
     );
@@ -66,6 +72,7 @@ function enqueueEvent(event) {
 
 function markQueueConsumed(jobId) {
   try {
+    const QUEUE_PATH = getQueuePath();
     if (!existsSync(QUEUE_PATH)) return;
     const lines = readFileSync(QUEUE_PATH, 'utf8').split('\n').filter(Boolean);
     let changed = false;
@@ -105,6 +112,15 @@ function gcExpiredJobs(now = Date.now()) {
   }
 }
 
+// Wait-budget clamp. ANALYZE permits longer single-turn analysis on large
+// files (cap 900s); other modes stay capped at 540s to leave headroom under
+// the MCP 600s stream-idle watchdog. Default 480s when input is missing,
+// non-numeric, or zero. Floor 1s to avoid no-wait races.
+export function clampWaitSec(input, mode) {
+  const cap = mode === 'ANALYZE' ? 900 : 540;
+  return Math.max(1, Math.min(Number(input) || 480, cap));
+}
+
 function getJob(jobId) { gcExpiredJobs(); return jobs.get(jobId) || null; }
 function updateJob(jobId, patch) { const j = jobs.get(jobId); if (j) Object.assign(j, patch); return j || null; }
 function retainTerminalJob(jobId, patch) {
@@ -137,12 +153,21 @@ async function fetchPromptInspect(job, { includeTimeline = false, limit = 40 } =
   return resp.data;
 }
 
-function buildJobResponse(job, inspect = null, { includeTimeline = false } = {}) {
+export function buildJobResponse(job, inspect = null, { includeTimeline = false } = {}) {
   const data = inspect || {};
+  // Status precedence: when the worker has emitted a bridge-level remap
+  // (timeout or unreachable), prefer the job's status over inspect data.
+  // Inspect is sourced from the daemon, which doesn't know about these
+  // bridge-only statuses and would otherwise surface the raw underlying
+  // value (e.g. failed for prompt timeout). For supervisor-detected and
+  // normal terminal states, inspect data wins as before.
+  const bridgeStatus = job.status;
+  const isBridgeRemap = bridgeStatus === 'timeout' || bridgeStatus === 'unreachable';
+  const status = isBridgeRemap ? bridgeStatus : (data.status || bridgeStatus || 'unknown');
   return {
     ok: true,
     job_id: job.jobId,
-    status: data.status || job.status || 'unknown',
+    status,
     prompt_id: data.promptId || job.promptId || null,
     session_id: data.sessionId || job.sessionId || null,
     mode: job.mode || null,
@@ -155,6 +180,12 @@ function buildJobResponse(job, inspect = null, { includeTimeline = false } = {})
       (job.terminalAt ? 0 : Math.max(0, Date.now() - (job.startedAt || Date.now()))),
     stuck_reason: data.stuckReason || job.stuckReason || null,
     supervisor_detail: data.stuckDetail || job.stuckDetail || null,
+    // detail is bridge-owned (set only by the worker on `unreachable` remap
+    // or when retainTerminalJob persists the reconciled value). The daemon
+    // never emits a `detail` field on inspect responses, so we read only
+    // from job. Keeping a `data.detail` fallback here would let a future
+    // daemon change silently override the bridge's authoritative value.
+    detail: job.detail || null,
     failed_tools: Array.isArray(data.failedTools) && data.failedTools.length > 0
       ? data.failedTools : Array.isArray(job.failedTools) ? job.failedTools : [],
     latest_plan: data.latestPlan || null,
@@ -238,20 +269,22 @@ function buildWaitResponse(outcome) {
     });
   }
   markQueueConsumed(job.jobId);
+  const meta = {
+    job_id: job.jobId, status: job.status,
+    mode: job.mode || 'EXECUTE',
+    thread: job.thread || null,
+    prompt_id: job.promptId || null,
+    session_id: job.sessionId || null,
+    failed_tools: Array.isArray(job.failedTools) ? job.failedTools.join(',') : '',
+    stuck_reason: job.stuckReason || null,
+  };
+  if (job.detail) meta.detail = String(job.detail).slice(0, 80);
   return asJson({
     ok: true, action: 'wait', status: job.status,
     job_id: job.jobId,
     duration_ms: job.durationMs || null,
     content: formatTerminalContent(job),
-    meta: {
-      job_id: job.jobId, status: job.status,
-      mode: job.mode || 'EXECUTE',
-      thread: job.thread || null,
-      prompt_id: job.promptId || null,
-      session_id: job.sessionId || null,
-      failed_tools: Array.isArray(job.failedTools) ? job.failedTools.join(',') : '',
-      stuck_reason: job.stuckReason || null,
-    },
+    meta,
   });
 }
 
@@ -275,9 +308,9 @@ function emitAlertNotification({ jobId, task, promptId, alert, startedAt, reqId 
 // Pure formatter: takes the fields a terminal job carries and returns the
 // human-readable body. Extracted from emitNotification so buildWaitResponse
 // can reuse the exact same formatting when the subagent blocks to completion.
-function formatTerminalContent({
+export function formatTerminalContent({
   jobId, status, task, mode, durationMs,
-  summary, error, stuckReason, failedTools, promptId,
+  summary, error, stuckReason, detail, failedTools, promptId,
 }) {
   const taskHeader = `Task: ${truncate(task, 200)}\n\n`;
   const duration = durationMs || 0;
@@ -320,11 +353,29 @@ function formatTerminalContent({
   if (status === 'running') {
     return taskHeader + "Copilot job exceeded the bridge's wait budget. Daemon was asked to cancel.";
   }
+  if (status === 'timeout') {
+    const failedLine = (Array.isArray(failedTools) && failedTools.length)
+      ? `\n\n**Failed tools:** ${failedTools.slice(0, 10).join(', ')}` : '';
+    return taskHeader +
+      `Copilot's model turn did not finish within the wait budget (${Math.round(duration / 1000)}s).\n\n` +
+      'The daemon is alive; the task was too large for one turn (note: `/fleet` runs by default for general tasks). Recommended next steps for the parent:\n' +
+      '- Decompose the task into smaller, explicitly-scoped sub-sends (target ≤ ~100 LOC of source per send).\n' +
+      '- For ANALYZE on large files, pass `template_args.scope_hint` (e.g. "imports/types only", "lines 1-120") to bind the analysis to a specific section.\n' +
+      '- Raise `max_wait_sec` (ANALYZE supports up to 900s; non-ANALYZE up to 540s) if the task is genuinely long.\n' +
+      "- Try `parallel: false` once if you suspect /fleet's coordination overhead is the bottleneck for a strictly linear task." +
+      failedLine;
+  }
+  if (status === 'unreachable') {
+    const detailLine = detail ? ` (detail: ${detail})` : '';
+    return taskHeader +
+      `Bridge could not reach the Copilot daemon (or socket reconciliation failed)${detailLine}.\n\n` +
+      'This is infrastructure-level — check `ps -ef | grep copilot-acp-daemon` and tail `/tmp/copilot-bridge.log` / `/tmp/copilot-acp-daemon.log` to confirm the daemon is alive.';
+  }
   return taskHeader + `Unexpected terminal status: ${status}`;
 }
 
-function emitNotification({
-  jobId, status, summary, error, stuckReason, duration,
+export function emitNotification({
+  jobId, status, summary, error, stuckReason, detail = null, duration,
   task, mode, cwd, thread = null, promptId = null, sessionId = null,
   reconciled = false, bridgeReason = null, failedTools = [], reqId = null,
 }) {
@@ -350,6 +401,7 @@ function emitNotification({
   if (summary?.toolCalls)  meta.tool_calls  = String(summary.toolCalls.length || 0);
   if (summary?.stopReason) meta.stop_reason = String(summary.stopReason);
   if (stuckReason)         meta.stuck_reason = String(stuckReason).slice(0, 80);
+  if (detail)              meta.detail = String(detail).slice(0, 80);
   if (Array.isArray(failedTools) && failedTools.length) meta.failed_tools = failedTools.join(',').slice(0, 80);
   if (reconciled)   meta.reconciled = 'true';
   if (bridgeReason) meta.bridge_reason = String(bridgeReason).slice(0, 40);
@@ -360,44 +412,57 @@ function emitNotification({
 
   const content = formatTerminalContent({
     jobId, status, task, mode, durationMs: duration,
-    summary, error, stuckReason, failedTools, promptId,
+    summary, error, stuckReason, detail, failedTools, promptId,
   });
 
   enqueueEvent({ kind: 'terminal', jobId, content, meta });
   if (status === 'completed' && rubberDuck === 'missing') {
     log('WARN', 'emit:', jobId, 'rubber_duck verdict missing from completed message — Copilot output drifted from wrapper contract');
   }
-  log('INFO', 'emit:', jobId, `status=${status} duration_ms=${duration}${status === 'completed' ? ` rubber_duck=${rubberDuck}` : ''}${stuckReason ? ` stuck=${stuckReason}` : ''}${bridgeReason ? ` bridge=${bridgeReason}` : ''}`);
+  log('INFO', 'emit:', jobId, `status=${status} duration_ms=${duration}${status === 'completed' ? ` rubber_duck=${rubberDuck}` : ''}${stuckReason ? ` stuck=${stuckReason}` : ''}${detail ? ` detail=${detail}` : ''}${bridgeReason ? ` bridge=${bridgeReason}` : ''}`);
 }
 
 function truncate(s, n) { if (!s) return ''; return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
 // Classify the rubber-duck verdict surfaced by Copilot in the final message.
-// The rubber-duck wrapper is always appended to the prompt, so every completed
-// job should yield exactly one `RUBBER-DUCK: clean.` or `RUBBER-DUCK: revised …`
-// line. A 'missing' verdict means Copilot's output drifted from the wrapper's
-// contract — logged at WARN for visibility.
+// The rubber-duck wrapper is appended to general/research prompts, so every
+// completed job from those templates should yield at least one
+// `RUBBER-DUCK: clean.` or `RUBBER-DUCK: revised …` line.
+//
+// Multi-verdict handling: when /fleet dispatches sub-agents, each sub-agent
+// receives the wrapper instructions and may emit its own verdict line; the
+// orchestrator concatenates sub-agent outputs into the final message, so the
+// message can contain N verdicts. We scan ALL matches and fail-pessimistic:
+// if ANY verdict is `revised`, the overall classification is `revised`. This
+// avoids silently downgrading a sub-agent's `revised` finding to `clean` just
+// because an earlier sub-agent reported `clean`.
+//
+// A 'missing' verdict means no marker at all — Copilot's output drifted from
+// the wrapper's contract. Logged at WARN for visibility.
 export function classifyRubberDuck(message) {
   if (!message) return 'missing';
-  const m = String(message).match(/(?:^|\n)\s*RUBBER-DUCK:\s*(clean|revised)\b/i);
-  if (!m) return 'missing';
-  return m[1].toLowerCase();
+  const matches = [...String(message).matchAll(/(?:^|\n)\s*RUBBER-DUCK:\s*(clean|revised)\b/gi)];
+  if (matches.length === 0) return 'missing';
+  for (const m of matches) {
+    if (m[1].toLowerCase() === 'revised') return 'revised';
+  }
+  return 'clean';
 }
 
 // --- Worker -----------------------------------------------------------------
 
 const MAX_JOB_MS = 30 * 60 * 1000;
 
-async function runWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, model, previousSid }) {
+async function runWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, model, previousSid, parallel }) {
   const startedAt = Date.now();
   let sessionId = null;
   const rlog = withReq(reqId, { job_id: jobId });
-  rlog.info('worker.start', { mode, template, thread: thread || null, model, cwd: cwd || null });
-  log('INFO', 'worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} model=${model} cwd=${cwd || '(default)'}`);
+  rlog.info('worker.start', { mode, template, thread: thread || null, model, cwd: cwd || null, parallel: !!parallel });
+  log('INFO', 'worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} model=${model} cwd=${cwd || '(default)'} parallel=${!!parallel}`);
   try {
     await ensureDaemon({ reqId });
 
-    let formatted = formatPrompt({ template, task, mode, template_args });
+    let formatted = formatPrompt({ template, task, mode, template_args, parallel });
     // plan_review prompts already embed their own senior-architect critique
     // instructions; layering the generic rubber-duck wrapper on top doubles
     // the prompt size without changing the output. Skip it for that template
@@ -439,11 +504,15 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
     }
 
     if (result.status === 'failed' && result.error === 'prompt timeout') {
-      result.status = 'stuck';
-      result.stuckReason = 'prompt_timeout';
+      // Promote prompt_timeout to a first-class terminal status. The model
+      // turn did not finish within the wait budget; the daemon is alive
+      // and the task was too large for one turn. Distinct from `stuck`
+      // (supervisor trip) and from `unreachable` (daemon/socket dead).
+      result.status = 'timeout';
+      result.stuckReason = null;
       result.error = null;
       rlog.warn('worker.remap_prompt_timeout', { prompt_id: promptId });
-      log('INFO', 'remap prompt_timeout:', jobId, `promptId=${promptId} → status=stuck`);
+      log('INFO', 'remap prompt_timeout:', jobId, `promptId=${promptId} → status=timeout`);
     }
 
     const duration = Date.now() - startedAt;
@@ -452,6 +521,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       promptId, sessionId,
       status: result.status, summary: result.summary,
       error: result.error, stuckReason: result.stuckReason,
+      detail: result.detail || null,
       failedTools, durationMs: duration,
       terminalAt: Date.now(),
     });
@@ -460,6 +530,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       jobId,
       status: result.status, summary: result.summary,
       error: result.error, stuckReason: result.stuckReason,
+      detail: result.detail || null,
       duration, task, mode, cwd, thread,
       promptId, sessionId, failedTools, reqId,
     });
@@ -481,6 +552,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       summary: reconciled?.summary ?? null,
       error: reconciled?.error ?? err.message,
       stuckReason: reconciled?.stuckReason ?? null,
+      detail: reconciled?.detail ?? null,
       failedTools: promptId ? failedToolsFromJsonl(promptId) : [],
       durationMs: duration, terminalAt: Date.now(),
     });
@@ -490,6 +562,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       summary: reconciled?.summary ?? null,
       error: reconciled?.error ?? err.message,
       stuckReason: reconciled?.stuckReason ?? null,
+      detail: reconciled?.detail ?? null,
       duration, task, mode, cwd, thread,
       promptId: promptId || null,
       sessionId: currentSessionId || null,
@@ -522,14 +595,18 @@ async function reconcileAfterTimeout(promptId) {
     );
     const data = resp?.ok ? resp.data : null;
     if (data?.status === 'completed') {
-      return { status: 'completed', summary: data.summary, error: null, stuckReason: null, bridgeReason: 'reconciled_completed' };
+      return { status: 'completed', summary: data.summary, error: null, stuckReason: null, detail: null, bridgeReason: 'reconciled_completed' };
     }
     if (data?.status === 'stuck' || data?.status === 'cancelled') {
-      return { status: 'stuck', summary: null, error: null, stuckReason: data.stuckReason || data.status, bridgeReason: 'reconciled_stuck' };
+      return { status: 'stuck', summary: null, error: null, stuckReason: data.stuckReason || data.status, detail: null, bridgeReason: 'reconciled_stuck' };
     }
-    return { status: 'stuck', summary: null, error: null, stuckReason: 'bridge_timeout', bridgeReason: 'bridge_timeout' };
+    // Socket reconciliation succeeded but the daemon reported no terminal
+    // state — treat as bridge-level unreachable (socket flapped). detail
+    // distinguishes this from a hard daemon-dead failure below.
+    return { status: 'unreachable', summary: null, error: null, stuckReason: null, detail: 'bridge_timeout', bridgeReason: 'bridge_timeout' };
   } catch {
-    return { status: 'stuck', summary: null, error: null, stuckReason: 'bridge_daemon_unreachable', bridgeReason: 'bridge_daemon_unreachable' };
+    // Daemon process dead or socket gone — true infra failure.
+    return { status: 'unreachable', summary: null, error: null, stuckReason: null, detail: 'bridge_daemon_unreachable', bridgeReason: 'bridge_daemon_unreachable' };
   }
 }
 
@@ -584,6 +661,7 @@ async function handleSend(args) {
     task: args.task, mode: args.mode,
     template: args.template, cwd: args.cwd,
     thread,
+    parallel: !!args.parallel,
     startedAt: Date.now(),
     status: 'starting', inspectAvailable: false,
   });
@@ -591,24 +669,31 @@ async function handleSend(args) {
     req_id: reqId, job_id: jobId,
     template: args.template, mode: args.mode,
     thread, model,
+    parallel: !!args.parallel,
   });
-  log('INFO', 'copilot:send', `job=${jobId} req=${reqId} template=${args.template} mode=${args.mode} thread=${thread} model=${model}`);
+  log('INFO', 'copilot:send', `job=${jobId} req=${reqId} template=${args.template} mode=${args.mode} thread=${thread} model=${model} parallel=${!!args.parallel}`);
 
   runWorker({
     jobId, reqId,
     task: args.task, mode: args.mode,
     template: args.template, template_args: args.template_args,
     cwd: args.cwd, thread, model, previousSid,
+    parallel: !!args.parallel,
   }).catch((err) => log('ERROR', 'worker error:', err.message));
 
-  const maxWaitSec = Math.max(1, Math.min(Number(args.max_wait_sec) || 480, 540));
+  const maxWaitSec = clampWaitSec(args.max_wait_sec, args.mode);
   const outcome = await waitForJob(jobId, maxWaitSec);
   return buildWaitResponse(outcome);
 }
 
 async function handleWait({ job_id, max_wait_sec }) {
   if (!job_id) return asJson({ ok: false, action: 'wait', error: 'job_id required' });
-  const max = Math.max(1, Math.min(Number(max_wait_sec) || 480, 540));
+  // Look up the job's stored mode so subsequent waits respect the
+  // ANALYZE 900s cap, not just the initial send. Falls back to EXECUTE
+  // (540s cap) when the job is unknown — defensive default.
+  const job = getJob(job_id);
+  const mode = job?.mode || 'EXECUTE';
+  const max = clampWaitSec(max_wait_sec, mode);
   const outcome = await waitForJob(job_id, max);
   return buildWaitResponse(outcome);
 }
@@ -759,11 +844,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           template_args: {
             type: 'object',
-            description: '[send] Template-specific arguments. Only plan_review consumes these.',
+            description: '[send] Template-specific arguments. Keys validated per-template.',
             additionalProperties: false,
             properties: {
-              plan_path:       { type: 'string', description: 'Absolute path to the plan .md (or "latest").' },
-              focus_directive: { type: 'string', description: 'Optional focus directive for plan_review.' },
+              plan_path:       { type: 'string', description: '[plan_review only] Absolute path to the plan .md (or "latest").' },
+              focus_directive: { type: 'string', description: '[plan_review only] Optional focus directive for plan_review.' },
+              scope_hint:      { type: 'string', description: '[general only] Binds the analysis to a specific scope (e.g. "imports/types only", "lines 1-120"). Useful for large-file ANALYZE.' },
             },
           },
           cwd: {
@@ -781,7 +867,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'number',
             description:
               '[send|wait] Upper bound on how long the bridge blocks this call before returning ' +
-              'still_running. Default 480, max 540 (leaves headroom under the MCP 600s stream-idle cap).',
+              'still_running. Default 480, max 540 (or 900 for ANALYZE). Non-ANALYZE caps at 540 ' +
+              'to leave headroom under the MCP 600s stream-idle watchdog; ANALYZE allows longer ' +
+              'single-turn analysis on large files.',
+          },
+          parallel: {
+            type: 'boolean',
+            description:
+              '[send] Default true. When true (default), prepends "/fleet " to the prompt so ' +
+              "Copilot's built-in orchestrator decomposes the task and dispatches isolated " +
+              'sub-agents in parallel where possible. Applies to all templates: general, research ' +
+              '(multi-source web research), and plan_review (per-claim verification). Set false to ' +
+              "skip /fleet overhead on strictly linear / single-source work where the orchestrator's " +
+              'decomposition-analysis cost would dominate.',
           },
           job_id:  { type: 'string',  description: '[wait|status|reply|cancel] Target a specific job.' },
           verbose: { type: 'boolean', description: '[status] Include full activity timeline when a job_id is given.' },

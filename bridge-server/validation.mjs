@@ -54,37 +54,58 @@ export const DEFAULT_MODE    = 'EXECUTE';
 
 // Field surface per action. Anything outside these is an "unknown key" error.
 const ALLOWED_FIELDS = {
-  send:   new Set(['action', 'task', 'mode', 'template', 'template_args', 'cwd', 'thread', 'max_wait_sec']),
+  send:   new Set(['action', 'task', 'mode', 'template', 'template_args', 'cwd', 'thread', 'max_wait_sec', 'parallel']),
   wait:   new Set(['action', 'job_id', 'max_wait_sec']),
   status: new Set(['action', 'job_id', 'verbose']),
   reply:  new Set(['action', 'job_id', 'message']),
   cancel: new Set(['action', 'job_id']),
 };
 
-const VALID_TEMPLATE_ARGS_KEYS = new Set(['plan_path', 'focus_directive']);
+// Per-template allowed keys. Plan_review and general have disjoint key sets;
+// research currently has none. Validating per template (instead of one global
+// set) prevents `scope_hint` from being silently accepted on plan_review and
+// vice-versa.
+const VALID_TEMPLATE_ARGS_KEYS_BY_TEMPLATE = {
+  general:     new Set(['scope_hint']),
+  research:    new Set(),
+  plan_review: new Set(['plan_path', 'focus_directive']),
+};
+const SCOPE_HINT_MAX_CHARS = 500;
 
 // --- Prompt templates -------------------------------------------------------
 
-export function formatGeneralTemplate({ task, mode }) {
+export function formatGeneralTemplate({ task, mode, scope_hint, parallel }) {
+  const analyzeLine =
+    'Do not modify any files — no `edit`, `write`, or file-mutating `shell` commands. Read-only tools (`view`, `grep`, `glob`, `web_search`, `web_fetch`, and the `task` tool for read-only sub-agents) are fine. ' +
+    'For files >200 LOC, scope your analysis: pick one section (imports/types, functions, error paths, etc.) per turn rather than reading the whole file at once. ' +
+    'If the task names a specific concern, focus there first; defer comprehensive review to a follow-up. ' +
+    'If `template_args.scope_hint` is provided, treat it as the binding scope for this turn.';
   const modeLine =
     mode === 'EXECUTE'
       ? 'You may use `edit`, `write`, `shell`, and the `task` tool. Be precise about file paths and the exact changes you intend.'
       : mode === 'PLAN'
         ? 'Do not modify any files — produce a plan only. Read-only tools (`view`, `grep`, `glob`, `web_search`, `web_fetch`, and read-only sub-agents) are fine. End the answer with a concrete, numbered implementation plan.'
-        : 'Do not modify any files — no `edit`, `write`, or file-mutating `shell` commands. Read-only tools (`view`, `grep`, `glob`, `web_search`, `web_fetch`, and the `task` tool for read-only sub-agents) are fine.';
+        : analyzeLine;
   const label = mode === 'EXECUTE' ? 'EXECUTE' : mode === 'PLAN' ? 'PLAN' : 'ANALYZE';
-  return [
-    `TASK: ${task}`,
+  // /fleet is a prompt-body slash command and MUST sit at the very start of
+  // the prompt body to be recognised by Copilot's parser. When parallel is
+  // true we drop the literal `TASK:` prefix so the slash command is the
+  // first non-whitespace token — fleet expects the objective immediately
+  // after `/fleet `.
+  const taskLine = parallel ? `/fleet ${task}` : `TASK: ${task}`;
+  const lines = [
+    taskLine,
     '',
     `Mode: ${label}`,
     modeLine,
-    '',
-    'Return: a concise answer plus the list of files you inspected or changed.',
-  ].join('\n');
+  ];
+  if (scope_hint) lines.push(`Scope: ${scope_hint}`);
+  lines.push('', 'Return: a concise answer plus the list of files you inspected or changed.');
+  return lines.join('\n');
 }
 
-export function formatResearchTemplate({ task }) {
-  return [
+export function formatResearchTemplate({ task, parallel }) {
+  const body = [
     'You are a research assistant. The user wants a focused, evidence-backed answer to:',
     '',
     `  ${task}`,
@@ -106,13 +127,14 @@ export function formatResearchTemplate({ task }) {
     '',
     'Be concise. Skip filler.',
   ].join('\n');
+  return maybeFleetPrefix(body, parallel);
 }
 
-export function formatPlanReviewTemplate({ template_args }) {
+export function formatPlanReviewTemplate({ template_args, parallel }) {
   const planPath = template_args?.plan_path;
   const focus = template_args?.focus_directive;
   if (!planPath) throw new Error('internal: plan_review reached formatter without plan_path');
-  return [
+  const body = [
     'You are a senior software architect reviewing an implementation plan produced by another AI coding',
     'assistant. The plan lives at:',
     '',
@@ -141,15 +163,25 @@ export function formatPlanReviewTemplate({ template_args }) {
     '- A numbered list of concrete findings, each with file path and specific issue',
     '- A brief overall assessment (2-3 sentences)',
   ].filter(Boolean).join('\n');
+  return maybeFleetPrefix(body, parallel);
 }
 
-export function formatPrompt({ template, task, mode, template_args }) {
+export function formatPrompt({ template, task, mode, template_args, parallel }) {
   switch (template || 'general') {
-    case 'general':     return formatGeneralTemplate({ task, mode });
-    case 'research':    return formatResearchTemplate({ task });
-    case 'plan_review': return formatPlanReviewTemplate({ template_args });
+    case 'general':     return formatGeneralTemplate({ task, mode, scope_hint: template_args?.scope_hint, parallel });
+    case 'research':    return formatResearchTemplate({ task, parallel });
+    case 'plan_review': return formatPlanReviewTemplate({ template_args, parallel });
     default: throw new Error(`unknown template: ${template}`);
   }
+}
+
+// Helper: prepend `/fleet ` to a multi-line template body so the slash
+// command sits at the very first non-whitespace token of the prompt
+// (Copilot's parser requirement). The rest of the body — role
+// description, rules, return format — becomes the orchestrator's
+// objective verbatim and is propagated to dispatched sub-agents.
+function maybeFleetPrefix(body, parallel) {
+  return parallel ? `/fleet ${body}` : body;
 }
 
 // Rubber-duck cross-examination wrapper — always appended unconditionally.
@@ -321,9 +353,19 @@ function validateSend(args) {
   if (typeof ta !== 'object' || Array.isArray(ta)) {
     throw new Error('copilot: template_args must be a plain object');
   }
+  const allowedTaKeys = VALID_TEMPLATE_ARGS_KEYS_BY_TEMPLATE[template] ?? new Set();
   for (const key of Object.keys(ta)) {
-    if (!VALID_TEMPLATE_ARGS_KEYS.has(key)) {
-      throw new Error(`copilot: unknown template_args key "${key}" (allowed: ${[...VALID_TEMPLATE_ARGS_KEYS].join(', ')})`);
+    if (!allowedTaKeys.has(key)) {
+      const allowedDesc = allowedTaKeys.size > 0 ? [...allowedTaKeys].join(', ') : '(none)';
+      throw new Error(`copilot: unknown template_args key "${key}" for template="${template}" (allowed: ${allowedDesc})`);
+    }
+  }
+  if (template === 'general' && ta.scope_hint !== undefined) {
+    if (typeof ta.scope_hint !== 'string') {
+      throw new Error('copilot: template_args.scope_hint must be a string');
+    }
+    if (ta.scope_hint.length > SCOPE_HINT_MAX_CHARS) {
+      throw new Error(`copilot: template_args.scope_hint too long (${ta.scope_hint.length} > ${SCOPE_HINT_MAX_CHARS} chars)`);
     }
   }
 
@@ -363,9 +405,13 @@ function validateSend(args) {
     if (ta.focus_directive !== undefined && typeof ta.focus_directive !== 'string') {
       throw new Error('copilot: template_args.focus_directive must be a string');
     }
-  } else if (Object.keys(ta).length > 0) {
-    log('WARN', 'copilot:', `template="${template}" ignores template_args (received keys: ${Object.keys(ta).join(', ')})`);
   }
+  // Note: pre-§D this branch had an `else if (template_args nonempty) → WARN
+  // "template ignores template_args"`. After §D introduced per-template
+  // template_args validation (`VALID_TEMPLATE_ARGS_KEYS_BY_TEMPLATE`), any
+  // key present is either accepted by the formatter (general's scope_hint)
+  // or already rejected upstream as an unknown key. The "ignores" warning is
+  // false now and was misleading users about scope_hint being dropped.
 
   assertCwd(args.cwd);
   assertThreadName(args.thread);
@@ -373,6 +419,17 @@ function validateSend(args) {
   if (args.max_wait_sec !== undefined && typeof args.max_wait_sec !== 'number') {
     throw new Error('copilot: max_wait_sec must be a number');
   }
+
+  // Fleet (parallel) handling: applies to all templates uniformly.
+  // /fleet is a prompt-body slash command that triggers Copilot's built-in
+  // orchestrator (decomposes + dispatches isolated sub-agents in parallel
+  // where possible). Default-on for every template; opt out per-call with
+  // parallel:false on strictly linear / single-source tasks where the
+  // decomposition-analysis overhead would dominate.
+  if (args.parallel !== undefined && typeof args.parallel !== 'boolean') {
+    throw new Error('copilot: parallel must be a boolean');
+  }
+  const parallel = args.parallel === undefined ? true : args.parallel;
 
   return {
     action: 'send',
@@ -383,5 +440,6 @@ function validateSend(args) {
     cwd: args.cwd || null,
     thread: args.thread || null,
     max_wait_sec: args.max_wait_sec,
+    parallel,
   };
 }

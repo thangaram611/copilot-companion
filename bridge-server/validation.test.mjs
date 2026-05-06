@@ -305,3 +305,237 @@ test('appendRubberDuckReview always wraps when called', () => {
   assert.match(wrapped, /CROSS-EXAMINATION STEP/);
   assert.match(wrapped, /^hello\n/);
 });
+
+// ---------- parallel field (default-on /fleet for general) ----------
+
+test('send: parallel defaults to true for general template', () => {
+  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'general' });
+  assert.equal(r.parallel, true);
+});
+
+test('send: parallel:false honored for general template', () => {
+  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'general', parallel: false });
+  assert.equal(r.parallel, false);
+});
+
+test('send: parallel:true explicit for general is identical to default', () => {
+  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'general', parallel: true });
+  assert.equal(r.parallel, true);
+});
+
+test('send: parallel defaults to true for research template (universal default-on)', () => {
+  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'research' });
+  assert.equal(r.parallel, true);
+});
+
+test('send: parallel:false honored for research template', () => {
+  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'research', parallel: false });
+  assert.equal(r.parallel, false);
+});
+
+test('send: parallel defaults to true for plan_review template (universal default-on)', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-'));
+  process.env.COPILOT_PLANS_DIR = tmp;
+  try {
+    const planFile = join(tmp, 'p.md');
+    writeFileSync(planFile, '# plan');
+    const r = validateCopilotArgs({
+      action: 'send',
+      template: 'plan_review',
+      template_args: { plan_path: planFile },
+    });
+    assert.equal(r.parallel, true);
+  } finally {
+    delete process.env.COPILOT_PLANS_DIR;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('send: parallel:false honored for plan_review template', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-'));
+  process.env.COPILOT_PLANS_DIR = tmp;
+  try {
+    const planFile = join(tmp, 'p.md');
+    writeFileSync(planFile, '# plan');
+    const r = validateCopilotArgs({
+      action: 'send',
+      template: 'plan_review',
+      template_args: { plan_path: planFile },
+      parallel: false,
+    });
+    assert.equal(r.parallel, false);
+  } finally {
+    delete process.env.COPILOT_PLANS_DIR;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('send: parallel must be a boolean for general', () => {
+  assert.throws(
+    () => validateCopilotArgs({ action: 'send', task: 'X', template: 'general', parallel: 'yes' }),
+    /parallel must be a boolean/,
+  );
+});
+
+test('send: parallel listed in allowed fields (no unknown-field error)', () => {
+  // Confirms the field is in ALLOWED_FIELDS.send.
+  const r = validateCopilotArgs({ action: 'send', task: 'X', parallel: true });
+  assert.equal(r.parallel, true);
+});
+
+// ---------- formatPrompt: /fleet prefix vs TASK prefix ----------
+
+test('formatPrompt(general, parallel=true) starts with /fleet (no TASK: prefix)', () => {
+  const out = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: true });
+  assert.match(out, /^\/fleet do thing\n/);
+  assert.doesNotMatch(out, /^TASK:/m);
+});
+
+test('formatPrompt(general, parallel=false) starts with TASK: (no /fleet)', () => {
+  const out = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: false });
+  assert.match(out, /^TASK: do thing\n/);
+  assert.doesNotMatch(out, /\/fleet/);
+});
+
+test('formatPrompt(research, parallel=true) starts with /fleet', () => {
+  const out = formatPrompt({ template: 'research', task: 'find X', parallel: true });
+  assert.match(out, /^\/fleet You are a research assistant/);
+});
+
+test('formatPrompt(research, parallel=false) starts without /fleet', () => {
+  const out = formatPrompt({ template: 'research', task: 'find X', parallel: false });
+  assert.match(out, /^You are a research assistant/);
+  assert.doesNotMatch(out, /\/fleet/);
+});
+
+test('formatPrompt(plan_review, parallel=true) starts with /fleet', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-fmt-'));
+  process.env.COPILOT_PLANS_DIR = tmp;
+  try {
+    const planFile = join(tmp, 'p.md');
+    writeFileSync(planFile, '# plan');
+    const r = validateCopilotArgs({
+      action: 'send',
+      template: 'plan_review',
+      template_args: { plan_path: planFile },
+      parallel: true,
+    });
+    const out = formatPrompt({ template: 'plan_review', template_args: r.template_args, parallel: true });
+    assert.match(out, /^\/fleet You are a senior software architect/);
+  } finally {
+    delete process.env.COPILOT_PLANS_DIR;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('formatPrompt(plan_review, parallel=false) starts without /fleet', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-fmt2-'));
+  process.env.COPILOT_PLANS_DIR = tmp;
+  try {
+    const planFile = join(tmp, 'p.md');
+    writeFileSync(planFile, '# plan');
+    const r = validateCopilotArgs({
+      action: 'send',
+      template: 'plan_review',
+      template_args: { plan_path: planFile },
+      parallel: false,
+    });
+    const out = formatPrompt({ template: 'plan_review', template_args: r.template_args, parallel: false });
+    assert.match(out, /^You are a senior software architect/);
+    assert.doesNotMatch(out, /\/fleet/);
+  } finally {
+    delete process.env.COPILOT_PLANS_DIR;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------- per-template template_args validation ----------
+
+test('send: scope_hint accepted for general template', () => {
+  const r = validateCopilotArgs({
+    action: 'send', task: 'X', template: 'general',
+    template_args: { scope_hint: 'imports only' },
+  });
+  assert.equal(r.template_args.scope_hint, 'imports only');
+});
+
+test('send: scope_hint rejected for plan_review template', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-'));
+  process.env.COPILOT_PLANS_DIR = tmp;
+  try {
+    const planFile = join(tmp, 'p.md');
+    writeFileSync(planFile, '# plan');
+    assert.throws(
+      () => validateCopilotArgs({
+        action: 'send',
+        template: 'plan_review',
+        template_args: { plan_path: planFile, scope_hint: 'lol' },
+      }),
+      /unknown template_args key "scope_hint" for template="plan_review"/,
+    );
+  } finally {
+    delete process.env.COPILOT_PLANS_DIR;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('send: scope_hint rejected for research template', () => {
+  assert.throws(
+    () => validateCopilotArgs({
+      action: 'send', task: 'X', template: 'research',
+      template_args: { scope_hint: 'X' },
+    }),
+    /unknown template_args key "scope_hint" for template="research"/,
+  );
+});
+
+test('send: plan_path rejected for general template', () => {
+  assert.throws(
+    () => validateCopilotArgs({
+      action: 'send', task: 'X', template: 'general',
+      template_args: { plan_path: '/tmp/x.md' },
+    }),
+    /unknown template_args key "plan_path" for template="general"/,
+  );
+});
+
+test('send: scope_hint must be a string', () => {
+  assert.throws(
+    () => validateCopilotArgs({
+      action: 'send', task: 'X', template: 'general',
+      template_args: { scope_hint: 42 },
+    }),
+    /scope_hint must be a string/,
+  );
+});
+
+test('send: scope_hint length capped at 500 chars', () => {
+  const big = 'x'.repeat(501);
+  assert.throws(
+    () => validateCopilotArgs({
+      action: 'send', task: 'X', template: 'general',
+      template_args: { scope_hint: big },
+    }),
+    /scope_hint too long/,
+  );
+});
+
+// ---------- formatPrompt: scope_hint interpolation ----------
+
+test('formatPrompt(general) emits Scope: line when scope_hint provided', () => {
+  const out = formatPrompt({
+    template: 'general', task: 'X', mode: 'ANALYZE',
+    template_args: { scope_hint: 'imports/types only' },
+  });
+  assert.match(out, /\nScope: imports\/types only\n/);
+});
+
+test('formatPrompt(general) omits Scope: line when scope_hint absent', () => {
+  const out = formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE' });
+  assert.doesNotMatch(out, /\nScope:/);
+});
+
+test('formatPrompt(general, ANALYZE) includes >200 LOC scope guidance', () => {
+  const out = formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE' });
+  assert.match(out, />200 LOC/);
+});
