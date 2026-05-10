@@ -539,3 +539,67 @@ test('formatPrompt(general, ANALYZE) includes >200 LOC scope guidance', () => {
   const out = formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE' });
   assert.match(out, />200 LOC/);
 });
+
+// ---------- session-id input aliases ----------
+
+test('host_session_id accepted on every action, normalized to host_session_id field', () => {
+  const acts = [
+    { action: 'send', task: 'X', host_session_id: 'sid-abc' },
+    { action: 'wait', job_id: 'j1', host_session_id: 'sid-abc' },
+    { action: 'status', host_session_id: 'sid-abc' },
+    { action: 'reply', job_id: 'j1', message: 'hi', host_session_id: 'sid-abc' },
+    { action: 'cancel', job_id: 'j1', host_session_id: 'sid-abc' },
+  ];
+  for (const a of acts) {
+    const out = validateCopilotArgs(a);
+    assert.equal(out.host_session_id, 'sid-abc', `${a.action} normalized host_session_id`);
+  }
+});
+
+test('claude_session_id legacy alias accepted, normalized to host_session_id field', () => {
+  // Backwards compat: existing Claude callers pass claude_session_id; the
+  // bridge accepts it and normalizes to the host-neutral internal field.
+  const out = validateCopilotArgs({ action: 'status', claude_session_id: 'legacy-sid' });
+  assert.equal(out.host_session_id, 'legacy-sid');
+});
+
+test('both claude_session_id and host_session_id accepted when values agree', () => {
+  // Common during a host transition: a wrapper might forward both. Same
+  // value → fine, single canonicalization. Different values → error.
+  const out = validateCopilotArgs({
+    action: 'status',
+    claude_session_id: 'matching-sid',
+    host_session_id: 'matching-sid',
+  });
+  assert.equal(out.host_session_id, 'matching-sid');
+});
+
+test('claude_session_id and host_session_id with conflicting values rejected', () => {
+  assert.throws(
+    () => validateCopilotArgs({
+      action: 'status',
+      claude_session_id: 'sid-A',
+      host_session_id: 'sid-B',
+    }),
+    /provided with different values/,
+  );
+});
+
+test('non-string claude_session_id rejected', () => {
+  assert.throws(
+    () => validateCopilotArgs({ action: 'status', claude_session_id: 42 }),
+    /claude_session_id must be a non-empty string/,
+  );
+});
+
+test('non-string host_session_id rejected', () => {
+  assert.throws(
+    () => validateCopilotArgs({ action: 'status', host_session_id: '' }),
+    /host_session_id must be a non-empty string/,
+  );
+});
+
+test('absent session-id args yield null host_session_id (no error)', () => {
+  const out = validateCopilotArgs({ action: 'status' });
+  assert.equal(out.host_session_id, null);
+});

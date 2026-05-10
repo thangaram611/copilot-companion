@@ -19,7 +19,8 @@ import {
   renameSync,
 } from 'node:fs';
 import { isAbsolute, join, sep as pathSep } from 'node:path';
-import { homedir } from 'node:os';
+
+import { plansDir, detectHost } from '../lib/host.mjs';
 
 // --- Logger -----------------------------------------------------------------
 
@@ -53,12 +54,23 @@ export const VALID_TEMPLATES = new Set(['general', 'research', 'plan_review']);
 export const DEFAULT_MODE    = 'EXECUTE';
 
 // Field surface per action. Anything outside these is an "unknown key" error.
+//
+// Session-id input fields (either accepted, normalized to internal `host_session_id`):
+//   - claude_session_id: legacy Claude-host alias. The Claude subagent reads
+//     $CLAUDE_CODE_SESSION_ID via Bash at activation and forwards it on every
+//     call (Claude Code does NOT expand ${VAR} in MCP env: blocks).
+//   - host_session_id: host-neutral alias for any caller (Codex if MCP _meta
+//     adoption fails; future hosts; tests). Functionally identical to the
+//     above on input.
+// On Codex, the bridge also reads request.params._meta["x-codex-turn-metadata"]
+// .session_id directly in server.mjs's MCP handler — that path bypasses
+// the per-arg field entirely (host-injected, can't be spoofed by the agent).
 const ALLOWED_FIELDS = {
-  send:   new Set(['action', 'task', 'mode', 'template', 'template_args', 'cwd', 'thread', 'max_wait_sec', 'parallel']),
-  wait:   new Set(['action', 'job_id', 'max_wait_sec']),
-  status: new Set(['action', 'job_id', 'verbose']),
-  reply:  new Set(['action', 'job_id', 'message']),
-  cancel: new Set(['action', 'job_id']),
+  send:   new Set(['action', 'task', 'mode', 'template', 'template_args', 'cwd', 'thread', 'max_wait_sec', 'parallel', 'claude_session_id', 'host_session_id']),
+  wait:   new Set(['action', 'job_id', 'max_wait_sec', 'claude_session_id', 'host_session_id']),
+  status: new Set(['action', 'job_id', 'verbose', 'claude_session_id', 'host_session_id']),
+  reply:  new Set(['action', 'job_id', 'message', 'claude_session_id', 'host_session_id']),
+  cancel: new Set(['action', 'job_id', 'claude_session_id', 'host_session_id']),
 };
 
 // Per-template allowed keys. Plan_review and general have disjoint key sets;
@@ -213,10 +225,11 @@ export function appendRubberDuckReview(formatted) {
 // --- Plan path resolution ---------------------------------------------------
 
 // PLANS_DIR can be overridden via COPILOT_PLANS_DIR for testing; otherwise
-// it defaults to ~/.claude/plans. Resolved per call so tests can set the
+// it routes through lib/host.mjs (so Codex resolves to ~/.codex/plans/
+// instead of Claude's directory). Resolved per call so tests can set the
 // env var without re-importing the module.
 export function getPlansDir() {
-  return process.env.COPILOT_PLANS_DIR || join(homedir(), '.claude', 'plans');
+  return process.env.COPILOT_PLANS_DIR || plansDir(detectHost());
 }
 export const PLANS_DIR = getPlansDir();
 
@@ -300,6 +313,29 @@ export function validateCopilotArgs(rawArgs) {
   }
 }
 
+// Accept either input alias and normalize to a single internal value.
+// host_session_id is the host-neutral name introduced for the dual-host
+// rollout; claude_session_id remains accepted unchanged so existing Claude
+// callers (the Markdown subagent in templates/copilot-companion.md) need
+// no code changes. If both are present they must agree — disagreement is
+// almost certainly a caller bug worth surfacing rather than silently
+// preferring one.
+function normalizeHostSid(args) {
+  const claudeRaw = args.claude_session_id;
+  const hostRaw = args.host_session_id;
+  if (claudeRaw == null && hostRaw == null) return null;
+  for (const [name, raw] of [['claude_session_id', claudeRaw], ['host_session_id', hostRaw]]) {
+    if (raw == null) continue;
+    if (typeof raw !== 'string' || !raw) {
+      throw new Error(`copilot: ${name} must be a non-empty string when provided`);
+    }
+  }
+  if (claudeRaw != null && hostRaw != null && claudeRaw !== hostRaw) {
+    throw new Error('copilot: claude_session_id and host_session_id provided with different values; pass only one');
+  }
+  return claudeRaw ?? hostRaw;
+}
+
 function validateReply(args) {
   // v6.1 D4: peer-steering. Both fields strictly required — there is no
   // sensible default for either.
@@ -308,12 +344,12 @@ function validateReply(args) {
   if (args.message.length > 8000) {
     throw new Error(`copilot: reply.message too long (${args.message.length} > 8000 chars)`);
   }
-  return { action: 'reply', job_id: args.job_id, message: args.message };
+  return { action: 'reply', job_id: args.job_id, message: args.message, host_session_id: normalizeHostSid(args) };
 }
 
 function validateCancel(args) {
   assertString('job_id', args.job_id);
-  return { action: 'cancel', job_id: args.job_id };
+  return { action: 'cancel', job_id: args.job_id, host_session_id: normalizeHostSid(args) };
 }
 
 function validateWait(args) {
@@ -321,13 +357,13 @@ function validateWait(args) {
   if (args.max_wait_sec !== undefined && typeof args.max_wait_sec !== 'number') {
     throw new Error('copilot: max_wait_sec must be a number');
   }
-  return { action: 'wait', job_id: args.job_id, max_wait_sec: args.max_wait_sec };
+  return { action: 'wait', job_id: args.job_id, max_wait_sec: args.max_wait_sec, host_session_id: normalizeHostSid(args) };
 }
 
 function validateStatus(args) {
   assertString('job_id', args.job_id, { optional: true });
   assertBoolean('verbose', args.verbose);
-  return { action: 'status', job_id: args.job_id || null, verbose: !!args.verbose };
+  return { action: 'status', job_id: args.job_id || null, verbose: !!args.verbose, host_session_id: normalizeHostSid(args) };
 }
 
 function validateSend(args) {
@@ -441,5 +477,6 @@ function validateSend(args) {
     thread: args.thread || null,
     max_wait_sec: args.max_wait_sec,
     parallel,
+    host_session_id: normalizeHostSid(args),
   };
 }

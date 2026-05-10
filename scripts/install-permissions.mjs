@@ -4,11 +4,19 @@
 // relies only on the Node version setup.sh already verifies.
 //
 // Usage:
-//   node scripts/install-permissions.mjs            # interactive y/N
-//   node scripts/install-permissions.mjs --yes      # non-interactive (used by setup.sh)
+//   node scripts/install-permissions.mjs                   # interactive y/N (Claude)
+//   node scripts/install-permissions.mjs --yes             # non-interactive (Claude, used by setup.sh)
+//   node scripts/install-permissions.mjs --host codex      # no-op (see below)
 //
-// Exit codes: 0 success / already present, 1 user-aborted or non-tty without --yes,
-// 2 malformed settings.json (parse error or wrong shape).
+// Why --host codex is a no-op: Codex's permission/approval model is
+// fundamentally different (sandbox modes, trust levels, per-project
+// trust_level entries) and doesn't read a per-MCP-tool allow-list out
+// of any user-scope file we control. Injecting permissions is therefore
+// out of scope for this script. Setup.sh delegates to it for both hosts
+// to keep the flow uniform; the codex branch logs a noop and exits 0.
+//
+// Exit codes: 0 success / already present / codex no-op, 1 user-aborted or
+// non-tty without --yes, 2 malformed settings.json (parse error or wrong shape).
 
 import {
   existsSync,
@@ -27,11 +35,26 @@ const SETTINGS = path.join(homedir(), '.claude', 'settings.json');
 const args = process.argv.slice(2);
 const yes = args.includes('--yes') || args.includes('-y');
 
+const hostIdx = args.indexOf('--host');
+const host = hostIdx >= 0 ? args[hostIdx + 1] : 'claude';
+if (host !== 'claude' && host !== 'codex') {
+  console.error(`[FAIL] --host must be 'claude' or 'codex' (got: ${host})`);
+  process.exit(2);
+}
+
 const ok = (m) => console.log(`[OK]   ${m}`);
 const fail = (m, code = 1) => {
   console.error(`[FAIL] ${m}`);
   process.exit(code);
 };
+
+// Codex permission model is not addressed by this plan — emit a clear
+// no-op marker so setup.sh's exit-code check stays happy and a future
+// Codex-permission implementation has an obvious place to plug in.
+if (host === 'codex') {
+  ok('permission injection skipped: Codex permission model not handled by this plan');
+  process.exit(0);
+}
 
 mkdirSync(path.dirname(SETTINGS), { recursive: true });
 

@@ -1,0 +1,13 @@
+{
+  "name": "copilot-companion",
+  "version": "0.0.1",
+  "description": "GitHub Copilot delegation companion for Codex CLI. Spawns a subagent that owns a dedicated MCP bridge + ACP daemon and delegates token-heavy tasks to Copilot CLI, freeing the parent's context.",
+  "keywords": [
+    "copilot",
+    "delegation",
+    "mcp",
+    "subagent",
+    "acp",
+    "codex"
+  ]
+}

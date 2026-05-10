@@ -1,44 +1,58 @@
 # Copilot Companion
 
-GitHub Copilot delegation for Claude Code, v0.0.1 — **Claude Code plugin with subagent-isolated architecture**.
+GitHub Copilot delegation for Claude Code **and Codex CLI**, v0.0.1 — **dual-host plugin with subagent-isolated architecture**.
 
-The entire public surface is a single Claude Code subagent shipped inside this
-plugin. Main Claude has **zero** direct MCP visibility into copilot-bridge; the
-MCP server is registered at plugin scope and only the subagent declares it in
-its `tools:` list. There is no slash command, no user-scope MCP registration,
-no main-session hooks, no skill, no session opt-in, no pause. Sends through the
+The entire public surface is a single subagent shipped inside this plugin (one
+Markdown variant for Claude Code, one TOML variant for Codex CLI). Main Claude
+or main Codex has **zero** direct MCP visibility into copilot-bridge; the MCP
+server is declared only in the subagent's frontmatter and only the subagent
+sees it. There is no slash command, no user-scope MCP registration, no
+main-session hooks, no skill, no session opt-in, no pause. Sends through the
 `general` template invoke Copilot's built-in `/fleet` orchestrator by default;
 see [Parallel orchestration](#parallel-orchestration) for details and opt-out.
+
+> **Host selection.** `setup.sh` defaults to `--host claude`. Pass `--host codex`
+> for a Codex-only install or `--host both` to install both. Auto-detection
+> from PATH is deliberately not done — installing for Codex would silently
+> change the experience for existing Claude users who happen to also have
+> Codex installed.
 
 ## Architecture at a glance
 
 ```
 copilot-companion/                            ← plugin root
 ├── .claude-plugin/
-│   └── plugin.json                           plugin manifest
-├── agents/
-│   └── copilot-companion.md                  subagent definition
-├── .mcp.json                                 copilot-bridge MCP server
+│   └── plugin.json                           Claude Code plugin manifest
+├── .codex-plugin/
+│   └── plugin.json                           Codex CLI plugin manifest
+├── templates/
+│   ├── copilot-companion.md                  Claude subagent template (Markdown + YAML frontmatter)
+│   └── copilot-companion.toml                Codex subagent template (TOML; runtime equivalent)
 ├── hooks/
-│   ├── hooks.json                            SessionStart + PostToolUse + UserPromptSubmit
-│   ├── drain-completions.sh                  surfaces orphan Copilot completions
-│   └── install-deps.sh                       installs bridge-server node_modules to ${CLAUDE_PLUGIN_DATA}
+│   ├── hooks.json                            Claude SessionStart + PostToolUse + UserPromptSubmit
+│   ├── drain-completions.sh                  surfaces orphan Copilot completions (host-agnostic)
+│   ├── install-deps.sh                       installs bridge-server node_modules
+│   ├── install-agent.sh                      Claude SessionStart: materialize Markdown subagent
+│   ├── install-agent-codex.sh                Codex SessionStart: materialize TOML subagent
+│   └── prewarm-daemon.sh                     starts copilot-acp-daemon early
 ├── bridge-server/
 │   ├── server.mjs                            `copilot` MCP tool, 5 actions:
 │   │                                         send | wait | status | reply | cancel
 │   ├── validation.mjs                        per-action field allow-lists, schemas
 │   └── package.json                          runtime deps (MCP SDK)
 ├── lib/                                      state + logging + prompt utilities
+│   ├── host.mjs                              host detection + per-host paths (claude | codex)
 │   ├── state.mjs                             default-model + threads/ state layer
 │   ├── log.mjs                               structured logging helper
 │   ├── prompt-supervisor.mjs                 wraps Copilot prompts (rubber-duck, etc.)
 │   └── prompt-inspect.mjs                    diagnostic dump for a Copilot prompt
-├── scripts/                                  daemon + client
+├── scripts/
 │   ├── copilot-acp-daemon.mjs                long-lived Copilot parent process
-│   └── copilot-acp-client.mjs                daemon stop/status CLI
-├── setup.sh                                  local-dev bootstrap (optional)
-├── default-model                             optional; 1-line model id
-└── threads/<name>.sid                        persisted Copilot session ids
+│   ├── copilot-acp-client.mjs                daemon stop/status CLI
+│   ├── install-permissions.mjs               --host claude (Claude permissions); --host codex no-op
+│   └── install-codex-hooks.mjs               read-merge-backup-write into ~/.codex/hooks.json
+├── setup.sh                                  --host claude|codex|both (default: claude)
+└── ~/.{claude,codex}/copilot-companion/      per-host runtime state (threads, jobs, default-model)
 ```
 
 ## Installation
@@ -94,6 +108,35 @@ Once submitted and approved:
 /plugin install copilot-companion@<marketplace-name>
 ```
 
+## Install for Codex CLI
+
+`codex plugin` has no `install` subcommand on 0.128.0 — `codex plugin marketplace add|upgrade|remove` only registers a *catalog* of plugins, and the actual enable step happens in the desktop app/TUI. For our flow, `setup.sh --host codex` performs the install directly without needing a marketplace registration:
+
+```bash
+bash setup.sh --host codex
+```
+
+What that does, end-to-end:
+
+1. **Materializes the TOML subagent** to `~/.codex/agents/copilot-companion.toml` (the only place Codex looks for unmanaged subagents — `~/.codex/agents/` and `<repo>/.codex/agents/` per `agent_roles.rs`). `${CLAUDE_PLUGIN_ROOT}` in the bridge MCP `args` is substituted to the absolute install path at materialization time, because Codex MCP `args` are runtime literals (no `${VAR}` expansion).
+2. **Merges hook entries** into `~/.codex/hooks.json` via `scripts/install-codex-hooks.mjs`. Pre-existing user hooks are preserved (read-merge-backup-write); each managed entry carries `_managed_by: "copilot-companion"` so a later `--uninstall` only removes our entries. A timestamped backup is written before each modification. Hook commands embed an absolute plugin-root path because Codex does NOT expand `${CLAUDE_PLUGIN_ROOT}` for user-scope hooks (only plugin-scope hooks discovered through `append_plugin_hook_sources` get that env var injected).
+3. **Skips Claude-specific steps**: no `~/.claude/settings.json` permission injection (Codex's permission/sandbox/trust model is not addressed by this plan), no `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` (Codex's `features.multi_agent` is `Stable` and on by default).
+4. **Writes a diagnostic marker** at `~/.codex/copilot-companion/.host` containing the literal `codex` so you can `cat` it to confirm what was installed where.
+
+After setup, run `codex` and ask main Codex to delegate to Copilot (e.g. _"have copilot audit the auth module"_) — main Codex spawns the `copilot-companion` subagent via `spawn_agent`, the bridge starts inline, and the flow mirrors the Claude path. Session id continuity is handled server-side: Codex injects `_meta["x-codex-turn-metadata"].session_id` on every MCP request, and the bridge reads it directly — there is no `claude_session_id`/`host_session_id` to forward by hand.
+
+If you'd rather install for both hosts in one shot:
+
+```bash
+bash setup.sh --host both
+```
+
+To remove only the Codex hook entries from `~/.codex/hooks.json` without uninstalling anything else:
+
+```bash
+node scripts/install-codex-hooks.mjs --plugin-root "$(pwd)" --uninstall --yes
+```
+
 ## Prerequisites
 
 - **Node.js ≥ 20**
@@ -101,7 +144,7 @@ Once submitted and approved:
   ```bash
   export COPILOT_BIN=$(command -v copilot)
   ```
-- **Agent Teams env var** — `export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the shell (required for SendMessage-based thread continuity).
+- **Agent Teams env var (Claude only)** — `export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the shell (required for SendMessage-based thread continuity). On Codex this is unnecessary: `features.multi_agent` is `Stable` and on by default.
 
 ## Permissions (user setup)
 
@@ -271,11 +314,32 @@ mcp__copilot-bridge__copilot, Bash, Read, Write, Edit, Grep, Glob, WebFetch, Tod
 
 `mcp__copilot-bridge__copilot` is the canonical dispatch tool. All others exist for diagnostics, artifact handling, and self-sufficiency. See the frontmatter "Tool surface" and "Forbidden" sections for when each is appropriate.
 
+## Diagnostics
+
+`setup.sh` writes a one-line marker file under each host's directory at install time, advisory-only, useful when a system has both hosts installed and you want to confirm what landed where:
+
+```bash
+cat ~/.claude/copilot-companion/.host    # → "claude" if installed
+cat ~/.codex/copilot-companion/.host     # → "codex"  if installed
+```
+
+Actual host-routing at runtime is decided by the `COPILOT_COMPANION_HOST` env var injected into the bridge's MCP `env:` block (set to `"codex"` literal in the materialized Codex TOML; not set on Claude, which falls back to the default). The marker files are NOT a fallback signal — with concurrent installs on both hosts, a fallback would be ambiguous.
+
+To inspect host selection from inside a bridge process:
+
+```bash
+# Each bridge spawn logs its detected host once at startup.
+grep '"event":"bridge.startup"' ~/.claude/copilot-companion/daemon.log
+grep '"event":"bridge.startup"' ~/.codex/copilot-companion/daemon.log
+```
+
+(The log file is the bridge's structured JSONL log under the host's `copilot-companion` state directory; each entry includes a `host_detected` field with `claude` or `codex`.)
+
 ## Development
 
 - `node --check` should pass on every `.mjs` after edits.
-- Tests: `node --test bridge-server/validation.test.mjs bridge-server/server.test.mjs lib/state.test.mjs lib/log.test.mjs lib/prompt-inspect.test.mjs lib/prompt-supervisor.test.mjs`
-- Validate the plugin manifest: `claude plugin validate` from the plugin root.
+- Tests: `node --test bridge-server/validation.test.mjs bridge-server/server.test.mjs lib/state.test.mjs lib/host.test.mjs lib/log.test.mjs lib/prompt-inspect.test.mjs lib/prompt-supervisor.test.mjs scripts/install-codex-hooks.test.mjs templates/copilot-companion.toml.test.mjs`
+- Validate the Claude plugin manifest: `claude plugin validate` from the plugin root.
 
 ## Out of scope
 

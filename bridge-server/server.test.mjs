@@ -4,6 +4,17 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// state.mjs binds BASE_DIR at module-load. Set the sandbox BEFORE importing
+// any module that touches state. Tests that exercise the persisted job
+// ledger rely on this sandbox.
+const STATE_SANDBOX = mkdtempSync(join(tmpdir(), 'copilot-state-server-'));
+process.env.COPILOT_COMPANION_HOME = STATE_SANDBOX;
+
+test.after(() => rmSync(STATE_SANDBOX, { recursive: true, force: true }));
 
 test('server.mjs is importable without spawning MCP transport', async () => {
   const mod = await import('./server.mjs');
@@ -18,6 +29,36 @@ test('dispatch rejects unknown actions', async () => {
     () => dispatch({ action: 'frobnicate' }),
     /unhandled action/,
   );
+});
+
+test('dispatch send rejects when CLAUDE_CODE_SESSION_ID is unset', async () => {
+  const { dispatch } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    const result = await dispatch({ action: 'send', task: 'do thing', mode: 'EXECUTE', template: 'general' });
+    const body = JSON.parse(result.content[0].text);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /CLAUDE_CODE_SESSION_ID/);
+    // No throw, no exit — bridge stays alive so other actions still work.
+  } finally {
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
+
+test('dispatch wait/cancel work without env sid (look up job from jobs map)', async () => {
+  const { dispatch, jobs } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    // unknown job_id paths don't depend on env sid
+    const w = await dispatch({ action: 'wait', job_id: 'no-such', max_wait_sec: 1 });
+    assert.equal(JSON.parse(w.content[0].text).status, 'unknown_job');
+    const c = await dispatch({ action: 'cancel', job_id: 'no-such' });
+    assert.match(JSON.parse(c.content[0].text).error, /unknown job_id/);
+  } finally {
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
 });
 
 test('dispatch reply rejects unknown job_id', async () => {
@@ -322,6 +363,505 @@ test('emitNotification: writes meta.detail to queue file when detail set', async
     assert.equal(event.meta.detail, 'bridge_daemon_unreachable');
   } finally {
     if (oldQ === undefined) delete process.env.COPILOT_QUEUE_PATH; else process.env.COPILOT_QUEUE_PATH = oldQ;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('persistJob writes file; gcExpiredJobs evicts in-memory entry and deletes file', async () => {
+  const { existsSync } = await import('node:fs');
+  const { jobs, gcExpiredJobs, persistJob } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+
+  jobs.set('j-gc', {
+    jobId: 'j-gc',
+    claudeSessionId: 'sid-X',
+    sessionId: 'cop-sid-1',
+    status: 'completed',
+    terminalAt: Date.now() - 10_000,
+    retentionExpiresAt: Date.now() - 5_000,
+  });
+  persistJob('j-gc');
+
+  const filePath = join(state.JOBS_DIR, 'j-gc.json');
+  assert.equal(existsSync(filePath), true, 'persisted file written under sandbox');
+
+  // sessionId in-memory → copilotSessionId on disk; claudeSessionId preserved.
+  const persisted = state.readJob('j-gc');
+  assert.equal(persisted.copilotSessionId, 'cop-sid-1');
+  assert.equal(persisted.claudeSessionId, 'sid-X');
+  assert.equal(persisted.sessionId, undefined, 'in-memory `sessionId` field is renamed, not duplicated');
+
+  gcExpiredJobs();
+  assert.equal(jobs.has('j-gc'), false, 'in-memory entry evicted');
+  assert.equal(existsSync(filePath), false, 'persisted file deleted');
+});
+
+test('getHostSessionId rejects literal ${VAR} placeholder from unexpanded env block', async () => {
+  const { getHostSessionId, _resetForTest } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  _resetForTest();
+  process.env.CLAUDE_CODE_SESSION_ID = '${CLAUDE_CODE_SESSION_ID}';
+  try {
+    assert.equal(getHostSessionId(), null,
+      'literal placeholder must NOT be treated as a valid sid');
+  } finally {
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
+
+test('dispatch adopts host_session_id from arg when env is unset', async () => {
+  const { dispatch, getHostSessionId, _resetForTest } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  _resetForTest();
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    // Unknown job_id is fine — we're just verifying adoption side-effect.
+    // host_session_id is the post-validation contract field (dispatch consumes
+    // the normalized object). Direct dispatch tests must use this name;
+    // claude_session_id alias acceptance is exercised via validateCopilotArgs
+    // in validation.test.mjs.
+    await dispatch({ action: 'wait', job_id: 'no-such', max_wait_sec: 1, host_session_id: 'arg-adopted-sid' });
+    assert.equal(getHostSessionId(), 'arg-adopted-sid', 'bridge adopted sid from MCP arg');
+  } finally {
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('dispatch adopts arg sid even when env carries a literal placeholder', async () => {
+  const { dispatch, getHostSessionId, _resetForTest } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  _resetForTest();
+  process.env.CLAUDE_CODE_SESSION_ID = '${CLAUDE_CODE_SESSION_ID}';
+  try {
+    await dispatch({ action: 'status', job_id: null, verbose: false, host_session_id: 'real-uuid-xyz' });
+    assert.equal(getHostSessionId(), 'real-uuid-xyz',
+      'arg overrides broken-env literal placeholder');
+  } finally {
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('validateCopilotArgs + dispatch round-trip: claude_session_id alias is normalized into host_session_id', async () => {
+  // Proves the full flow: legacy Claude callers passing `claude_session_id`
+  // still work — validation normalizes the field to host_session_id, dispatch
+  // adopts via the normalized object.
+  const { dispatch, getHostSessionId, _resetForTest } = await import('./server.mjs');
+  const { validateCopilotArgs } = await import('./validation.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  _resetForTest();
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    const normalized = validateCopilotArgs({
+      action: 'status',
+      job_id: null,
+      claude_session_id: 'legacy-claude-sid',
+    });
+    assert.equal(normalized.host_session_id, 'legacy-claude-sid',
+      'validation normalized claude_session_id input → host_session_id field');
+    await dispatch(normalized);
+    assert.equal(getHostSessionId(), 'legacy-claude-sid');
+  } finally {
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('MCP _meta["x-codex-turn-metadata"].session_id is adoptable as the primary Codex path', async () => {
+  // Codex flow: server.mjs's CallToolRequestSchema handler extracts
+  // request.params._meta["x-codex-turn-metadata"].session_id and calls
+  // adoptHostSessionId before dispatch. We can't easily wire the MCP
+  // transport in a unit test, so we exercise the same helper directly
+  // — that's what the handler calls.
+  const { adoptHostSessionId, getHostSessionId, _resetForTest } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  _resetForTest();
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    const codexSid = '019e0dc8-94b3-7172-abeb-60578f8a8a8d';
+    adoptHostSessionId(codexSid);
+    assert.equal(getHostSessionId(), codexSid,
+      'bridge adopted sid from simulated _meta path');
+  } finally {
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('_meta-adopted sid wins over later host_session_id arg with different value (BRIDGE_SID_CONFLICT)', async () => {
+  // Ordering invariant: the MCP handler calls adoptHostSessionId(metaSid)
+  // BEFORE dispatch — so once _meta wins, a conflicting arg-side adoption
+  // is rejected with BRIDGE_SID_CONFLICT and dispatch short-circuits
+  // before the action runs. This is the contract the drain hook depends
+  // on (the bridge tags queue rows with the same sid Codex sends to hook
+  // stdin); silent-ignore would let a misrouted call land on the wrong
+  // session's ledger.
+  const { adoptHostSessionId, dispatch, getHostSessionId, _resetForTest } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  _resetForTest();
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    adoptHostSessionId('meta-sid-codex');
+    const result = await dispatch({
+      action: 'status', job_id: null, verbose: false,
+      host_session_id: 'arg-sid-different',
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.ok, false, 'mismatched arg-sid yields ok:false');
+    assert.equal(parsed.code, 'BRIDGE_SID_CONFLICT', 'error code surfaces conflict');
+    assert.match(parsed.error, /sid conflict/i, 'error message describes the conflict');
+    assert.equal(getHostSessionId(), 'meta-sid-codex',
+      'meta-adopted sid retained even though the arg-side adoption was rejected');
+  } finally {
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('matching second adoption (meta then arg with same sid) is silently accepted', async () => {
+  // Guard against accidental over-strictness: only differing sids should
+  // throw. A second adoption of the *same* sid (e.g. _meta on turn 1,
+  // matching host_session_id arg on turn 2) is a no-op, and dispatch
+  // proceeds to the action.
+  const { adoptHostSessionId, dispatch, getHostSessionId, _resetForTest } = await import('./server.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  _resetForTest();
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    adoptHostSessionId('shared-sid');
+    const result = await dispatch({
+      action: 'status', job_id: null, verbose: false,
+      host_session_id: 'shared-sid',
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.ok, true, 'matching arg-sid is accepted; status action runs');
+    assert.notEqual(parsed.code, 'BRIDGE_SID_CONFLICT', 'no conflict reported on match');
+    assert.equal(getHostSessionId(), 'shared-sid', 'sid stays bound to the agreed value');
+  } finally {
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+// Note: not asserting send-with-arg-sid via dispatch — handleSend kicks off a
+// background runWorker that contacts the real daemon, which would burn live
+// Copilot tokens. The gate logic is exercised end-to-end by the integration
+// run from a copilot-companion subagent (see /tmp/copilot-bridge.log line
+// "sid adopted: <uuid>" after a real subagent dispatch).
+
+test('resolveSendThread: explicit args.thread wins over stored mapping', async () => {
+  const { resolveSendThread } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+  const sid = 'codex-sid-explicit-wins';
+  state.writeHostSessionThread(sid, 'stored-thread');
+  try {
+    const out = resolveSendThread('caller-thread', sid, 'copilot-job1');
+    assert.equal(out, 'caller-thread', 'explicit caller thread wins');
+    assert.equal(state.readHostSessionThread(sid), 'caller-thread',
+      'mapping is updated to caller-supplied thread');
+  } finally {
+    state.clearHostSessionThread(sid);
+  }
+});
+
+test('resolveSendThread: falls back to stored mapping when no args.thread', async () => {
+  const { resolveSendThread } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+  const sid = 'codex-sid-stored-fallback';
+  state.writeHostSessionThread(sid, 'companion-prior-job');
+  try {
+    const out = resolveSendThread(null, sid, 'copilot-job2');
+    assert.equal(out, 'companion-prior-job',
+      'stored host-session thread reused');
+  } finally {
+    state.clearHostSessionThread(sid);
+  }
+});
+
+test('resolveSendThread: auto-generates and persists when neither caller-supplied nor stored', async () => {
+  const { resolveSendThread } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+  const sid = 'codex-sid-fresh';
+  state.clearHostSessionThread(sid);
+  try {
+    const out = resolveSendThread(null, sid, 'copilot-jobNEW');
+    assert.equal(out, 'companion-copilot-jobNEW', 'auto thread name follows companion-<jobId>');
+    assert.equal(state.readHostSessionThread(sid), 'companion-copilot-jobNEW',
+      'mapping persisted for next send');
+  } finally {
+    state.clearHostSessionThread(sid);
+  }
+});
+
+test('resolveSendThread: no host session id → no state-file work, plain auto-generation', async () => {
+  const { resolveSendThread } = await import('./server.mjs');
+  const out = resolveSendThread(null, '', 'copilot-jobNOSID');
+  assert.equal(out, 'companion-copilot-jobNOSID');
+});
+
+test('resolveSendThread: host session id with disallowed chars is sanitized for file path', async () => {
+  const { resolveSendThread } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+  const rawSid = 'codex/has spaces!';
+  const sanitized = 'codex_has_spaces_';
+  try {
+    const out = resolveSendThread(null, rawSid, 'copilot-jobX');
+    assert.equal(out, 'companion-copilot-jobX');
+    assert.equal(state.readHostSessionThread(sanitized), 'companion-copilot-jobX',
+      'mapping is keyed by sanitized id (raw path would be invalid)');
+  } finally {
+    state.clearHostSessionThread(sanitized);
+  }
+});
+
+test('hydrateJobsFromLedger claims own-session jobs, ignores other-session jobs', async () => {
+  const { jobs, hydrateJobsFromLedger } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-hydrate-A';
+  try {
+    state.writeJob('j-mine-terminal', {
+      jobId: 'j-mine-terminal', claudeSessionId: 'sid-hydrate-A',
+      copilotSessionId: 'cop-1', thread: null,
+      status: 'completed', startedAt: 1000, terminalAt: 2000,
+      retentionExpiresAt: Date.now() + 60_000,
+    });
+    state.writeJob('j-other-session', {
+      jobId: 'j-other-session', claudeSessionId: 'sid-other-B',
+      status: 'running', startedAt: 1000,
+    });
+
+    jobs.clear();
+    const { _resetForTest } = await import('./server.mjs');
+    _resetForTest();
+    hydrateJobsFromLedger();
+
+    assert.equal(jobs.has('j-mine-terminal'), true, 'own session terminal job claimed');
+    assert.equal(jobs.has('j-other-session'), false, 'other-session job NOT claimed');
+    const claimed = jobs.get('j-mine-terminal');
+    assert.equal(claimed.sessionId, 'cop-1', 'persisted copilotSessionId restored as in-memory sessionId');
+
+    state.deleteJob('j-mine-terminal');
+    state.deleteJob('j-other-session');
+    jobs.clear();
+  } finally {
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
+
+test('hydrateJobsFromLedger restores thread→sid mapping for resumed jobs', async () => {
+  const { jobs, hydrateJobsFromLedger } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-hydrate-thread';
+  try {
+    state.clearThread('thread-restored');
+    state.writeJob('j-with-thread', {
+      jobId: 'j-with-thread', claudeSessionId: 'sid-hydrate-thread',
+      copilotSessionId: 'cop-thread-sid', thread: 'thread-restored',
+      status: 'completed', startedAt: 1000, terminalAt: 2000,
+      retentionExpiresAt: Date.now() + 60_000,
+    });
+
+    jobs.clear();
+    const { _resetForTest } = await import('./server.mjs');
+    _resetForTest();
+    hydrateJobsFromLedger();
+
+    assert.equal(state.readThreadSid('thread-restored'), 'cop-thread-sid',
+      'thread sid file restored from ledger');
+
+    state.deleteJob('j-with-thread');
+    state.clearThread('thread-restored');
+    jobs.clear();
+  } finally {
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
+
+test('rehydrated terminal job: dispatch wait marks the queue row consumed (no double-delivery)', async () => {
+  const { mkdtempSync, writeFileSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { jobs, dispatch, hydrateJobsFromLedger } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+
+  const tmpQ = mkdtempSync(join(tmpdir(), 'copilot-rehydrate-q-'));
+  const queueFile = join(tmpQ, 'q.jsonl');
+  const oldQ = process.env.COPILOT_QUEUE_PATH;
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.COPILOT_QUEUE_PATH = queueFile;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-rehydrate-A';
+
+  try {
+    // Pre-bridge state: terminal job persisted, plus one unconsumed queue row
+    // for that job (as if the previous bridge wrote it before dying).
+    state.writeJob('j-rehydrated', {
+      jobId: 'j-rehydrated', claudeSessionId: 'sid-rehydrate-A',
+      copilotSessionId: 'cop-rh', thread: null,
+      task: 'old task', mode: 'EXECUTE',
+      status: 'completed',
+      summary: { message: 'all done' },
+      error: null, stuckReason: null, detail: null,
+      startedAt: Date.now() - 5000, terminalAt: Date.now() - 1000,
+      retentionExpiresAt: Date.now() + 60_000,
+    });
+    const queueRow = {
+      ts: Date.now() - 1000, kind: 'terminal', jobId: 'j-rehydrated',
+      claudeSessionId: 'sid-rehydrate-A', consumed: false,
+      content: 'all done', meta: { status: 'completed' },
+    };
+    writeFileSync(queueFile, JSON.stringify(queueRow) + '\n');
+
+    jobs.clear();
+    const { _resetForTest } = await import('./server.mjs');
+    _resetForTest();
+    hydrateJobsFromLedger();
+    assert.equal(jobs.has('j-rehydrated'), true, 'rehydrated into in-memory map');
+
+    // Subagent (re-spawned by Claude Code on a fresh bridge) calls wait.
+    const result = await dispatch({ action: 'wait', job_id: 'j-rehydrated', max_wait_sec: 1 });
+    const body = JSON.parse(result.content[0].text);
+    assert.equal(body.ok, true);
+    assert.equal(body.status, 'completed');
+
+    // The queue row should now be consumed:true so the next drain cycle
+    // doesn't re-deliver the same content the wait response just carried.
+    const post = readFileSync(queueFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(post.length, 1);
+    assert.equal(post[0].consumed, true, 'queue row marked consumed by wait response');
+
+    state.deleteJob('j-rehydrated');
+    jobs.clear();
+  } finally {
+    if (oldQ === undefined) delete process.env.COPILOT_QUEUE_PATH; else process.env.COPILOT_QUEUE_PATH = oldQ;
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    rmSync(tmpQ, { recursive: true, force: true });
+  }
+});
+
+test('hydrateJobsFromLedger marks starting-without-promptId as unreachable', async () => {
+  const { jobs, hydrateJobsFromLedger } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-hydrate-orphan';
+  try {
+    state.writeJob('j-orphan', {
+      jobId: 'j-orphan', claudeSessionId: 'sid-hydrate-orphan',
+      status: 'starting', startedAt: 1000,
+      // no promptId, no terminalAt
+    });
+
+    jobs.clear();
+    const { _resetForTest } = await import('./server.mjs');
+    _resetForTest();
+    hydrateJobsFromLedger();
+    const claimed = jobs.get('j-orphan');
+    assert.ok(claimed, 'orphan claimed');
+    assert.equal(claimed.status, 'unreachable');
+    assert.equal(claimed.detail, 'rehydrate_no_promptid');
+
+    state.deleteJob('j-orphan');
+    jobs.clear();
+  } finally {
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
+
+test('sweepOwnSessionStaleQueueRows drops own stale rows, keeps fresh and other-session', async () => {
+  const { mkdtempSync, writeFileSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { sweepOwnSessionStaleQueueRows } = await import('./server.mjs');
+
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-sweep-test-'));
+  const queueFile = join(tmp, 'q.jsonl');
+  const oldQ = process.env.COPILOT_QUEUE_PATH;
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.COPILOT_QUEUE_PATH = queueFile;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-sweep-A';
+  try {
+    const NOW = Date.now();
+    const rows = [
+      { ts: NOW - 90_000, kind: 'alert', jobId: 'j-mine-old', claudeSessionId: 'sid-sweep-A', consumed: false, content: 'mine-old' },
+      { ts: NOW - 30_000, kind: 'alert', jobId: 'j-mine-fresh', claudeSessionId: 'sid-sweep-A', consumed: false, content: 'mine-fresh' },
+      { ts: NOW - 90_000, kind: 'alert', jobId: 'j-other-old', claudeSessionId: 'sid-sweep-B', consumed: false, content: 'other-old' },
+    ];
+    writeFileSync(queueFile, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+    sweepOwnSessionStaleQueueRows(NOW);
+
+    const remaining = readFileSync(queueFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const ids = remaining.map((r) => r.jobId).sort();
+    assert.deepEqual(ids, ['j-mine-fresh', 'j-other-old'],
+      'own-session stale dropped; fresh own and other-session retained');
+  } finally {
+    if (oldQ === undefined) delete process.env.COPILOT_QUEUE_PATH; else process.env.COPILOT_QUEUE_PATH = oldQ;
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('persistJob skips when claudeSessionId is null (untagged jobs not persisted)', async () => {
+  const { existsSync } = await import('node:fs');
+  const { jobs, persistJob } = await import('./server.mjs');
+  const state = await import('../lib/state.mjs');
+
+  jobs.set('j-untagged', { jobId: 'j-untagged', status: 'starting', startedAt: Date.now() });
+  persistJob('j-untagged');
+
+  const filePath = join(state.JOBS_DIR, 'j-untagged.json');
+  assert.equal(existsSync(filePath), false, 'untagged job not persisted');
+  jobs.delete('j-untagged');
+});
+
+test('emitNotification: stamps claudeSessionId from env on the queue event', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-queue-test-'));
+  const queueFile = join(tmp, 'completions.jsonl');
+  const oldQ = process.env.COPILOT_QUEUE_PATH;
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.COPILOT_QUEUE_PATH = queueFile;
+  process.env.CLAUDE_CODE_SESSION_ID = 'cc-test-session-abc';
+  try {
+    const { emitNotification } = await import('./server.mjs');
+    emitNotification({
+      jobId: 'j-sid', status: 'completed', summary: { message: 'ok' },
+      duration: 10, task: 'X', mode: 'EXECUTE', cwd: '/tmp',
+    });
+    const event = JSON.parse(readFileSync(queueFile, 'utf8').trim().split('\n').pop());
+    assert.equal(event.claudeSessionId, 'cc-test-session-abc');
+  } finally {
+    if (oldQ === undefined) delete process.env.COPILOT_QUEUE_PATH; else process.env.COPILOT_QUEUE_PATH = oldQ;
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('emitNotification: writes claudeSessionId=null when env unset', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const tmp = mkdtempSync(join(tmpdir(), 'copilot-queue-test-'));
+  const queueFile = join(tmp, 'completions.jsonl');
+  const oldQ = process.env.COPILOT_QUEUE_PATH;
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.COPILOT_QUEUE_PATH = queueFile;
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    const { emitNotification } = await import('./server.mjs');
+    emitNotification({
+      jobId: 'j-no-sid', status: 'completed', summary: { message: 'ok' },
+      duration: 10, task: 'X', mode: 'EXECUTE', cwd: '/tmp',
+    });
+    const event = JSON.parse(readFileSync(queueFile, 'utf8').trim().split('\n').pop());
+    assert.equal(event.claudeSessionId, null);
+  } finally {
+    if (oldQ === undefined) delete process.env.COPILOT_QUEUE_PATH; else process.env.COPILOT_QUEUE_PATH = oldQ;
+    if (oldS !== undefined) process.env.CLAUDE_CODE_SESSION_ID = oldS;
     rmSync(tmp, { recursive: true, force: true });
   }
 });

@@ -1,0 +1,223 @@
+#!/usr/bin/env node
+// install-codex-hooks.mjs — idempotently install the copilot-companion
+// hook entries into ~/.codex/hooks.json. Sibling of install-permissions.mjs;
+// owns the file format and merge semantics for Codex's user-scope hook
+// registry.
+//
+// Why we need this: Codex's `RawPluginManifest` has no `hooks` field that
+// fires for unmanaged plugins, and the `plugin_hooks` feature flag is
+// `UnderDevelopment` and OFF by default. The stable codex_hooks feature
+// reads only ~/.codex/hooks.json and per-project <repo>/.codex/hooks.json.
+// We route to the user-scope file so hooks fire across every Codex
+// session this user runs, not just those rooted in trusted repos.
+//
+// Why a script instead of just shipping hooks/hooks-codex.json: the user
+// almost certainly has other hooks already in place (their own
+// PreToolUse/PostToolUse scripts, other plugins' entries). Overwriting
+// would destroy unrelated work. Also, user-scope hook commands cannot
+// reference ${CLAUDE_PLUGIN_ROOT} (Codex injects that var only for
+// plugin-scope hooks discovered via append_plugin_hook_sources). So we
+// have to substitute the absolute plugin path at install time, which
+// only this script knows.
+//
+// Usage:
+//   node scripts/install-codex-hooks.mjs --plugin-root /abs/path [--yes]
+//   node scripts/install-codex-hooks.mjs --plugin-root /abs/path --uninstall
+//
+// Behavior:
+//   - Backs up ~/.codex/hooks.json to ~/.codex/hooks.json.bak.<ts> when
+//     it exists and would be modified.
+//   - Each managed entry carries `_managed_by: "copilot-companion"` so
+//     uninstall and re-install can locate just our entries without
+//     touching unrelated work.
+//   - Aborts cleanly if the existing file is not valid JSON (rather than
+//     overwriting and losing the user's data).
+//
+// Exit codes: 0 success / no-op, 1 user-aborted or non-tty without --yes,
+// 2 malformed hooks.json or other fatal fs/parse error.
+
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  copyFileSync,
+  mkdirSync,
+  renameSync,
+} from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import readline from 'node:readline/promises';
+
+const HOOKS_FILE = path.join(homedir(), '.codex', 'hooks.json');
+const SENTINEL_KEY = '_managed_by';
+const SENTINEL_VALUE = 'copilot-companion';
+
+const args = process.argv.slice(2);
+const yes = args.includes('--yes') || args.includes('-y');
+const uninstall = args.includes('--uninstall');
+const rootIdx = args.indexOf('--plugin-root');
+const pluginRoot = rootIdx >= 0 ? args[rootIdx + 1] : null;
+
+const ok = (m) => console.log(`[OK]   ${m}`);
+const fail = (m, code = 1) => {
+  console.error(`[FAIL] ${m}`);
+  process.exit(code);
+};
+
+if (!pluginRoot) {
+  fail('--plugin-root <abs path> required; pass the directory containing .codex-plugin/plugin.json', 2);
+}
+if (!path.isAbsolute(pluginRoot)) {
+  fail(`--plugin-root must be absolute (got: ${pluginRoot})`, 2);
+}
+
+// Hook definitions to install. Each command resolves to an absolute path
+// at install time — Codex does NOT expand ${CLAUDE_PLUGIN_ROOT} for
+// user-scope hooks (only for plugin-scope hooks discovered through
+// append_plugin_hook_sources). We export the var explicitly in the
+// command line so the underlying scripts (which still reference
+// $CLAUDE_PLUGIN_ROOT internally) can resolve their own paths.
+function bashEntry(scriptRel, timeout) {
+  const abs = path.join(pluginRoot, scriptRel);
+  return {
+    type: 'command',
+    command: `CLAUDE_PLUGIN_ROOT='${pluginRoot}' bash '${abs}'`,
+    timeout,
+    [SENTINEL_KEY]: SENTINEL_VALUE,
+  };
+}
+
+const MANAGED_ENTRIES = {
+  SessionStart: [
+    {
+      hooks: [
+        bashEntry('hooks/install-agent-codex.sh', 5),
+        bashEntry('hooks/prewarm-daemon.sh', 5),
+        bashEntry('hooks/install-deps.sh', 55),
+        bashEntry('hooks/drain-completions.sh', 5),
+      ],
+      [SENTINEL_KEY]: SENTINEL_VALUE,
+    },
+  ],
+  UserPromptSubmit: [
+    {
+      hooks: [bashEntry('hooks/drain-completions.sh', 5)],
+      [SENTINEL_KEY]: SENTINEL_VALUE,
+    },
+  ],
+  PostToolUse: [
+    {
+      matcher: '.*',
+      hooks: [bashEntry('hooks/drain-completions.sh', 5)],
+      [SENTINEL_KEY]: SENTINEL_VALUE,
+    },
+  ],
+};
+
+mkdirSync(path.dirname(HOOKS_FILE), { recursive: true });
+
+let cfg = {};
+if (existsSync(HOOKS_FILE)) {
+  let raw;
+  try {
+    raw = readFileSync(HOOKS_FILE, 'utf8');
+  } catch (e) {
+    fail(`cannot read ${HOOKS_FILE}: ${e.message}`, 2);
+  }
+  // Empty file is OK — treat as fresh config.
+  if (raw.trim().length > 0) {
+    try {
+      cfg = JSON.parse(raw);
+    } catch (e) {
+      fail(
+        `${HOOKS_FILE} is not valid JSON: ${e.message}. Fix manually (or move it aside) before re-running so we don't overwrite your data.`,
+        2,
+      );
+    }
+    if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) {
+      fail(`${HOOKS_FILE} top-level must be a JSON object`, 2);
+    }
+  }
+}
+
+if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
+  cfg.hooks = {};
+}
+
+// Drop every entry whose top-level _managed_by === SENTINEL_VALUE. Used
+// by both uninstall and the re-install merge (so a re-install picks up
+// the latest path/script set without leaving stale duplicates from a
+// previous run).
+function dropManaged(eventName) {
+  const list = cfg.hooks[eventName];
+  if (!Array.isArray(list)) return;
+  const filtered = list.filter((entry) => {
+    return !entry || entry[SENTINEL_KEY] !== SENTINEL_VALUE;
+  });
+  if (filtered.length === 0) {
+    delete cfg.hooks[eventName];
+  } else {
+    cfg.hooks[eventName] = filtered;
+  }
+}
+
+const ALL_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PreToolUse', 'Stop'];
+
+if (uninstall) {
+  for (const ev of ALL_EVENTS) dropManaged(ev);
+  if (Object.keys(cfg.hooks).length === 0) delete cfg.hooks;
+  writeAtomic(cfg);
+  ok(`removed copilot-companion hooks from ${HOOKS_FILE}`);
+  process.exit(0);
+}
+
+// Confirm with the user before mutating an existing file (skipped with --yes).
+if (existsSync(HOOKS_FILE) && !yes) {
+  if (!process.stdin.isTTY) {
+    fail('interactive confirmation required but stdin is not a tty; pass --yes', 1);
+  }
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const ans = (await rl.question(`Merge copilot-companion hooks into ${HOOKS_FILE}? [y/N] `))
+    .trim()
+    .toLowerCase();
+  rl.close();
+  if (ans !== 'y' && ans !== 'yes') {
+    console.log('aborted');
+    process.exit(1);
+  }
+}
+
+// Replace any prior managed entries (idempotent re-install) before
+// merging the fresh ones.
+for (const ev of ALL_EVENTS) dropManaged(ev);
+
+// Merge: append managed entries to each event's existing array. We
+// deliberately keep ours as separate sibling entries (rather than
+// folding into the user's existing matcher entries) so uninstall is a
+// clean filter operation.
+for (const [ev, entries] of Object.entries(MANAGED_ENTRIES)) {
+  if (!Array.isArray(cfg.hooks[ev])) cfg.hooks[ev] = [];
+  cfg.hooks[ev].push(...entries);
+}
+
+writeAtomic(cfg);
+ok(`installed copilot-companion hooks into ${HOOKS_FILE}`);
+
+function writeAtomic(data) {
+  const ts = new Date()
+    .toISOString()
+    .replace(/[-:T.]/g, '')
+    .slice(0, 14);
+  const hadExisting = existsSync(HOOKS_FILE);
+  if (hadExisting) {
+    const backup = `${HOOKS_FILE}.bak.${ts}`;
+    copyFileSync(HOOKS_FILE, backup);
+    console.log(`[INFO] backup: ${backup}`);
+  }
+  const tmp = `${HOOKS_FILE}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  renameSync(tmp, HOOKS_FILE);
+}

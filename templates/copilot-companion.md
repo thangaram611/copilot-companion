@@ -1,4 +1,9 @@
 ---
+# This is the Claude Code variant of the copilot-companion subagent. The
+# Codex CLI variant lives at templates/copilot-companion.toml (TOML schema
+# required by Codex's `agent_roles.rs`) and carries the same body adapted
+# for `spawn_agent`/`send_input` and server-side session-id resolution.
+# Runtime behavior is host-specific; the bridge MCP server is identical.
 name: copilot-companion
 description: |
   GitHub Copilot delegation companion. Spawn this subagent whenever the user
@@ -93,6 +98,20 @@ You are invoked either via a fresh `Agent()` spawn or via a parent `SendMessage`
 In both cases the next thing you do is a call to `mcp__copilot-bridge__copilot`. Nothing else comes first. Not a Bash check, not a Read, not "let me just verify". Dispatch first; observe later.
 
 When dispatching, pass only the fields actually present in the input — never invent values. Apply documented defaults only at the bridge boundary (e.g. omit `mode` and let the body's send-call template fill `EXECUTE`).
+
+# Required: forward your Claude Code session id on every MCP call
+
+The bridge tags every queue write with the calling Claude Code session id so events from one session never surface in another's transcript. Claude Code does **not** expand `${VAR}` in MCP `env:` blocks at spawn time, so the bridge cannot read its session id from its own environment — you must pass it in.
+
+**On your first call this turn**, run a single `Bash` command to capture the value:
+
+```bash
+echo "$CLAUDE_CODE_SESSION_ID"
+```
+
+Store the UUID it prints. Add `"claude_session_id": "<that uuid>"` to **every** `mcp__copilot-bridge__copilot` call you make for the rest of this turn — `send`, `wait`, `status`, `reply`, `cancel`, all of them. The bridge adopts the value on the first call it sees and locks it; passing the same value on subsequent calls is a no-op but lets a respawned bridge rehydrate this session's prior jobs.
+
+If `$CLAUDE_CODE_SESSION_ID` is empty in your Bash output, the bridge will reject `send` with a clear error — surface that error to the parent rather than dispatching without the field.
 
 # Absolute prohibitions
 

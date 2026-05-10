@@ -41,8 +41,11 @@ import {
   readDefaultModel,
   isModelAllowed,
   readThreadSid, writeThreadSid, listThreads,
+  readHostSessionThread, writeHostSessionThread,
+  writeJob, readJob, listJobsForSession, deleteJob,
   DEFAULT_MODEL,
 } from '../lib/state.mjs';
+import { sanitizeHostSessionId } from '../lib/host.mjs';
 import { createReqId, withReq, logEvent } from '../lib/log.mjs';
 
 // --- Queue (replaces dev-channel notifications) -----------------------------
@@ -55,14 +58,82 @@ function getQueuePath() {
   return process.env.COPILOT_QUEUE_PATH || '/tmp/copilot-completions.jsonl';
 }
 
+// The bridge's resolved host session id. Three sources, in precedence:
+//   1. MCP _meta["x-codex-turn-metadata"].session_id — Codex injects this
+//      on every CallToolRequest (PR openai/codex#15190); adopted in
+//      server.mjs's CallToolRequestSchema handler before dispatch.
+//   2. The host_session_id (or legacy claude_session_id) MCP arg —
+//      forwarded by the agent. Used by the Claude subagent because Claude
+//      Code does NOT expand ${VAR} in MCP env: blocks at spawn time, so
+//      env-var injection is unavailable. Codex falls back here only if
+//      _meta is absent (e.g. older Codex versions).
+//   3. CLAUDE_CODE_SESSION_ID env var — backstop for tests and direct
+//      Claude invocations that do set it.
+let _bridgeHostSid = null;
+
+export function getHostSessionId() {
+  return _bridgeHostSid || sanitizeSid(process.env.CLAUDE_CODE_SESSION_ID) || null;
+}
+
+// Reject obviously-bad values: empty, or an unexpanded shell template like
+// "${CLAUDE_CODE_SESSION_ID}" that survives Claude Code's literal-pass-through
+// of MCP env: blocks. A literal placeholder must NOT be treated as a valid
+// session id — every event tagged with it would land in a non-existent
+// session's drain bucket and never surface.
+function sanitizeSid(s) {
+  if (!s || typeof s !== 'string') return null;
+  if (s.includes('${') || s.includes('}')) return null;
+  return s;
+}
+
+// Set once per bridge process. Subsequent calls with a different sid throw
+// BRIDGE_SID_CONFLICT — multiple host sessions sharing one bridge violates
+// the isolation contract that the queue tagging is supposed to enforce.
+// Callers (MCP request handler, dispatch) catch and surface this as a
+// structured `{ ok: false, code: 'BRIDGE_SID_CONFLICT' }` response so a
+// misrouted call gets explicit feedback instead of silently landing on
+// the wrong session's ledger.
+function adoptHostSessionId(sid) {
+  if (!sid) return;
+  if (_bridgeHostSid && _bridgeHostSid !== sid) {
+    const err = new Error(
+      `bridge sid conflict: process bound to ${_bridgeHostSid}, received ${sid}. ` +
+      'Multiple host sessions sharing one bridge process violates queue-tag isolation.'
+    );
+    err.code = 'BRIDGE_SID_CONFLICT';
+    throw err;
+  }
+  if (_bridgeHostSid) return;
+  _bridgeHostSid = sid;
+  log('INFO', 'sid adopted:', sid);
+  // Lazy hydrate-and-sweep, deferred until the bridge actually knows whose
+  // session it serves. Idempotent guards inside both functions handle the
+  // already-run case.
+  try { hydrateJobsFromLedger(); } catch (err) { log('WARN', 'lazy hydrate failed:', err.message); }
+  try { sweepOwnSessionStaleQueueRows(); } catch (err) { log('WARN', 'lazy sweep failed:', err.message); }
+}
+
 function enqueueEvent(event) {
   // Synchronous append; writes are small (~1-5KB). `consumed:false` lets the
   // drain script filter out events already surfaced by a wait-terminal MCP
   // response — the subagent never sees the same event twice.
+  //
+  // Sid resolution: prefer the originating job's stored sid (so a recovered
+  // bridge holding session-B's job correctly tags session-B's events even
+  // when this bridge process serves session-A). Fall back to the bridge's
+  // own adopted sid; fall back finally to env. Untagged rows are dropped by
+  // the drain hook, so a missing sid means the event never surfaces.
+  const fromJob = event.jobId ? jobs.get(event.jobId)?.claudeSessionId : null;
+  const sid = fromJob || getHostSessionId();
   try {
     appendFileSync(
       getQueuePath(),
-      JSON.stringify({ ts: Date.now(), consumed: false, ...event }) + '\n',
+      JSON.stringify({
+        ts: Date.now(),
+        consumed: false,
+        claudeSessionId: sid,
+        ...event,
+      }) + '\n',
       { encoding: 'utf8' },
     );
   } catch (err) {
@@ -92,7 +163,7 @@ function markQueueConsumed(jobId) {
   }
 }
 
-log('INFO', 'bridge start:', `pid=${process.pid} ppid=${process.ppid}`);
+log('INFO', 'bridge start:', `pid=${process.pid} ppid=${process.ppid} claude_sid=${process.env.CLAUDE_CODE_SESSION_ID || 'unset'}`);
 
 // --- Job tracking -----------------------------------------------------------
 
@@ -108,7 +179,26 @@ function gcExpiredJobs(now = Date.now()) {
     if (!job.terminalAt || !job.retentionExpiresAt) continue;
     if (job.retentionExpiresAt > now) continue;
     jobs.delete(jobId);
+    deleteJob(jobId);
     log('INFO', 'gc job:', jobId, `status=${job.status}`);
+  }
+}
+
+// In-memory jobs use `sessionId` for the Copilot ACP session; persisted form
+// renames it to `copilotSessionId` so it cannot be confused with the Claude
+// Code session id (`claudeSessionId`) that the drain hook keys on. Best-effort:
+// failures don't abort the action — the in-memory map is still authoritative
+// for the current bridge process.
+function persistJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job || !job.claudeSessionId) return;
+  try {
+    const { sessionId, ...rest } = job;
+    const data = { ...rest };
+    if (sessionId !== undefined) data.copilotSessionId = sessionId;
+    writeJob(jobId, data);
+  } catch (err) {
+    log('WARN', 'persistJob failed:', jobId, err.message);
   }
 }
 
@@ -121,8 +211,37 @@ export function clampWaitSec(input, mode) {
   return Math.max(1, Math.min(Number(input) || 480, cap));
 }
 
+// Resolve the thread name for a send. Three sources, in precedence:
+//   1. Explicit `args.thread` from caller (Claude's MY_THREAD-comment trick).
+//   2. Server-side host-session→thread state file (Codex path: subagent has
+//      no transcript-replay mechanism, so the bridge resolves continuity
+//      keyed by the host session id from MCP _meta). Harmless on Claude
+//      because the agent always passes its remembered thread, so this
+//      branch only fires when the caller deliberately omits it.
+//   3. Auto-generated `companion-<jobId>` for first-ever sends.
+// On every send we persist the (host_session_id → thread) mapping so a
+// future bridge respawn can rehydrate the same Copilot session.
+export function resolveSendThread(explicitThread, hostSidRaw, jobId) {
+  let thread = explicitThread || null;
+  const hostSidKey = hostSidRaw ? sanitizeHostSessionId(hostSidRaw) : '';
+  if (!thread && hostSidKey) {
+    try { thread = readHostSessionThread(hostSidKey); }
+    catch (err) { log('WARN', 'readHostSessionThread failed:', err.message); }
+  }
+  if (!thread) thread = `companion-${jobId}`;
+  if (hostSidKey) {
+    try { writeHostSessionThread(hostSidKey, thread); }
+    catch (err) { log('WARN', 'writeHostSessionThread failed:', err.message); }
+  }
+  return thread;
+}
+
 function getJob(jobId) { gcExpiredJobs(); return jobs.get(jobId) || null; }
-function updateJob(jobId, patch) { const j = jobs.get(jobId); if (j) Object.assign(j, patch); return j || null; }
+function updateJob(jobId, patch) {
+  const j = jobs.get(jobId);
+  if (j) { Object.assign(j, patch); persistJob(jobId); }
+  return j || null;
+}
 function retainTerminalJob(jobId, patch) {
   const job = jobs.get(jobId);
   if (!job) return null;
@@ -132,6 +251,7 @@ function retainTerminalJob(jobId, patch) {
     retentionExpiresAt: terminalAt + JOB_RETENTION_MS,
     inspectAvailable: Boolean(job.promptId || patch.promptId),
   });
+  persistJob(jobId);
   resolveAllWaiters(jobId, { terminal: true, job });
   return job;
 }
@@ -455,7 +575,6 @@ const MAX_JOB_MS = 30 * 60 * 1000;
 
 async function runWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, model, previousSid, parallel }) {
   const startedAt = Date.now();
-  let sessionId = null;
   const rlog = withReq(reqId, { job_id: jobId });
   rlog.info('worker.start', { mode, template, thread: thread || null, model, cwd: cwd || null, parallel: !!parallel });
   log('INFO', 'worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} model=${model} cwd=${cwd || '(default)'} parallel=${!!parallel}`);
@@ -480,8 +599,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       reqId,
     });
     if (!startResp.ok) throw new Error(`prompt-bg failed: ${startResp.error}`);
-    const { promptId, sessionId: sid } = startResp.data;
-    sessionId = sid;
+    const { promptId, sessionId } = startResp.data;
     rlog.info('worker.prompt_started', { prompt_id: promptId, session_id: sessionId });
     log('INFO', 'worker prompt started:', jobId, `promptId=${promptId} sessionId=${sessionId}`);
 
@@ -492,6 +610,23 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       catch (err) { log('WARN', 'writeThreadSid failed:', err.message); }
     }
 
+    await runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId });
+  } catch (err) {
+    // Failure before the prompt was registered (ensureDaemon, prompt-bg, etc).
+    // No promptId yet → not reconcilable, just record terminal failure.
+    await emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd, thread, rlog, sessionId: null });
+  } finally {
+    rlog.info('worker.end', { duration_ms: Date.now() - startedAt });
+    log('INFO', 'worker end:', jobId, `duration_ms=${Date.now() - startedAt}`);
+  }
+}
+
+// Watch-loop and terminal handling, factored out so a rehydrated bridge can
+// re-attach to a daemon-owned promptId without re-running prompt-bg. Called
+// from runWorker (fresh prompt) and from rehydrate (recovery after restart).
+async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId }) {
+  const rlog = withReq(reqId, { job_id: jobId });
+  try {
     let result;
     while (true) {
       result = await awaitTerminal(promptId, 480);
@@ -535,46 +670,47 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       promptId, sessionId, failedTools, reqId,
     });
   } catch (err) {
-    const duration = Date.now() - startedAt;
-    const promptId = jobs.get(jobId)?.promptId;
-    const currentSessionId = jobs.get(jobId)?.sessionId || sessionId;
-    const isReconcilableErr = !!promptId && (
-      (err && typeof err.code === 'string' && ['ECONNREFUSED', 'ENOENT', 'EPIPE', 'ETIMEDOUT'].includes(err.code)) ||
-      /timeout/i.test(err?.message || '')
-    );
-    const reconciled = isReconcilableErr ? await reconcileAfterTimeout(promptId) : null;
-    rlog.warn('worker.catch', { error: err.message, reconciled: reconciled?.status || null });
-    log('WARN', 'worker catch:', jobId, `err="${err.message}" reconciled=${reconciled?.status || 'n/a'}`);
-    retainTerminalJob(jobId, {
-      promptId: promptId || null,
-      sessionId: currentSessionId || null,
-      status: reconciled?.status ?? 'failed',
-      summary: reconciled?.summary ?? null,
-      error: reconciled?.error ?? err.message,
-      stuckReason: reconciled?.stuckReason ?? null,
-      detail: reconciled?.detail ?? null,
-      failedTools: promptId ? failedToolsFromJsonl(promptId) : [],
-      durationMs: duration, terminalAt: Date.now(),
-    });
-    emitNotification({
-      jobId,
-      status: reconciled?.status ?? 'failed',
-      summary: reconciled?.summary ?? null,
-      error: reconciled?.error ?? err.message,
-      stuckReason: reconciled?.stuckReason ?? null,
-      detail: reconciled?.detail ?? null,
-      duration, task, mode, cwd, thread,
-      promptId: promptId || null,
-      sessionId: currentSessionId || null,
-      failedTools: promptId ? failedToolsFromJsonl(promptId) : [],
-      bridgeReason: reconciled?.bridgeReason || null,
-      reconciled: !!reconciled,
-      reqId,
-    });
-  } finally {
-    rlog.info('worker.end', { duration_ms: Date.now() - startedAt });
-    log('INFO', 'worker end:', jobId, `duration_ms=${Date.now() - startedAt}`);
+    await emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd, thread, rlog, sessionId });
   }
+}
+
+async function emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd, thread, rlog, sessionId }) {
+  const duration = Date.now() - startedAt;
+  const promptId = jobs.get(jobId)?.promptId;
+  const currentSessionId = jobs.get(jobId)?.sessionId || sessionId;
+  const isReconcilableErr = !!promptId && (
+    (err && typeof err.code === 'string' && ['ECONNREFUSED', 'ENOENT', 'EPIPE', 'ETIMEDOUT'].includes(err.code)) ||
+    /timeout/i.test(err?.message || '')
+  );
+  const reconciled = isReconcilableErr ? await reconcileAfterTimeout(promptId) : null;
+  rlog.warn('worker.catch', { error: err.message, reconciled: reconciled?.status || null });
+  log('WARN', 'worker catch:', jobId, `err="${err.message}" reconciled=${reconciled?.status || 'n/a'}`);
+  retainTerminalJob(jobId, {
+    promptId: promptId || null,
+    sessionId: currentSessionId || null,
+    status: reconciled?.status ?? 'failed',
+    summary: reconciled?.summary ?? null,
+    error: reconciled?.error ?? err.message,
+    stuckReason: reconciled?.stuckReason ?? null,
+    detail: reconciled?.detail ?? null,
+    failedTools: promptId ? failedToolsFromJsonl(promptId) : [],
+    durationMs: duration, terminalAt: Date.now(),
+  });
+  emitNotification({
+    jobId,
+    status: reconciled?.status ?? 'failed',
+    summary: reconciled?.summary ?? null,
+    error: reconciled?.error ?? err.message,
+    stuckReason: reconciled?.stuckReason ?? null,
+    detail: reconciled?.detail ?? null,
+    duration, task, mode, cwd, thread,
+    promptId: promptId || null,
+    sessionId: currentSessionId || null,
+    failedTools: promptId ? failedToolsFromJsonl(promptId) : [],
+    bridgeReason: reconciled?.bridgeReason || null,
+    reconciled: !!reconciled,
+    reqId,
+  });
 }
 
 async function awaitTerminal(promptId, maxWaitSec) {
@@ -633,12 +769,25 @@ function failedToolsFromJsonl(promptId) {
 function asJson(obj) { return { content: [{ type: 'text', text: JSON.stringify(obj) }] }; }
 
 async function handleSend(args) {
+  // The drain hook keys event delivery on claudeSessionId. Without it, every
+  // queue write the new job produces would land in a row that no session can
+  // claim — the model would never see its own watchdog alerts or terminal
+  // events. Refuse upfront with a clear error rather than silently dropping
+  // notifications later.
+  if (!getHostSessionId()) {
+    return asJson({
+      ok: false,
+      action: 'send',
+      error: 'CLAUDE_CODE_SESSION_ID not set in bridge environment — bridge cannot tag events for hook delivery. Verify the subagent template forwards it via the env: block.',
+    });
+  }
+
   // v6.1: bridge auto-generates a thread name if caller (the companion
   // subagent) did not pass one. This is how the companion gets a stable
   // handle it can remember across resumes — main never sees or carries it.
   // Pre-compute the jobId first so we can derive thread = companion-<jobId>.
   const jobId = `copilot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  const thread = args.thread || `companion-${jobId}`;
+  const thread = resolveSendThread(args.thread || null, getHostSessionId(), jobId);
 
   // Thread → previous Copilot sid. If the caller passed an explicit thread
   // name that doesn't exist yet, readThreadSid returns null (new thread).
@@ -658,6 +807,7 @@ async function handleSend(args) {
   const reqId = createReqId();
   jobs.set(jobId, {
     jobId, reqId,
+    claudeSessionId: getHostSessionId(),
     task: args.task, mode: args.mode,
     template: args.template, cwd: args.cwd,
     thread,
@@ -665,6 +815,7 @@ async function handleSend(args) {
     startedAt: Date.now(),
     status: 'starting', inspectAvailable: false,
   });
+  persistJob(jobId);
   logEvent('info', 'copilot.send', {
     req_id: reqId, job_id: jobId,
     template: args.template, mode: args.mode,
@@ -883,6 +1034,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           job_id:  { type: 'string',  description: '[wait|status|reply|cancel] Target a specific job.' },
           verbose: { type: 'boolean', description: '[status] Include full activity timeline when a job_id is given.' },
+          claude_session_id: {
+            type: 'string',
+            description:
+              "[all] Caller's Claude Code session id, used to scope the bridge's queue writes and " +
+              "ledger so events from one session never leak into another. The Claude companion subagent " +
+              'extracts this from $CLAUDE_CODE_SESSION_ID via Bash at activation and forwards it on ' +
+              'every action. Required on `send` for Claude callers; recommended on every other action ' +
+              "(lets the bridge rehydrate its own-session jobs after a restart). Codex callers don't " +
+              'need this — the bridge reads the session id from MCP `_meta["x-codex-turn-metadata"]` ' +
+              'directly. host_session_id is accepted as a host-neutral alias.',
+          },
+          host_session_id: {
+            type: 'string',
+            description:
+              '[all] Host-neutral alias of `claude_session_id`. Same semantics — pass either, not both. ' +
+              'Provided so non-Claude hosts can forward a session id without using a Claude-named field.',
+          },
         },
         required: ['action'],
       },
@@ -892,13 +1060,49 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name !== 'copilot') throw new Error(`unknown tool: ${req.params.name}`);
-  const normalized = validateCopilotArgs(req.params.arguments || {});
-  return dispatch(normalized);
+  try {
+    // Codex (PR openai/codex#15190) injects per-turn metadata on every MCP
+    // tool call as `_meta["x-codex-turn-metadata"]`, including a stable
+    // session_id. Adopt that BEFORE validation/dispatch so even callers
+    // that don't forward host_session_id get correctly tagged. This is
+    // the primary host→bridge session-id channel on Codex; arg-based
+    // forwarding is the fallback for hosts that don't expose _meta
+    // (Claude does not).
+    const metaSid = req?.params?._meta?.['x-codex-turn-metadata']?.session_id;
+    if (metaSid && typeof metaSid === 'string') adoptHostSessionId(metaSid);
+    const normalized = validateCopilotArgs(req.params.arguments || {});
+    return await dispatch(normalized);
+  } catch (err) {
+    if (err && err.code === 'BRIDGE_SID_CONFLICT') {
+      log('ERROR', 'sid conflict on MCP call:', err.message);
+      return asJson({ ok: false, error: err.message, code: 'BRIDGE_SID_CONFLICT' });
+    }
+    throw err;
+  }
 });
 
 // Exported dispatcher lets tests drive the action handlers directly without
-// going through MCP transport plumbing.
+// going through MCP transport plumbing. Tests that want to exercise the
+// MCP `_meta` path call `adoptHostSessionId(metaSid)` directly before
+// invoking dispatch — this matches the MCP handler's own ordering.
 export async function dispatch(normalized) {
+  // Arg-based session-id adoption (host_session_id is the host-neutral
+  // alias; claude_session_id stays accepted as input alias and is
+  // normalized into host_session_id by validation.mjs::normalizeHostSid).
+  // Skipped if _meta already adopted a sid for this process — adoptHostSessionId
+  // is no-op-on-match / throws BRIDGE_SID_CONFLICT on conflict, so the
+  // precedence holds. We catch the conflict here so direct callers (tests,
+  // and any non-MCP consumer) get the same structured error the MCP handler
+  // returns rather than an unhandled rejection.
+  try {
+    if (normalized.host_session_id) adoptHostSessionId(normalized.host_session_id);
+  } catch (err) {
+    if (err && err.code === 'BRIDGE_SID_CONFLICT') {
+      log('ERROR', 'sid conflict on dispatch:', err.message);
+      return asJson({ ok: false, error: err.message, code: 'BRIDGE_SID_CONFLICT' });
+    }
+    throw err;
+  }
   switch (normalized.action) {
     case 'send':   return handleSend(normalized);
     case 'wait':   return handleWait(normalized);
@@ -909,7 +1113,123 @@ export async function dispatch(normalized) {
   }
 }
 
-export { mcp, jobs };
+// Module-level idempotency flags. Hydrate and sweep are now triggered
+// lazily by adoptHostSessionId on the first sid-bearing MCP call, so we
+// must guard against re-running within the same bridge process.
+let _hydrated = false;
+let _swept = false;
+
+// On bridge startup (or on first sid-bearing action in fallback mode), claim
+// any persisted jobs belonging to this Claude Code session. The previous
+// bridge for this session (killed by stdio reconnect, crash, etc.) may have
+// left in-flight jobs whose Copilot prompts are still running on the still-
+// detached daemon. Re-attach the watch loop so wait/status/reply/cancel
+// resolve correctly. Idempotent: subsequent calls within the same process
+// are no-ops.
+export function hydrateJobsFromLedger() {
+  if (_hydrated) return;
+  const mySid = getHostSessionId();
+  if (!mySid) {
+    log('WARN', 'hydrate skipped: CLAUDE_CODE_SESSION_ID not set');
+    return;
+  }
+  let entries;
+  try { entries = listJobsForSession(mySid); }
+  catch (err) { log('WARN', 'hydrate listJobs failed:', err.message); return; }
+
+  let claimed = 0;
+  let resumed = 0;
+  for (const persisted of entries) {
+    const { copilotSessionId, ...rest } = persisted;
+    const job = { ...rest };
+    if (copilotSessionId !== undefined) job.sessionId = copilotSessionId;
+    jobs.set(job.jobId, job);
+    claimed++;
+
+    // If thread + sessionId are both known but the thread file may not
+    // exist (original bridge died before writeThreadSid ran), restore it.
+    if (job.thread && job.sessionId) {
+      try { writeThreadSid(job.thread, job.sessionId); }
+      catch (err) { log('WARN', 'hydrate writeThreadSid failed:', err.message); }
+    }
+
+    // Resume the watch loop for non-terminal jobs that have a registered
+    // promptId. Jobs in 'starting' (no prompt-bg yet) cannot be resumed —
+    // mark them terminal:unreachable so wait/status return cleanly.
+    const isTerminal = !!job.terminalAt;
+    if (isTerminal) continue;
+    if (!job.promptId) {
+      retainTerminalJob(job.jobId, {
+        status: 'unreachable',
+        error: 'bridge restart before prompt-bg completed',
+        detail: 'rehydrate_no_promptid',
+        terminalAt: Date.now(),
+      });
+      continue;
+    }
+    runWatchLoop({
+      jobId: job.jobId,
+      promptId: job.promptId,
+      sessionId: job.sessionId || null,
+      thread: job.thread || null,
+      task: job.task || '',
+      mode: job.mode || 'EXECUTE',
+      cwd: job.cwd || null,
+      startedAt: job.startedAt || Date.now(),
+      reqId: job.reqId || createReqId(),
+    }).catch((err) => log('ERROR', 'rehydrate watch error:', job.jobId, err.message));
+    resumed++;
+  }
+  log('INFO', 'hydrate:', `claimed=${claimed} resumed=${resumed} sid=${mySid}`);
+  _hydrated = true;
+}
+
+// On startup, drop own-session entries from the queue that are older than
+// STARTUP_STALE_MS. Without this, the prior bridge's already-displayed alerts
+// would be redelivered on the first PostToolUse hook the new bridge's session
+// fires — same model would see them twice. We can be strict here because the
+// bridge's only durable user-facing state is the model's prior context, which
+// already has those alerts.
+const STARTUP_STALE_MS = 60_000;
+export function sweepOwnSessionStaleQueueRows(nowMs = Date.now()) {
+  if (_swept) return;
+  const mySid = getHostSessionId();
+  if (!mySid) return;
+  _swept = true;
+  const QUEUE_PATH = getQueuePath();
+  if (!existsSync(QUEUE_PATH)) return;
+  try {
+    const lines = readFileSync(QUEUE_PATH, 'utf8').split('\n').filter(Boolean);
+    let dropped = 0;
+    const kept = [];
+    for (const line of lines) {
+      let e; try { e = JSON.parse(line); } catch { kept.push(line); continue; }
+      const isOwn = e.claudeSessionId === mySid;
+      const isStale = typeof e.ts === 'number' && (nowMs - e.ts > STARTUP_STALE_MS);
+      if (isOwn && isStale) { dropped++; continue; }
+      kept.push(line);
+    }
+    if (dropped === 0) return;
+    const tmp = `${QUEUE_PATH}.sweep.${process.pid}`;
+    writeFileSync(tmp, kept.length ? kept.join('\n') + '\n' : '');
+    renameSync(tmp, QUEUE_PATH);
+    log('INFO', 'startup sweep:', `dropped=${dropped} sid=${mySid}`);
+  } catch (err) {
+    log('WARN', 'startup sweep failed:', err.message);
+  }
+}
+
+// Test-only: reset module-level state so each test scenario starts clean.
+// Production code never calls this — module state is permanent until the
+// bridge process exits. Exists because Node's ESM module cache means the
+// in-process test runner sees state mutations carry across test cases.
+export function _resetForTest() {
+  _bridgeHostSid = null;
+  _hydrated = false;
+  _swept = false;
+}
+
+export { mcp, jobs, gcExpiredJobs, persistJob, adoptHostSessionId };
 
 // Only attach stdio transport when launched as a script. Allows
 // `import('./server.mjs')` from tests without spawning a real MCP loop.
@@ -923,5 +1243,20 @@ const isMain = (() => {
   } catch { return false; }
 })();
 if (isMain) {
+  // One-line startup log so a user troubleshooting host routing can grep
+  // /tmp/copilot-bridge.log for "host detected" and see what the bridge
+  // resolved on this run. The README's Diagnostics section points readers here.
+  const { detectHost } = await import('../lib/host.mjs');
+  logEvent('info', 'bridge.startup', { host_detected: detectHost() });
+
+  // Only run eager hydrate/sweep when the env actually carries a real sid.
+  // In production, Claude Code passes the literal string `${CLAUDE_CODE_SESSION_ID}`
+  // through to the env block (no ${VAR} expansion at MCP-spawn time), so
+  // sanitizeSid returns null and we wait for the subagent to forward the
+  // sid via the first MCP call's `claude_session_id` arg.
+  if (getHostSessionId()) {
+    hydrateJobsFromLedger();
+    sweepOwnSessionStaleQueueRows();
+  }
   await mcp.connect(new StdioServerTransport());
 }
