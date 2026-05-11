@@ -317,6 +317,7 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
     activity:           includeTimeline ? (Array.isArray(data.activity) ? data.activity : []) : undefined,
     activity_count:     includeTimeline ? (data.activityCount ?? 0) : undefined,
     activity_truncated: includeTimeline ? Boolean(data.activityTruncated) : undefined,
+    session_reborn:     Boolean(job.sessionReborn),
   };
 }
 
@@ -385,6 +386,11 @@ function buildWaitResponse(outcome) {
       current_status: job.status || 'running',
       started_at: iso(job.startedAt),
       age_s: Math.round((Date.now() - (job.startedAt || Date.now())) / 1000),
+      // Mirror the terminal-path field so a poll that catches the job mid-run
+      // still sees the rebirth signal — without this, callers using {wait,
+      // max_wait_sec} would only learn about the lost context on the next
+      // poll iteration that resolves terminally.
+      session_reborn: Boolean(job.sessionReborn),
       hint: 'call copilot({action:"wait", job_id, max_wait_sec}) again to continue blocking.',
     });
   }
@@ -399,6 +405,7 @@ function buildWaitResponse(outcome) {
     stuck_reason: job.stuckReason || null,
   };
   if (job.detail) meta.detail = String(job.detail).slice(0, 80);
+  if (job.sessionReborn) meta.session_reborn = 'true';
   return asJson({
     ok: true, action: 'wait', status: job.status,
     job_id: job.jobId,
@@ -425,14 +432,50 @@ function emitAlertNotification({ jobId, task, promptId, alert, startedAt, reqId 
   enqueueEvent({ kind: 'alert', jobId, content, meta });
 }
 
+// One-shot rebirth alert, fired at prompt-bg time when the daemon reports
+// that the bridge-supplied sessionId was stale and a fresh Copilot session
+// had to be minted. Surfaces *immediately* (next drain tick), independent of
+// whether the eventual completion succeeds, so the parent can correct course
+// in long-running threads. emitNotification's session_reborn meta + the
+// formatTerminalContent banner are belt-and-suspenders for callers that
+// don't drain alerts.
+function emitRebirthAlert({ jobId, task, promptId, thread, previousSid, newSessionId, startedAt, reqId = null }) {
+  const ageSec = Math.round((Date.now() - startedAt) / 1000);
+  const content = [
+    `Task: ${truncate(task, 200)}`,
+    '',
+    '**Copilot session respawned** — the prior subprocess died, in-process conversation context was lost.',
+    '',
+    `**thread:** ${thread || '(none)'}  |  **prev sid:** ${previousSid || '(none)'}  |  **new sid:** ${newSessionId}`,
+    '',
+    'If subsequent prompts in this thread depend on earlier turns, restate the relevant context.',
+  ].join('\n');
+  const meta = {
+    job_id: jobId, status: 'watchdog', prompt_id: promptId,
+    age_sec: String(ageSec), tier: '1', reason: 'session_reborn',
+    session_reborn: 'true',
+  };
+  if (thread)       meta.thread = String(thread);
+  if (previousSid)  meta.previous_session_id = String(previousSid);
+  if (newSessionId) meta.session_id = String(newSessionId);
+  if (reqId)        meta.req_id = String(reqId);
+  enqueueEvent({ kind: 'alert', jobId, content, meta });
+  log('WARN', 'rebirth:', jobId, `thread=${thread || '-'} prev=${previousSid || '-'} new=${newSessionId}`);
+}
+
 // Pure formatter: takes the fields a terminal job carries and returns the
 // human-readable body. Extracted from emitNotification so buildWaitResponse
 // can reuse the exact same formatting when the subagent blocks to completion.
 export function formatTerminalContent({
   jobId, status, task, mode, durationMs,
   summary, error, stuckReason, detail, failedTools, promptId,
+  sessionReborn = false,
 }) {
-  const taskHeader = `Task: ${truncate(task, 200)}\n\n`;
+  const rebirthBanner = sessionReborn
+    ? '> ⚠ Copilot session was respawned mid-thread; prior in-process conversation context was lost. ' +
+      'If your next prompt depends on earlier turns of this thread, restate the relevant context.\n\n'
+    : '';
+  const taskHeader = rebirthBanner + `Task: ${truncate(task, 200)}\n\n`;
   const duration = durationMs || 0;
   const rubberDuck = classifyRubberDuck(summary?.message);
 
@@ -498,6 +541,7 @@ export function emitNotification({
   jobId, status, summary, error, stuckReason, detail = null, duration,
   task, mode, cwd, thread = null, promptId = null, sessionId = null,
   reconciled = false, bridgeReason = null, failedTools = [], reqId = null,
+  sessionReborn = false,
 }) {
   if (
     status === 'completed' &&
@@ -526,6 +570,7 @@ export function emitNotification({
   if (reconciled)   meta.reconciled = 'true';
   if (bridgeReason) meta.bridge_reason = String(bridgeReason).slice(0, 40);
   if (reqId)        meta.req_id = String(reqId);
+  if (sessionReborn) meta.session_reborn = 'true';
 
   const rubberDuck = classifyRubberDuck(summary?.message);
   if (status === 'completed') meta.rubber_duck = rubberDuck;
@@ -533,6 +578,7 @@ export function emitNotification({
   const content = formatTerminalContent({
     jobId, status, task, mode, durationMs: duration,
     summary, error, stuckReason, detail, failedTools, promptId,
+    sessionReborn,
   });
 
   enqueueEvent({ kind: 'terminal', jobId, content, meta });
@@ -599,18 +645,29 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       reqId,
     });
     if (!startResp.ok) throw new Error(`prompt-bg failed: ${startResp.error}`);
-    const { promptId, sessionId } = startResp.data;
-    rlog.info('worker.prompt_started', { prompt_id: promptId, session_id: sessionId });
-    log('INFO', 'worker prompt started:', jobId, `promptId=${promptId} sessionId=${sessionId}`);
+    const { promptId, sessionId, sessionReborn } = startResp.data;
+    rlog.info('worker.prompt_started', { prompt_id: promptId, session_id: sessionId, session_reborn: !!sessionReborn });
+    log('INFO', 'worker prompt started:', jobId, `promptId=${promptId} sessionId=${sessionId}${sessionReborn ? ' (REBORN)' : ''}`);
 
-    updateJob(jobId, { promptId, sessionId, status: 'running', inspectAvailable: true });
+    updateJob(jobId, { promptId, sessionId, status: 'running', inspectAvailable: true, sessionReborn: !!sessionReborn });
 
     if (thread && sessionId) {
       try { writeThreadSid(thread, sessionId); }
       catch (err) { log('WARN', 'writeThreadSid failed:', err.message); }
     }
 
-    await runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId });
+    // Surface the rebirth immediately, before the prompt completes. The
+    // parent (Claude/Codex) needs to know that Copilot's in-process
+    // conversation context was lost so it can restate any thread context
+    // that matters — Copilot CLI's ACP session/load is process-local
+    // (github/copilot-cli#1767), so cross-process resume isn't possible
+    // at the protocol layer. The terminal emit also tags meta.session_reborn
+    // as belt-and-suspenders for callers that don't drain alerts.
+    if (sessionReborn) {
+      emitRebirthAlert({ jobId, task, promptId, thread, previousSid, newSessionId: sessionId, startedAt, reqId });
+    }
+
+    await runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId, sessionReborn: !!sessionReborn });
   } catch (err) {
     // Failure before the prompt was registered (ensureDaemon, prompt-bg, etc).
     // No promptId yet → not reconcilable, just record terminal failure.
@@ -624,7 +681,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
 // Watch-loop and terminal handling, factored out so a rehydrated bridge can
 // re-attach to a daemon-owned promptId without re-running prompt-bg. Called
 // from runWorker (fresh prompt) and from rehydrate (recovery after restart).
-async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId }) {
+async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId, sessionReborn = false }) {
   const rlog = withReq(reqId, { job_id: jobId });
   try {
     let result;
@@ -659,15 +716,16 @@ async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cw
       detail: result.detail || null,
       failedTools, durationMs: duration,
       terminalAt: Date.now(),
+      sessionReborn,
     });
-    rlog.info('worker.terminal', { status: result.status, duration_ms: duration, failed_tools: failedTools?.length || 0 });
+    rlog.info('worker.terminal', { status: result.status, duration_ms: duration, failed_tools: failedTools?.length || 0, session_reborn: sessionReborn });
     emitNotification({
       jobId,
       status: result.status, summary: result.summary,
       error: result.error, stuckReason: result.stuckReason,
       detail: result.detail || null,
       duration, task, mode, cwd, thread,
-      promptId, sessionId, failedTools, reqId,
+      promptId, sessionId, failedTools, reqId, sessionReborn,
     });
   } catch (err) {
     await emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd, thread, rlog, sessionId });

@@ -16,6 +16,7 @@
 set -e
 QUEUE="${COPILOT_QUEUE_PATH:-/tmp/copilot-completions.jsonl}"
 LOCK="${QUEUE}.lock"
+HEARTBEAT_DIR="${COPILOT_HEARTBEAT_DIR:-/tmp/copilot-companion-heartbeats}"
 
 PAYLOAD=$(cat)
 HOOK_EVENT=$(printf '%s' "$PAYLOAD" | jq -r '.hook_event_name // "PostToolUse"')
@@ -25,6 +26,17 @@ MY_SID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty')
 # inject anything. Hook payloads from real Claude Code sessions always carry
 # session_id, so this only triggers on misconfigured callers.
 [ -n "$MY_SID" ] || exit 0
+
+# Heartbeat: the daemon's heartbeat-aware inactivity tick scans this dir for
+# fresh mtimes and reschedules its shutdown timer when any host is still
+# active. Touch BEFORE the queue-empty fast path so idle drains (the common
+# case between Copilot jobs) still count as liveness — without this the
+# 15-min daemon idle timer would terminate the Copilot subprocess mid-session
+# whenever the user goes a stretch without triggering a Copilot job, even if
+# they're actively using Claude Code. Best-effort; failure here must not
+# block the drain.
+mkdir -p "$HEARTBEAT_DIR" 2>/dev/null || true
+touch "$HEARTBEAT_DIR/$MY_SID.heartbeat" 2>/dev/null || true
 
 # Fast path: no queue file, or empty file → no-op silently. Outside the lock
 # because the worst case is racing into the locked path and finding nothing.

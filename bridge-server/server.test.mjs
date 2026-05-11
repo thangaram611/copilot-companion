@@ -330,6 +330,98 @@ test('buildJobResponse: ignores spurious data.detail (bridge-owned)', async () =
   assert.equal(out.detail, null);
 });
 
+// ---------- session rebirth signaling ----------
+
+test('formatTerminalContent: rebirth banner prepended when sessionReborn=true', async () => {
+  const { formatTerminalContent } = await import('./server.mjs');
+  const body = formatTerminalContent({
+    jobId: 'jr1', status: 'completed', task: 'continue thread',
+    mode: 'EXECUTE', durationMs: 1234,
+    summary: { message: 'OK\n\nRUBBER-DUCK: clean.', toolCalls: [] },
+    error: null, stuckReason: null, detail: null, failedTools: [],
+    promptId: 'p1', sessionReborn: true,
+  });
+  assert.match(body, /Copilot session was respawned mid-thread/);
+  assert.match(body, /prior in-process conversation context was lost/);
+  // Banner precedes the Task: header so the warning is visible before any
+  // model output the user reads.
+  const bannerIdx = body.indexOf('respawned mid-thread');
+  const taskIdx = body.indexOf('Task:');
+  assert.ok(bannerIdx >= 0 && taskIdx > bannerIdx, 'banner must precede Task header');
+});
+
+test('formatTerminalContent: no banner when sessionReborn is falsy', async () => {
+  const { formatTerminalContent } = await import('./server.mjs');
+  const body = formatTerminalContent({
+    jobId: 'jr2', status: 'completed', task: 'normal call',
+    mode: 'EXECUTE', durationMs: 1000,
+    summary: { message: 'done\n\nRUBBER-DUCK: clean.', toolCalls: [] },
+    error: null, stuckReason: null, detail: null, failedTools: [],
+    promptId: 'p2',
+  });
+  assert.doesNotMatch(body, /respawned mid-thread/);
+});
+
+test('buildWaitResponse: surfaces meta.session_reborn when job has the flag', async () => {
+  const mod = await import('./server.mjs');
+  const { jobs } = mod;
+  const jobId = 'jr-wait';
+  jobs.set(jobId, {
+    jobId, status: 'completed', task: 't', mode: 'EXECUTE',
+    promptId: 'p', sessionId: 's-new', thread: 'companion-x',
+    startedAt: Date.now() - 1000, terminalAt: Date.now(),
+    retentionExpiresAt: Date.now() + 60_000,
+    durationMs: 1000, failedTools: [],
+    summary: { message: 'k\n\nRUBBER-DUCK: clean.', toolCalls: [] },
+    sessionReborn: true,
+  });
+  try {
+    const res = await mod.dispatch({ action: 'wait', job_id: jobId, max_wait_sec: 1 });
+    const body = JSON.parse(res.content[0].text);
+    assert.equal(body.meta.session_reborn, 'true');
+    assert.match(body.content, /respawned mid-thread/);
+  } finally {
+    jobs.delete(jobId);
+  }
+});
+
+test('buildWaitResponse: still_running surfaces session_reborn so polls see it before terminal', async () => {
+  const mod = await import('./server.mjs');
+  const { jobs } = mod;
+  const jobId = 'jr-still';
+  jobs.set(jobId, {
+    jobId, status: 'running', task: 't', mode: 'EXECUTE',
+    promptId: 'p', sessionId: 's-new', thread: 'companion-x',
+    startedAt: Date.now() - 5000,
+    sessionReborn: true,
+  });
+  try {
+    // Use a 1s wait_sec so the wait resolves on timeout (still_running),
+    // not by terminal completion.
+    const res = await mod.dispatch({ action: 'wait', job_id: jobId, max_wait_sec: 1 });
+    const body = JSON.parse(res.content[0].text);
+    assert.equal(body.status, 'still_running');
+    assert.equal(body.session_reborn, true);
+  } finally {
+    jobs.delete(jobId);
+  }
+});
+
+test('buildJobResponse: session_reborn boolean reflects job field', async () => {
+  const { buildJobResponse } = await import('./server.mjs');
+  const reborn = buildJobResponse({
+    jobId: 'j-rb', status: 'completed', startedAt: Date.now() - 1000,
+    terminalAt: Date.now(), retentionExpiresAt: Date.now() + 60_000,
+    sessionReborn: true,
+  });
+  assert.equal(reborn.session_reborn, true);
+  const normal = buildJobResponse({
+    jobId: 'j-norm', status: 'completed', startedAt: Date.now() - 1000,
+    terminalAt: Date.now(), retentionExpiresAt: Date.now() + 60_000,
+  });
+  assert.equal(normal.session_reborn, false);
+});
+
 // ---------- emitNotification: queue write carries meta.detail ----------
 
 test('emitNotification: writes meta.detail to queue file when detail set', async () => {

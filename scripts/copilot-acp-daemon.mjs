@@ -10,7 +10,7 @@
 
 import { spawn, execSync } from 'node:child_process';
 import { createServer, connect as connectSocket } from 'node:net';
-import { appendFileSync, statSync, unlinkSync, renameSync, writeFileSync, existsSync, readFileSync, chmodSync } from 'node:fs';
+import { appendFileSync, statSync, unlinkSync, renameSync, writeFileSync, existsSync, readFileSync, chmodSync, readdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { Supervisor, pollSupervisor } from '../lib/prompt-supervisor.mjs';
 import {
@@ -18,6 +18,7 @@ import {
   coalesceTextChunks,
   buildPromptInspection,
 } from '../lib/prompt-inspect.mjs';
+import { selectLiveHeartbeat } from '../lib/heartbeat.mjs';
 
 // --- Constants ---------------------------------------------------------------
 
@@ -46,6 +47,18 @@ const SOCKET_PATH = '/tmp/copilot-acp.sock';
 const LOG_FILE = '/tmp/copilot-acp-daemon.log';
 const LOG_MAX_BYTES = 1024 * 1024; // 1 MB
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — safely above the 10-min prompt cap
+
+// Heartbeat-driven liveness extension. Claude/Codex hooks touch a per-host-sid
+// file in HEARTBEAT_DIR on every tool turn (PostToolUse / UserPromptSubmit /
+// SessionStart). When the inactivity timer fires, the daemon checks for any
+// heartbeat newer than HOST_LIVENESS_TTL_MS and reschedules instead of exiting
+// — keeping the Copilot subprocess alive (and its in-process conversation
+// context with it) for the full lifetime of an active host session. The 15-min
+// idle timer alone would terminate the Copilot child mid-session, forcing a
+// rebirth on the next prompt-bg and losing context.
+const HEARTBEAT_DIR = '/tmp/copilot-companion-heartbeats';
+const HOST_LIVENESS_TTL_MS = 30 * 60 * 1000; // 30 min — see hooks/drain-completions.sh
+const HEARTBEAT_STALE_AFTER_MS = 24 * 60 * 60 * 1000; // 24h: unlink unused heartbeats
 const PROMPT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per prompt — must be >= MAX_LONG_POLL_WAIT_MS or legitimate long prompts are killed and surface as "prompt timeout" failures instead of real answers
 const PROMPT_RETENTION_MS = 60 * 60 * 1000; // retain terminal prompts for inspection
 const SPAWN_INIT_TIMEOUT_MS = 30 * 1000; // 30s for handshake
@@ -765,6 +778,19 @@ class SessionManager {
         if (this.connection) {
           this.connection.kill();
           this.connection = null;
+          // Every sid in this.sessions was registered with the dead child
+          // (Copilot's --acp sessions are process-local — github/copilot-cli#1767).
+          // After respawning, none of those sids are valid. Wipe the map so
+          // a later prompt-bg with a stale sid hits the rebirth branch
+          // (sidKnown=false) instead of falsely passing startPromptBg's local
+          // has() check and reaching the new Copilot child with a sid it
+          // never created. Without this clear, a stale sid combined with a
+          // healthy new connection produces 'Session not found' from Copilot
+          // instead of a clean sessionReborn signal.
+          if (this.sessions.size > 0) {
+            log('INFO', `connection respawn: invalidating ${this.sessions.size} stale session(s)`);
+            this.sessions.clear();
+          }
         }
         const conn = new AcpConnection();
         await conn.spawn(cwd);
@@ -1219,9 +1245,51 @@ class SessionManager {
       this.inactivityTimer = setTimeout(() => this._onInactivityTick(), 60_000);
       return;
     }
+    // Host-liveness extension: if any host session has touched its heartbeat
+    // within HOST_LIVENESS_TTL_MS, the parent (Claude/Codex) is still active
+    // and we keep the Copilot child alive for it. Without this gate, the 15-min
+    // idle timer would kill the subprocess mid-session and force a rebirth (and
+    // context loss) on the next prompt-bg.
+    const liveSid = this._findLiveHeartbeat(now);
+    if (liveSid) {
+      log('INFO', `inactivity tick: host ${liveSid} still active (heartbeat fresh) — extending`);
+      this.inactivityTimer = setTimeout(() => this._onInactivityTick(), 60_000);
+      return;
+    }
     log('INFO', 'inactivity timeout — shutting down');
     this.shutdown();
     process.exit(0);
+  }
+
+  // Scan HEARTBEAT_DIR for the freshest per-host-sid heartbeat. Returns the
+  // sid (basename minus extension) if any heartbeat is within HOST_LIVENESS_TTL_MS,
+  // else null. Sweeps heartbeats older than HEARTBEAT_STALE_AFTER_MS as a side
+  // effect — keeps the dir from growing unbounded across orphaned sessions
+  // (parent process crash, OS reboot, etc).
+  //
+  // I/O lives here; classification (TTL boundary, freshest-of-many,
+  // stale-unlink predicate) is in lib/heartbeat.mjs so it can be unit-tested.
+  _findLiveHeartbeat(now = Date.now()) {
+    let names;
+    try { names = readdirSync(HEARTBEAT_DIR); }
+    catch { return null; } // dir doesn't exist → no hosts yet
+    const entries = [];
+    for (const name of names) {
+      if (!name.endsWith('.heartbeat')) continue;
+      try {
+        const stat = statSync(`${HEARTBEAT_DIR}/${name}`);
+        entries.push({ name, mtimeMs: stat.mtimeMs });
+      } catch { /* file vanished between readdir and stat — skip */ }
+    }
+    const { liveSid, staleToUnlink } = selectLiveHeartbeat({
+      entries, nowMs: now,
+      liveTtlMs: HOST_LIVENESS_TTL_MS,
+      staleAfterMs: HEARTBEAT_STALE_AFTER_MS,
+    });
+    for (const name of staleToUnlink) {
+      try { unlinkSync(`${HEARTBEAT_DIR}/${name}`); } catch {}
+    }
+    return liveSid;
   }
 }
 
@@ -1299,12 +1367,40 @@ class IpcServer {
       case 'prompt-bg': {
         // Start a session if no sessionId given (auto mode), then fire prompt
         // in background and return immediately with promptId.
+        //
+        // Rebirth: if the caller supplied a sessionId but either (a) the
+        // underlying Copilot subprocess is dead (so `this.connection` is null
+        // or its child has exited) or (b) the sid is unknown to this daemon
+        // (different daemon instance, sid GC'd, etc), the sid is stale —
+        // a fresh Copilot child won't recognize it and startPromptBg would
+        // throw 'no active connection — call start first' or 'unknown
+        // sessionId'. Drop the stale sid, mint a fresh session, and surface
+        // sessionReborn:true so the bridge can warn the parent that
+        // in-process conversation context was lost (Copilot's ACP
+        // session/load is process-local — github/copilot-cli#1767 — so
+        // cross-process resume isn't possible at the protocol layer).
         let sessionId = msg.sessionId;
+        let sessionReborn = false;
+        if (sessionId) {
+          const conn = this.manager.connection;
+          const connAlive = !!(conn && conn.isAlive() && conn.initialized);
+          const sidKnown = this.manager.sessions.has(sessionId);
+          if (!connAlive || !sidKnown) {
+            log('WARN', `prompt-bg: stale sessionId ${sessionId} (connAlive=${connAlive} sidKnown=${sidKnown}) — minting fresh session`);
+            // Belt-and-suspenders with ensureConnection's session wipe: if the
+            // entry survived (e.g., connAlive=true but sidKnown=false reached
+            // here by a different path), evict it so no subsequent caller can
+            // mistake it for a live session and bypass this guard.
+            this.manager.sessions.delete(sessionId);
+            sessionId = null;
+            sessionReborn = true;
+          }
+        }
         if (!sessionId) {
           sessionId = await this.manager.startSession(msg.cwd || process.cwd());
         }
         const data = await this.manager.startPromptBg(sessionId, msg.text);
-        return { ok: true, data: { ...data, activeModel: ACTIVE_MODEL } };
+        return { ok: true, data: { ...data, activeModel: ACTIVE_MODEL, sessionReborn } };
       }
       case 'watch': {
         const data = await this.manager.watchPrompt(msg.promptId, msg.since || 0, {
