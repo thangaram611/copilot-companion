@@ -377,7 +377,7 @@ function buildWaitResponse(outcome) {
   }
   const job = outcome.job;
   if (outcome.timeout) {
-    return asJson({
+    const stillRunning = {
       ok: true, action: 'wait', status: 'still_running',
       job_id: job.jobId,
       // Surface thread even on still_running so a crash+resume can still
@@ -392,7 +392,9 @@ function buildWaitResponse(outcome) {
       // poll iteration that resolves terminally.
       session_reborn: Boolean(job.sessionReborn),
       hint: 'call copilot({action:"wait", job_id, max_wait_sec}) again to continue blocking.',
-    });
+    };
+    if (job.reattached) stillRunning.reattached = true;
+    return asJson(stillRunning);
   }
   markQueueConsumed(job.jobId);
   const meta = {
@@ -406,6 +408,8 @@ function buildWaitResponse(outcome) {
   };
   if (job.detail) meta.detail = String(job.detail).slice(0, 80);
   if (job.sessionReborn) meta.session_reborn = 'true';
+  if (job.reattached) meta.reattached = 'true';
+  if (job.existingPromptId) meta.existing_prompt_id = String(job.existingPromptId);
   return asJson({
     ok: true, action: 'wait', status: job.status,
     job_id: job.jobId,
@@ -541,7 +545,7 @@ export function emitNotification({
   jobId, status, summary, error, stuckReason, detail = null, duration,
   task, mode, cwd, thread = null, promptId = null, sessionId = null,
   reconciled = false, bridgeReason = null, failedTools = [], reqId = null,
-  sessionReborn = false,
+  sessionReborn = false, extraMeta = null,
 }) {
   if (
     status === 'completed' &&
@@ -571,6 +575,11 @@ export function emitNotification({
   if (bridgeReason) meta.bridge_reason = String(bridgeReason).slice(0, 40);
   if (reqId)        meta.req_id = String(reqId);
   if (sessionReborn) meta.session_reborn = 'true';
+  if (extraMeta && typeof extraMeta === 'object') {
+    for (const [k, v] of Object.entries(extraMeta)) {
+      if (v !== undefined && v !== null) meta[k] = String(v).slice(0, 80);
+    }
+  }
 
   const rubberDuck = classifyRubberDuck(summary?.message);
   if (status === 'completed') meta.rubber_duck = rubberDuck;
@@ -644,7 +653,45 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       model,
       reqId,
     });
-    if (!startResp.ok) throw new Error(`prompt-bg failed: ${startResp.error}`);
+    if (!startResp.ok) {
+      // Daemon-side mutex says another prompt already owns this Copilot
+      // sessionId. The bridge reattach guard should normally catch this
+      // first, but a race between two send dispatches can still slip
+      // through. Map to a clean terminal 'unreachable' envelope (with
+      // detail=session_busy + existing_prompt_id) instead of throwing a
+      // generic error that the caller would see as "unexpected terminal".
+      if (startResp.code === 'SESSION_BUSY') {
+        const existingPromptId = startResp.data?.existingPromptId || null;
+        const conflictSessionId = startResp.data?.sessionId || null;
+        rlog.warn('worker.session_busy', { existing_prompt_id: existingPromptId, session_id: conflictSessionId });
+        log('WARN', 'worker session busy:', jobId, `existingPromptId=${existingPromptId} sessionId=${conflictSessionId}`);
+        const duration = Date.now() - startedAt;
+        retainTerminalJob(jobId, {
+          status: 'unreachable',
+          detail: 'session_busy',
+          error: startResp.error || 'session busy',
+          existingPromptId,
+          durationMs: duration,
+          terminalAt: Date.now(),
+        });
+        emitNotification({
+          jobId,
+          status: 'unreachable',
+          summary: null,
+          error: startResp.error || 'session busy',
+          stuckReason: null,
+          detail: 'session_busy',
+          duration, task, mode, cwd, thread,
+          promptId: null,
+          sessionId: conflictSessionId,
+          failedTools: [],
+          reqId,
+          extraMeta: existingPromptId ? { existing_prompt_id: String(existingPromptId) } : undefined,
+        });
+        return;
+      }
+      throw new Error(`prompt-bg failed: ${startResp.error}`);
+    }
     const { promptId, sessionId, sessionReborn } = startResp.data;
     rlog.info('worker.prompt_started', { prompt_id: promptId, session_id: sessionId, session_reborn: !!sessionReborn });
     log('INFO', 'worker prompt started:', jobId, `promptId=${promptId} sessionId=${sessionId}${sessionReborn ? ' (REBORN)' : ''}`);
@@ -846,6 +893,29 @@ async function handleSend(args) {
   // Pre-compute the jobId first so we can derive thread = companion-<jobId>.
   const jobId = `copilot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const thread = resolveSendThread(args.thread || null, getHostSessionId(), jobId);
+
+  // Reattach guard. When the MCP bridge dies mid-send and Claude Code respawns
+  // it, the same tool call lands again with the same thread + host session.
+  // The previous worker is still running inside the daemon. Starting a new
+  // prompt-bg on the same Copilot sessionId would overwrite the live
+  // collector entry (sessionCollectors[sessionId]) and silently amputate the
+  // first prompt's event stream. Instead, find the live job and just wait
+  // on it — its terminal payload is the one the caller wants anyway.
+  const hostSid = getHostSessionId();
+  for (const existing of jobs.values()) {
+    if (existing.thread !== thread) continue;
+    if (existing.claudeSessionId !== hostSid) continue;
+    if (existing.terminalAt) continue;
+    existing.reattached = true;
+    persistJob(existing.jobId);
+    const maxWait = clampWaitSec(args.max_wait_sec, args.mode);
+    logEvent('info', 'copilot.send.reattached', {
+      job_id: existing.jobId, thread, host_session: hostSid, status: existing.status || 'running',
+    });
+    log('INFO', 'copilot:send reattached:', `job=${existing.jobId} thread=${thread} status=${existing.status}`);
+    const outcome = await waitForJob(existing.jobId, maxWait);
+    return buildWaitResponse(outcome);
+  }
 
   // Thread → previous Copilot sid. If the caller passed an explicit thread
   // name that doesn't exist yet, readThreadSid returns null (new thread).
@@ -1287,7 +1357,7 @@ export function _resetForTest() {
   _swept = false;
 }
 
-export { mcp, jobs, gcExpiredJobs, persistJob, adoptHostSessionId };
+export { mcp, jobs, gcExpiredJobs, persistJob, adoptHostSessionId, retainTerminalJob };
 
 // Only attach stdio transport when launched as a script. Allows
 // `import('./server.mjs')` from tests without spawning a real MCP loop.

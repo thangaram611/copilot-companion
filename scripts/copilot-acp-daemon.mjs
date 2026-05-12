@@ -10,8 +10,9 @@
 
 import { spawn, execSync } from 'node:child_process';
 import { createServer, connect as connectSocket } from 'node:net';
-import { appendFileSync, statSync, unlinkSync, renameSync, writeFileSync, existsSync, readFileSync, chmodSync, readdirSync } from 'node:fs';
+import { appendFileSync, statSync, unlinkSync, renameSync, writeFileSync, existsSync, readFileSync, chmodSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { Supervisor, pollSupervisor } from '../lib/prompt-supervisor.mjs';
 import {
   parseJsonlEvents,
@@ -64,6 +65,13 @@ const PROMPT_RETENTION_MS = 60 * 60 * 1000; // retain terminal prompts for inspe
 const SPAWN_INIT_TIMEOUT_MS = 30 * 1000; // 30s for handshake
 const SILENCE_CHECK_INTERVAL_MS = 10 * 1000; // 10s — silence heuristic
 const MAX_LONG_POLL_WAIT_MS = 8 * 60 * 1000; // 8 min — caller-requested wait cap (must be <= PROMPT_TIMEOUT_MS)
+// replyPrompt must wait for the cancelled prompt to reach a TERMINAL_STATUSES
+// state before re-entering startPromptBg, otherwise the prior collector still
+// owns `sessionCollectors[sessionId]` and would be overwritten by the
+// replacement — recreating the duplicate-prompt collision the per-session
+// mutex is meant to prevent. If the drain does not complete inside this
+// window the reply is failed cleanly rather than racing.
+export const REPLY_DRAIN_TIMEOUT_MS = 10 * 1000;
 
 // YOLO MODE: Copilot has unrestricted tool access. Constituent flags
 // (--allow-all-tools / --allow-all-paths / --allow-all-urls) are preferred
@@ -833,6 +841,27 @@ class SessionManager {
       throw new Error(`unknown sessionId: ${sessionId}`);
     }
 
+    // Per-session prompt mutex. AcpConnection.sendPrompt keys its event
+    // collector by sessionId and unconditionally overwrites; if we start a
+    // second prompt while the prior one is still non-terminal (running OR
+    // cancelling), the prior collector is silently amputated and JSON-RPC
+    // resolutions cross-contaminate. Refuse the second start and surface
+    // SESSION_BUSY so the bridge can reattach instead of colliding.
+    //
+    // No exemption for the reply path: replyPrompt must wait for the prior
+    // state to reach TERMINAL_STATUSES (drain cap = REPLY_DRAIN_TIMEOUT_MS)
+    // before re-entering this method. That's the only legitimate way to
+    // start a new prompt on the same session.
+    for (const prior of this.inFlightPrompts.values()) {
+      if (prior.sessionId !== sessionId) continue;
+      if (TERMINAL_STATUSES.has(prior.status)) continue;
+      const err = new Error(`session busy: prompt ${prior.promptId} is in flight (status=${prior.status})`);
+      err.code = 'SESSION_BUSY';
+      err.existingPromptId = prior.promptId;
+      err.sessionId = sessionId;
+      throw err;
+    }
+
     const promptId = randomUUID();
     const eventsFile = eventsFilePath(promptId);
     const sessionMeta = this.sessions.get(sessionId);
@@ -1084,18 +1113,35 @@ class SessionManager {
     state.replyInFlight = true;
     const sessionId = state.sessionId;
     try {
-      // Cancel the in-flight turn and wait briefly for it to drain.
+      // Cancel the in-flight turn and wait for it to actually reach a
+      // terminal state. Failing to wait would let us re-enter
+      // startPromptBg while AcpConnection.sendPrompt's collector for this
+      // session is still mapped to the cancelled prompt — replacement
+      // would overwrite it and trigger the duplicate-prompt collision.
+      // REPLY_DRAIN_TIMEOUT_MS caps the wait; on expiry we return a
+      // structured failure rather than racing.
       this.cancelPrompt(promptId);
-      await new Promise((resolve) => {
-        if (TERMINAL_STATUSES.has(state.status)) return resolve();
+      const drained = await new Promise((resolve) => {
+        if (TERMINAL_STATUSES.has(state.status)) return resolve(true);
         const timer = setTimeout(() => {
           const idx = state._terminalWaiters.indexOf(resolver);
           if (idx >= 0) state._terminalWaiters.splice(idx, 1);
-          resolve();
-        }, 5000);
-        const resolver = () => { clearTimeout(timer); resolve(); };
+          resolve(false);
+        }, REPLY_DRAIN_TIMEOUT_MS);
+        const resolver = () => {
+          clearTimeout(timer);
+          // Belt-and-suspenders: the drain helper resolves us before the
+          // status flip becomes observable in some orderings; double-check
+          // before declaring success.
+          resolve(TERMINAL_STATUSES.has(state.status));
+        };
         state._terminalWaiters.push(resolver);
       });
+
+      if (!drained) {
+        log('WARN', 'reply timeout: prior turn did not drain:', promptId, `status=${state.status}`);
+        return { ok: false, reason: 'reply timeout: prior turn did not drain' };
+      }
 
       const merged = [
         'CONTINUATION (user follow-up while you were working):',
@@ -1399,8 +1445,24 @@ class IpcServer {
         if (!sessionId) {
           sessionId = await this.manager.startSession(msg.cwd || process.cwd());
         }
-        const data = await this.manager.startPromptBg(sessionId, msg.text);
-        return { ok: true, data: { ...data, activeModel: ACTIVE_MODEL, sessionReborn } };
+        try {
+          const data = await this.manager.startPromptBg(sessionId, msg.text);
+          return { ok: true, data: { ...data, activeModel: ACTIVE_MODEL, sessionReborn } };
+        } catch (err) {
+          if (err && err.code === 'SESSION_BUSY') {
+            log('WARN', 'prompt-bg refused (session busy):', `sid=${err.sessionId} existing=${err.existingPromptId}`);
+            return {
+              ok: false,
+              code: 'SESSION_BUSY',
+              error: err.message,
+              data: {
+                existingPromptId: err.existingPromptId,
+                sessionId: err.sessionId,
+              },
+            };
+          }
+          throw err;
+        }
       }
       case 'watch': {
         const data = await this.manager.watchPrompt(msg.promptId, msg.since || 0, {
@@ -1460,40 +1522,64 @@ class IpcServer {
   }
 }
 
-// --- Main --------------------------------------------------------------------
+// --- Exports + Main ---------------------------------------------------------
 
-const manager = new SessionManager();
-const server = new IpcServer(manager);
-
-const cleanupAndExit = (code) => {
-  log('INFO', 'shutting down', { code });
-  manager.shutdown();
-  server.cleanup();
-  process.exit(code);
+// Importable for unit tests. Tests instantiate SessionManager with a stub
+// AcpConnection (see scripts/copilot-acp-daemon.test.mjs) to exercise the
+// per-session mutex and reply drain without spawning a Copilot subprocess
+// or opening the IPC socket. Production callers always go through the
+// `isMain` startup path below.
+export {
+  SessionManager,
+  AcpConnection,
+  IpcServer,
+  TERMINAL_STATUSES,
 };
 
-process.on('SIGINT', () => cleanupAndExit(0));
-process.on('SIGTERM', () => cleanupAndExit(0));
-process.on('uncaughtException', (err) => {
-  log('FATAL', 'uncaughtException:', err.stack || err.message);
-  cleanupAndExit(1);
-});
-process.on('unhandledRejection', (err) => {
-  log('FATAL', 'unhandledRejection:', err?.stack || String(err));
-});
-// Catch-all: if anything calls process.exit() directly (e.g. the stop
-// command, inactivity timer), still unlink the socket. exit handlers must
-// be synchronous.
-process.on('exit', () => {
-  if (existsSync(SOCKET_PATH)) {
-    try {
-      unlinkSync(SOCKET_PATH);
-    } catch {}
-  }
-});
+// Match server.mjs's isMain detection — realpathSync on both sides so a
+// symlinked argv[1] still matches import.meta.url.
+const isMain = (() => {
+  try {
+    const argvReal = realpathSync(process.argv[1]);
+    const metaReal = realpathSync(fileURLToPath(import.meta.url));
+    return argvReal === metaReal;
+  } catch { return false; }
+})();
 
-server.start().catch((err) => {
-  log('FATAL', 'failed to start server:', err.message);
-  console.error('failed to start daemon:', err.message);
-  process.exit(1);
-});
+if (isMain) {
+  const manager = new SessionManager();
+  const server = new IpcServer(manager);
+
+  const cleanupAndExit = (code) => {
+    log('INFO', 'shutting down', { code });
+    manager.shutdown();
+    server.cleanup();
+    process.exit(code);
+  };
+
+  process.on('SIGINT', () => cleanupAndExit(0));
+  process.on('SIGTERM', () => cleanupAndExit(0));
+  process.on('uncaughtException', (err) => {
+    log('FATAL', 'uncaughtException:', err.stack || err.message);
+    cleanupAndExit(1);
+  });
+  process.on('unhandledRejection', (err) => {
+    log('FATAL', 'unhandledRejection:', err?.stack || String(err));
+  });
+  // Catch-all: if anything calls process.exit() directly (e.g. the stop
+  // command, inactivity timer), still unlink the socket. exit handlers
+  // must be synchronous.
+  process.on('exit', () => {
+    if (existsSync(SOCKET_PATH)) {
+      try {
+        unlinkSync(SOCKET_PATH);
+      } catch {}
+    }
+  });
+
+  server.start().catch((err) => {
+    log('FATAL', 'failed to start server:', err.message);
+    console.error('failed to start daemon:', err.message);
+    process.exit(1);
+  });
+}

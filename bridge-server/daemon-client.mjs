@@ -30,7 +30,7 @@ const DAEMON_PATH = process.env.COPILOT_DAEMON_PATH || (() => {
 const DAEMON_BOOT_TIMEOUT_MS = Number(process.env.COPILOT_DAEMON_BOOT_MS) || 8_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 6 * 60 * 1000;
 
-export function sendToSocket(message, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+function realSendToSocket(message, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const sock = connectSocket(SOCKET_PATH);
     let buf = '';
@@ -97,7 +97,7 @@ async function spawnDaemon() {
   finally { _spawnPromise = null; }
 }
 
-export async function ensureDaemon({ reqId } = {}) {
+async function realEnsureDaemon({ reqId } = {}) {
   // Try a short probe first — if the daemon is already up the cost is one
   // round-trip on the socket. Skip the longer status timeout since "alive"
   // here means "socket accepts a connection", not "everything healthy".
@@ -112,5 +112,30 @@ export async function ensureDaemon({ reqId } = {}) {
     }
   }
   await spawnDaemon();
+}
+
+// Module-local impl pointers — tests can swap these via _setForTest without
+// touching the real socket / spawn. server.mjs imports the public wrappers
+// below as named bindings, so the indirection has to live here (ESM named
+// imports can't be rebound from outside).
+let _sendToSocketImpl = realSendToSocket;
+let _ensureDaemonImpl = realEnsureDaemon;
+
+export function sendToSocket(message, timeoutMs) {
+  return _sendToSocketImpl(message, timeoutMs);
+}
+
+export function ensureDaemon(opts) {
+  return _ensureDaemonImpl(opts);
+}
+
+export function _setForTest({ sendToSocket: sendStub, ensureDaemon: ensureStub } = {}) {
+  if (sendStub) _sendToSocketImpl = sendStub;
+  if (ensureStub) _ensureDaemonImpl = ensureStub;
+}
+
+export function _resetForTest() {
+  _sendToSocketImpl = realSendToSocket;
+  _ensureDaemonImpl = realEnsureDaemon;
 }
 

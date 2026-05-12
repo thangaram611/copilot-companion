@@ -319,22 +319,15 @@ echo ""
 # --- Step 8: Run unit tests -------------------------------------------------
 
 printf "Running unit tests...\n"
-TEST_FILES=(
-  "$SCRIPT_DIR/lib/prompt-supervisor.test.mjs"
-  "$SCRIPT_DIR/lib/prompt-inspect.test.mjs"
-  "$SCRIPT_DIR/lib/state.test.mjs"
-  "$SCRIPT_DIR/lib/log.test.mjs"
-  "$SCRIPT_DIR/lib/host.test.mjs"
-  "$SCRIPT_DIR/bridge-server/validation.test.mjs"
-  "$SCRIPT_DIR/bridge-server/server.test.mjs"
-  "$SCRIPT_DIR/hooks/drain-completions.test.mjs"
-  "$SCRIPT_DIR/scripts/install-codex-hooks.test.mjs"
-  "$SCRIPT_DIR/templates/copilot-companion.toml.test.mjs"
-)
+# Single source of truth: every `*.test.mjs` under the project tree. Avoids
+# the README / inline-list drift problem (new tests were getting added but
+# this list was not updated).
 EXISTING=()
-for f in "${TEST_FILES[@]}"; do
-  [ -f "$f" ] && EXISTING+=("$f")
-done
+while IFS= read -r f; do EXISTING+=("$f"); done < <(
+  find "$SCRIPT_DIR/bridge-server" "$SCRIPT_DIR/lib" "$SCRIPT_DIR/scripts" \
+       "$SCRIPT_DIR/hooks" "$SCRIPT_DIR/templates" \
+       -name '*.test.mjs' 2>/dev/null
+)
 
 if [ "${#EXISTING[@]}" -gt 0 ]; then
   if node --test "${EXISTING[@]}" 2>/dev/null; then

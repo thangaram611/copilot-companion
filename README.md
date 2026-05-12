@@ -338,8 +338,9 @@ grep '"event":"bridge.startup"' ~/.codex/copilot-companion/daemon.log
 ## Development
 
 - `node --check` should pass on every `.mjs` after edits.
-- Tests: `node --test bridge-server/validation.test.mjs bridge-server/server.test.mjs lib/state.test.mjs lib/host.test.mjs lib/log.test.mjs lib/prompt-inspect.test.mjs lib/prompt-supervisor.test.mjs scripts/install-codex-hooks.test.mjs templates/copilot-companion.toml.test.mjs`
-- Validate the Claude plugin manifest: `claude plugin validate` from the plugin root.
+- Tests: `node --test $(find bridge-server lib scripts hooks templates -name '*.test.mjs')`
+  — covers `bridge-server/{server,validation}.test.mjs`, `lib/{state,host,log,prompt-inspect,prompt-supervisor,heartbeat}.test.mjs`, `scripts/{copilot-acp-daemon,install-codex-hooks}.test.mjs`, `hooks/drain-completions.test.mjs`, and `templates/copilot-companion.toml.test.mjs`.
+- Validate the Claude plugin manifest: `claude plugin validate .` from the plugin root.
 
 ## Out of scope
 

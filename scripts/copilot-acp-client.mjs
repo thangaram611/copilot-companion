@@ -85,28 +85,6 @@ async function ensureDaemon() {
 
 // --- Subcommand handlers -----------------------------------------------------
 
-async function cmdStart(args) {
-  await ensureDaemon();
-  const cwd = parseFlag(args, '--cwd') || process.cwd();
-  return sendToSocket({ command: 'start', cwd });
-}
-
-async function cmdPrompt(args) {
-  await ensureDaemon();
-  const sessionId = args[0];
-  const text = args.slice(1).join(' ');
-  if (!sessionId || !text) throw new Error('usage: prompt <sessionId> <text>');
-  return sendToSocket({ command: 'prompt', sessionId, text });
-}
-
-async function cmdPromptAuto(args) {
-  await ensureDaemon();
-  const cwd = parseFlag(args, '--cwd') || process.cwd();
-  const text = args.filter((a, i, arr) => !(a === '--cwd' || arr[i - 1] === '--cwd')).join(' ');
-  if (!text) throw new Error('usage: prompt-auto <text>');
-  return sendToSocket({ command: 'prompt-auto', cwd, text });
-}
-
 // Background prompt: returns immediately with promptId. Use `watch` to poll
 // progress and `cancel` to interrupt. Optional --session <sid> to use an
 // existing session; otherwise a new session is created.
@@ -210,9 +188,6 @@ async function main() {
   if (!subcommand || subcommand === '--help' || subcommand === '-h') {
     console.log(
       'usage:\n' +
-        '  copilot-acp-client.mjs start [--cwd <path>]\n' +
-        '  copilot-acp-client.mjs prompt <sessionId> <text...>\n' +
-        '  copilot-acp-client.mjs prompt-auto [--cwd <path>] <text...>\n' +
         '  copilot-acp-client.mjs prompt-bg [--session <sid>] [--cwd <path>] <text...>\n' +
         '  copilot-acp-client.mjs watch <promptId> [--since <N>] [--raw] [--wait <sec>] [--summary-only]\n' +
         '  copilot-acp-client.mjs inspect <promptId> [--limit <N>]\n' +
@@ -228,9 +203,6 @@ async function main() {
   try {
     let result;
     switch (subcommand) {
-      case 'start': result = await cmdStart(rest); break;
-      case 'prompt': result = await cmdPrompt(rest); break;
-      case 'prompt-auto': result = await cmdPromptAuto(rest); break;
       case 'prompt-bg': result = await cmdPromptBg(rest); break;
       case 'watch': result = await cmdWatch(rest); break;
       case 'inspect': result = await cmdInspect(rest); break;

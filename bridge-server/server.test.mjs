@@ -1034,3 +1034,174 @@ test('buildWaitResponse: meta.detail omitted when no detail set', async () => {
     jobs.delete(jobId);
   }
 });
+
+// ---------- handleSend: bridge-side reattach + daemon SESSION_BUSY translation ----
+
+// Set up the daemon-client test seam. Each test below stubs sendToSocket /
+// ensureDaemon to a scenario-specific impl and resets at the end. Order
+// matters: import server.mjs first so we know daemon-client.mjs is on the
+// module-loader path with its public wrappers intact.
+async function withDaemonStubs(stubs, body) {
+  const daemonClient = await import('./daemon-client.mjs');
+  daemonClient._setForTest(stubs);
+  try { return await body(); }
+  finally { daemonClient._resetForTest(); }
+}
+
+test('handleSend reattaches to a non-terminal job for the same thread + host sid', async () => {
+  const { dispatch, jobs, _resetForTest } = await import('./server.mjs');
+  _resetForTest();
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-reattach-A';
+  let socketCalls = 0;
+  jobs.set('copilot-existing-1', {
+    jobId: 'copilot-existing-1',
+    claudeSessionId: 'sid-reattach-A',
+    thread: 'thread-reattach-A',
+    status: 'running',
+    promptId: 'prompt-existing-1',
+    sessionId: 'cop-sid-1',
+    startedAt: Date.now() - 5_000,
+  });
+  try {
+    const body = await withDaemonStubs(
+      {
+        ensureDaemon: async () => { socketCalls++; },
+        sendToSocket: async () => { socketCalls++; throw new Error('reattach must not touch the daemon'); },
+      },
+      async () => {
+        const res = await dispatch({
+          action: 'send',
+          task: 'reattach me',
+          mode: 'EXECUTE',
+          template: 'general',
+          thread: 'thread-reattach-A',
+          host_session_id: 'sid-reattach-A',
+          max_wait_sec: 1, // force still_running timeout
+          parallel: false,
+        });
+        return JSON.parse(res.content[0].text);
+      },
+    );
+    assert.equal(body.status, 'still_running', 'reattach + waitForJob timeout → still_running');
+    assert.equal(body.job_id, 'copilot-existing-1', 'must surface the pre-existing job id, not a fresh one');
+    assert.equal(body.reattached, true, 'still_running response must carry reattached:true');
+    assert.equal(socketCalls, 0, 'reattach branch must skip both ensureDaemon and sendToSocket');
+  } finally {
+    jobs.delete('copilot-existing-1');
+    _resetForTest();
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
+
+test('handleSend reattach surfaces meta.reattached on terminal flip mid-wait', async () => {
+  const { dispatch, jobs, retainTerminalJob, _resetForTest } = await import('./server.mjs');
+  _resetForTest();
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-reattach-B';
+  jobs.set('copilot-existing-2', {
+    jobId: 'copilot-existing-2',
+    claudeSessionId: 'sid-reattach-B',
+    thread: 'thread-reattach-B',
+    status: 'running',
+    promptId: 'prompt-existing-2',
+    sessionId: 'cop-sid-2',
+    startedAt: Date.now() - 5_000,
+  });
+  try {
+    const body = await withDaemonStubs(
+      {
+        ensureDaemon: async () => {},
+        sendToSocket: async () => { throw new Error('reattach must not touch the daemon'); },
+      },
+      async () => {
+        // Schedule the terminal flip slightly after dispatch parks its waiter.
+        // retainTerminalJob fires resolveAllWaiters, so the still-running
+        // handleSend's waitForJob resolves with terminal:true and
+        // buildWaitResponse takes the terminal branch — which is where the
+        // meta.reattached flag is written.
+        setImmediate(() => {
+          retainTerminalJob('copilot-existing-2', {
+            status: 'completed',
+            summary: { message: 'done.\n\nRUBBER-DUCK: clean.' },
+            durationMs: 4_000,
+            terminalAt: Date.now(),
+          });
+        });
+        const res = await dispatch({
+          action: 'send',
+          task: 'reattach me again',
+          mode: 'EXECUTE',
+          template: 'general',
+          thread: 'thread-reattach-B',
+          host_session_id: 'sid-reattach-B',
+          max_wait_sec: 5,
+          parallel: false,
+        });
+        return JSON.parse(res.content[0].text);
+      },
+    );
+    assert.equal(body.status, 'completed', 'terminal flip drives status=completed');
+    assert.equal(body.job_id, 'copilot-existing-2');
+    assert.equal(body.meta.reattached, 'true', 'terminal payload must surface meta.reattached');
+  } finally {
+    jobs.delete('copilot-existing-2');
+    _resetForTest();
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
+
+test('runWorker translates daemon SESSION_BUSY into unreachable + meta.existing_prompt_id', async () => {
+  // Belt-and-suspenders: the bridge reattach guard normally catches the
+  // duplicate before it reaches the daemon, but a race between two
+  // interleaved sends could still slip through. SESSION_BUSY from the daemon
+  // must map to a clean terminal envelope instead of a 6 ms "unexpected
+  // terminal" bubbling out as a generic error.
+  const { dispatch, jobs, _resetForTest } = await import('./server.mjs');
+  _resetForTest();
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-busy-C';
+  try {
+    const body = await withDaemonStubs(
+      {
+        ensureDaemon: async () => {},
+        sendToSocket: async (msg) => {
+          if (msg.command === 'prompt-bg') {
+            return {
+              ok: false,
+              code: 'SESSION_BUSY',
+              error: 'session busy: prompt p1 is in flight (status=running)',
+              data: { existingPromptId: 'p1', sessionId: 'cop-sid-busy' },
+            };
+          }
+          // status/watch probes get an empty-ok so ensureDaemon-style calls
+          // never fall through to the spawn path.
+          return { ok: true, data: {} };
+        },
+      },
+      async () => {
+        const res = await dispatch({
+          action: 'send',
+          task: 'this one races the daemon mutex',
+          mode: 'EXECUTE',
+          template: 'general',
+          thread: 'thread-busy-C',
+          host_session_id: 'sid-busy-C',
+          max_wait_sec: 5,
+          parallel: false,
+        });
+        return JSON.parse(res.content[0].text);
+      },
+    );
+    assert.equal(body.status, 'unreachable', 'SESSION_BUSY maps to terminal:unreachable');
+    assert.equal(body.meta.detail, 'session_busy', 'detail tag identifies the busy variant');
+    assert.equal(body.meta.existing_prompt_id, 'p1', 'meta surfaces the daemon-reported promptId');
+  } finally {
+    // Best-effort cleanup of the in-memory job the failing send registered.
+    for (const id of [...jobs.keys()]) {
+      if (jobs.get(id)?.claudeSessionId === 'sid-busy-C') jobs.delete(id);
+    }
+    _resetForTest();
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+  }
+});
