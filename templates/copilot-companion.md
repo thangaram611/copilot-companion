@@ -42,7 +42,9 @@ description: |
                                                               //   coordination overhead would dominate.
                                                               //   The companion does NOT decide this —
                                                               //   main sets it before dispatch.
-      "max_wait_sec":  <integer>                              // default 480, clamped to [1,540]
+      "max_wait_sec":  <integer>                              // applies to subsequent `wait` calls only;
+                                                              // `send` returns still_running immediately.
+                                                              // default 480, clamped to [1,540]
                                                               // ([1,900] for ANALYZE);
                                                               // 0/missing/non-numeric → 480
     }
@@ -165,13 +167,13 @@ Initial call:
 
 Remember the `max_wait_sec` value you used here — call it `BUDGET`. You will reuse `BUDGET` for every wait iteration (see Wait loop).
 
-The call BLOCKS up to `BUDGET` seconds inside the bridge. Capture `response.job_id`. If this was your first send, also capture `response.meta.thread` (terminal path) or `response.thread` (still_running path) and emit `<!-- MY_THREAD=<value> -->` immediately as a visible line in your turn.
+`send` returns immediately with `status="still_running"` and a `job_id`; the worker runs in the background. Capture `response.job_id`. If this was your first send, also capture `response.thread` (still_running path) — or `response.meta.thread` if a reattach short-circuited to a terminal payload — and emit `<!-- MY_THREAD=<value> -->` immediately as a visible line in your turn.
 
 Branch on `response.status`:
-- `completed` | `failed` | `stuck` | `cancelled` → terminal, go to **Return / terminal envelope**.
+- `still_running` → expected on the initial send; go to **Wait loop**.
+- `completed` | `failed` | `stuck` | `cancelled` → terminal (only possible on a reattach to an already-finished job), go to **Return / terminal envelope**.
 - `timeout` → go to **Return / timeout envelope** (do NOT rescue the task yourself; main will decompose and re-dispatch).
 - `unreachable` → go to **Return / unreachable envelope** (infrastructure failure; surface `meta.detail` so main can tell `bridge_timeout` from `bridge_daemon_unreachable`).
-- `still_running` → go to **Wait loop**.
 - `unknown_job` / `response.ok === false` / any other error envelope → go to **Return / error envelope**.
 
 ## Wait loop
@@ -192,7 +194,7 @@ Then call:
 
 Re-branch on `response.status`. Keep looping until terminal. No iteration cap.
 
-**Interrupt observability**: SendMessage arrivals from main are visible only **between** iterations of this loop, not during the bridge's blocking call. Worst-case interrupt latency is therefore one `BUDGET`. The initial `send` itself blocks before the wait loop exists, so an interrupt that arrives during the first blocking call cannot be observed until that call returns.
+**Interrupt observability**: SendMessage arrivals from main are visible only **between** iterations of this loop, not during a blocking `wait` call. Worst-case interrupt latency is therefore one `BUDGET`. The initial `send` returns immediately, so a follow-up interrupt observed before the first `wait` iteration is handled normally.
 
 If a new user turn appears between iterations, treat it as a new dispatch input (parse the JSON string, branch on `action`). If it is `{"action":"cancel"}`, immediately call the bridge's `cancel` action with your tracked `job_id`; then exit by going to **Return** with the cancelled result.
 

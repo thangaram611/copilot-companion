@@ -191,6 +191,7 @@ test('clampWaitSec: floor of 1 (no zero-wait races)', async () => {
   assert.equal(clampWaitSec(0.4, 'EXECUTE'), 1);
 });
 
+
 // ---------- formatTerminalContent: timeout + unreachable branches ----------
 
 test('formatTerminalContent: timeout body lists decompose / scope_hint / parallel:false', async () => {
@@ -1121,6 +1122,64 @@ async function withDaemonStubs(stubs, body) {
   finally { daemonClient._resetForTest(); }
 }
 
+test('handleSend returns still_running envelope synchronously (does not wait on worker)', async () => {
+  // Bug 1 fix: send no longer blocks on waitForJob. The worker stub here
+  // pins the job in the 'starting' state forever; if handleSend still
+  // awaited terminal it would hang past the assertion timeout. We measure
+  // wall-clock with performance.now() and assert < 200ms — comfortably
+  // above any realistic in-process latency but well under the daemon
+  // socket timeout, the per-tool MCP cap, or any worker tick.
+  const { dispatch, jobs, _resetForTest } = await import('./server.mjs');
+  _resetForTest();
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-instant-send';
+  try {
+    const body = await withDaemonStubs(
+      {
+        // ensureDaemon resolves so runWorker can proceed past the daemon
+        // handshake; sendToSocket would normally drive the prompt forward
+        // but we never await it from handleSend now — so a no-op stub is
+        // enough. The fire-and-forget runWorker may invoke it later; that
+        // is fine because the assertions only inspect the synchronous
+        // return value.
+        ensureDaemon: async () => {},
+        sendToSocket: async () => ({ ok: true, data: {} }),
+      },
+      async () => {
+        const t0 = performance.now();
+        const res = await dispatch({
+          action: 'send',
+          task: 'instant-return smoke',
+          mode: 'EXECUTE',
+          template: 'general',
+          host_session_id: 'sid-instant-send',
+          max_wait_sec: 9999, // would block forever if handleSend still awaited
+          parallel: false,
+        });
+        const elapsed = performance.now() - t0;
+        return { body: JSON.parse(res.content[0].text), elapsed };
+      },
+    );
+    assert.ok(body.elapsed < 200, `handleSend must return synchronously (got ${body.elapsed}ms)`);
+    assert.equal(body.body.ok, true);
+    assert.equal(body.body.action, 'send');
+    assert.equal(body.body.status, 'still_running');
+    assert.ok(body.body.job_id.startsWith('copilot-'));
+    assert.ok(body.body.thread, 'still_running envelope must surface thread');
+    assert.equal(body.body.current_status, 'starting');
+    assert.ok(body.body.started_at, 'still_running envelope must surface started_at iso');
+    assert.equal(body.body.age_s, 0);
+    assert.equal(body.body.session_reborn, false);
+    assert.match(body.body.hint, /action:"wait"/);
+  } finally {
+    _resetForTest();
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    // Worker fired in the background; give the event loop a tick so any
+    // pending microtasks settle before the next test imports server.mjs.
+    await new Promise((r) => setImmediate(r));
+  }
+});
+
 test('handleSend reattaches to a non-terminal job for the same thread + host sid', async () => {
   const { dispatch, jobs, _resetForTest } = await import('./server.mjs');
   _resetForTest();
@@ -1230,6 +1289,11 @@ test('runWorker translates daemon SESSION_BUSY into unreachable + meta.existing_
   // interleaved sends could still slip through. SESSION_BUSY from the daemon
   // must map to a clean terminal envelope instead of a 6 ms "unexpected
   // terminal" bubbling out as a generic error.
+  //
+  // Post-Bug-1 fix, handleSend returns still_running synchronously and the
+  // worker drives the terminal flip in the background. We exercise the
+  // worker's translation by issuing a follow-up `wait` on the job_id from
+  // the send response — that path is the one production subagents use.
   const { dispatch, jobs, _resetForTest } = await import('./server.mjs');
   _resetForTest();
   const oldS = process.env.CLAUDE_CODE_SESSION_ID;
@@ -1253,7 +1317,7 @@ test('runWorker translates daemon SESSION_BUSY into unreachable + meta.existing_
         },
       },
       async () => {
-        const res = await dispatch({
+        const sendRes = await dispatch({
           action: 'send',
           task: 'this one races the daemon mutex',
           mode: 'EXECUTE',
@@ -1263,7 +1327,19 @@ test('runWorker translates daemon SESSION_BUSY into unreachable + meta.existing_
           max_wait_sec: 5,
           parallel: false,
         });
-        return JSON.parse(res.content[0].text);
+        const sendBody = JSON.parse(sendRes.content[0].text);
+        assert.equal(sendBody.status, 'still_running', 'send returns still_running synchronously');
+        assert.ok(sendBody.job_id, 'send must surface job_id for the follow-up wait');
+        // Worker now drives the SESSION_BUSY → terminal:unreachable flip in
+        // the background. Wait on the job_id; resolves quickly because the
+        // worker hits the stub error on its first prompt-bg call.
+        const waitRes = await dispatch({
+          action: 'wait',
+          job_id: sendBody.job_id,
+          max_wait_sec: 5,
+          host_session_id: 'sid-busy-C',
+        });
+        return JSON.parse(waitRes.content[0].text);
       },
     );
     assert.equal(body.status, 'unreachable', 'SESSION_BUSY maps to terminal:unreachable');

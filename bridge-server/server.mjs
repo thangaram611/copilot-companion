@@ -7,10 +7,13 @@
 // activation lifecycle. Model selection and rubber-duck critique are internal
 // server concerns and never exposed through the public schema.
 //
-// `send` blocks up to `max_wait_sec` (default 480) then returns either a
-// terminal response or `status=still_running` with the job_id; the subagent
-// loops on `wait` until terminal, emitting a short line between iterations to
-// reset Claude Code's 600s stream-idle watchdog.
+// `send` enqueues the task and returns `status=still_running` with the job_id
+// immediately (no blocking — the worker keeps running in the background). The
+// subagent then loops on `wait` until terminal, emitting a short line between
+// iterations to reset the host's stream-idle watchdog. Both hosts have
+// generous per-tool-call budgets (Claude 600s, Codex 120s per
+// `codex-rs/codex-mcp/src/rmcp_client.rs:79`); a single wait bounded by
+// clampWaitSec (≤540s, ≤900s for ANALYZE) returns well under both.
 //
 // Completion surfacing: each terminal/alert event is appended to a JSONL queue
 // file with `consumed:false`; the drain script (invoked from the subagent's
@@ -204,8 +207,11 @@ function persistJob(jobId) {
 
 // Wait-budget clamp. ANALYZE permits longer single-turn analysis on large
 // files (cap 900s); other modes stay capped at 540s to leave headroom under
-// the MCP 600s stream-idle watchdog. Default 480s when input is missing,
-// non-numeric, or zero. Floor 1s to avoid no-wait races.
+// Claude Code's 600s stream-idle watchdog. Codex's per-tool MCP timeout
+// defaults to 120s (`codex-rs/codex-mcp/src/rmcp_client.rs:79`) but is
+// user-configurable via `[mcp_servers.X].tool_timeout_sec` in the agent
+// TOML — see README's Codex install section. Default 480s when input is
+// missing, non-numeric, or zero. Floor 1s to avoid no-wait races.
 export function clampWaitSec(input, mode) {
   const cap = mode === 'ANALYZE' ? 900 : 540;
   return Math.max(1, Math.min(Number(input) || 480, cap));
@@ -323,10 +329,11 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
 
 // --- Waiters (v6.1) --------------------------------------------------------
 //
-// Each blocking action (send, wait) parks a resolver on the target jobId. The
-// worker calls resolveAllWaiters through retainTerminalJob when the job
-// reaches a terminal state. A per-call timeout returns {timeout:true, job} so
-// the subagent can loop with a fresh wait.
+// `wait` parks a resolver on the target jobId (`send` returns synchronously,
+// so it never parks). The worker calls resolveAllWaiters through
+// retainTerminalJob when the job reaches a terminal state. A per-call
+// timeout returns {timeout:true, job} so the subagent can loop with a fresh
+// wait.
 
 const waiters = new Map(); // jobId -> Set<resolver>
 
@@ -973,9 +980,23 @@ async function handleSend(args) {
     parallel: !!args.parallel,
   }).catch((err) => log('ERROR', 'worker error:', err.message));
 
-  const maxWaitSec = clampWaitSec(args.max_wait_sec, args.mode);
-  const outcome = await waitForJob(jobId, maxWaitSec);
-  return buildWaitResponse(outcome);
+  // Return immediately with still_running. The worker continues in the
+  // background; the caller (subagent) loops on `wait` to block until terminal.
+  // Returning synchronously here avoids client-side MCP timeouts on hosts
+  // (Codex) with shorter per-tool budgets than the bridge's natural wait
+  // window. Shape mirrors buildWaitResponse's still_running envelope so the
+  // subagent doesn't need to special-case send vs wait responses.
+  const job = jobs.get(jobId);
+  return asJson({
+    ok: true, action: 'send', status: 'still_running',
+    job_id: jobId,
+    thread,
+    current_status: job?.status || 'starting',
+    started_at: iso(job?.startedAt || Date.now()),
+    age_s: 0,
+    session_reborn: false,
+    hint: 'call copilot({action:"wait", job_id, max_wait_sec}) to block until terminal.',
+  });
 }
 
 async function handleWait({ job_id, max_wait_sec }) {
@@ -1081,9 +1102,10 @@ const mcp = new Server(
       'agent at ~/.claude/agents/copilot-companion.md, materialized by the ' +
       'plugin\'s install-agent.sh SessionStart hook). Not registered at session ' +
       'scope — main Claude does not see this tool surface. Actions: send ' +
-      '(blocking), wait, status, reply, cancel. The companion uses send for ' +
-      'kickoff then loops on wait until terminal. Completion events are also ' +
-      'appended to /tmp/copilot-completions.jsonl for the plugin\'s drain hooks.',
+      '(returns still_running synchronously), wait (blocks until terminal), ' +
+      'status, reply, cancel. The companion uses send for kickoff then loops ' +
+      'on wait until terminal. Completion events are also appended to ' +
+      '/tmp/copilot-completions.jsonl for the plugin\'s drain hooks.',
   },
 );
 
@@ -1103,7 +1125,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['send', 'wait', 'status', 'reply', 'cancel'],
             description:
-              'send: delegate a task, BLOCK up to max_wait_sec seconds, return terminal OR still_running with job_id. ' +
+              'send: enqueue a task; returns still_running with job_id immediately. Caller then loops on action:wait to block until terminal. ' +
               'wait: block on an existing job_id up to max_wait_sec seconds. ' +
               'status: without job_id returns global state; with job_id returns job diagnostics. ' +
               'reply: re-steer an in-flight job (requires job_id + message). ' +
@@ -1158,10 +1180,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           max_wait_sec: {
             type: 'number',
             description:
-              '[send|wait] Upper bound on how long the bridge blocks this call before returning ' +
+              '[send|wait] Upper bound on how long the bridge blocks before returning ' +
               'still_running. Default 480, max 540 (or 900 for ANALYZE). Non-ANALYZE caps at 540 ' +
-              'to leave headroom under the MCP 600s stream-idle watchdog; ANALYZE allows longer ' +
-              'single-turn analysis on large files.',
+              'to leave headroom under Claude Code\'s 600s stream-idle watchdog; ANALYZE allows ' +
+              'longer single-turn analysis on large files. On a fresh `send` this bound is moot — ' +
+              'the call returns still_running synchronously — but on a reattach to an in-flight ' +
+              'job, send blocks on the existing job up to this bound. Wait always blocks up to ' +
+              'this bound.',
           },
           parallel: {
             type: 'boolean',

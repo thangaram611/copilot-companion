@@ -28,7 +28,10 @@ param fails schema validation on objects). Payload shape:
                                                             //   Copilot's orchestrator decomposes &
                                                             //   dispatches isolated sub-agents in
                                                             //   parallel where possible.
-    "max_wait_sec":  <integer>                              // default 480, clamped to [1,540]
+    "max_wait_sec":  <integer>                              // applies to subsequent `wait` calls only;
+                                                            //   `send` returns still_running immediately
+                                                            //   (no blocking). default 480, clamped to
+                                                            //   [1,540] ([1,900] for ANALYZE).
   }
   { "action": "status" }
   { "action": "status", "job_id": "copilot-...", "verbose": true }
@@ -38,12 +41,21 @@ param fails schema validation on objects). Payload shape:
 
 The JSON has no `thread` field — the bridge manages thread continuity
 internally, keyed by the Codex session id it reads from MCP request
-metadata. For `send`, parent should not block on this subagent; jobs may
-take minutes to hours. For status / reply / cancel, the call returns in
-seconds.
+metadata. `send` enqueues the task and returns `still_running` with a
+`job_id` immediately; the subagent then loops on `wait` until terminal.
+status / reply / cancel calls return in seconds.
 
-Cancel latency is bounded by the current MCP wait window: pass
-`max_wait_sec: 60` on the initial send if urgent cancel matters.
+Completion delivery (Codex 0.130.0): when this subagent reaches a final
+status, its terminal output is injected directly into main Codex's
+session conversation by the V1 completion watcher, but `trigger_turn`
+is hardcoded `false` (see `codex-rs/core/src/agent/control.rs:1012`) so
+main does NOT auto-resume. Main reads the injected message on its next
+user prompt. This is an upstream V1 limitation, not a plugin bug — V2
+is under-development and its `spawn_agent` schema (`task_name + message`)
+is incompatible with this plugin.
+
+Cancel latency is bounded by the per-iteration wait window: pass
+`max_wait_sec: 60` if urgent cancel matters.
 
 Copilot output for `general` and `research` templates includes a
 server-appended `RUBBER-DUCK: clean|revised` verdict line; not configurable.
@@ -132,13 +144,13 @@ Initial call:
 
 Remember the `max_wait_sec` value you used here — call it `BUDGET`. You will reuse `BUDGET` for every wait iteration (see Wait loop).
 
-The call BLOCKS up to `BUDGET` seconds inside the bridge. Capture `response.job_id`.
+`send` returns immediately with `status="still_running"` and a `job_id`; the worker runs in the background. Capture `response.job_id`.
 
 Branch on `response.status`:
-- `completed` | `failed` | `stuck` | `cancelled` → terminal, go to **Return / terminal envelope**.
+- `still_running` → expected on the initial send; go to **Wait loop**.
+- `completed` | `failed` | `stuck` | `cancelled` → terminal (only possible on a reattach to an already-finished job), go to **Return / terminal envelope**.
 - `timeout` → go to **Return / timeout envelope** (do NOT rescue the task yourself; main will decompose and re-dispatch).
 - `unreachable` → go to **Return / unreachable envelope** (infrastructure failure; surface `meta.detail` so main can tell `bridge_timeout` from `bridge_daemon_unreachable`).
-- `still_running` → go to **Wait loop**.
 - `unknown_job` / `response.ok === false` / any other error envelope → go to **Return / error envelope**.
 
 ## Wait loop
@@ -159,7 +171,7 @@ Then call:
 
 Re-branch on `response.status`. Keep looping until terminal. No iteration cap.
 
-**Interrupt observability**: send_input arrivals from main are visible only **between** iterations of this loop, not during the bridge's blocking call. Worst-case interrupt latency is therefore one `BUDGET`. The initial `send` itself blocks before the wait loop exists, so an interrupt that arrives during the first blocking call cannot be observed until that call returns.
+**Interrupt observability**: send_input arrivals from main are visible only **between** iterations of this loop, not during a blocking `wait` call. Worst-case interrupt latency is therefore one `BUDGET`. The initial `send` returns immediately, so a follow-up interrupt observed before the first `wait` iteration is handled normally.
 
 If a new user turn appears between iterations, treat it as a new dispatch input (parse the JSON string, branch on `action`). If it is `{"action":"cancel"}`, immediately call the bridge's `cancel` action with your tracked `job_id`; then exit by going to **Return** with the cancelled result.
 

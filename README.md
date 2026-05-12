@@ -125,6 +125,8 @@ What that does, end-to-end:
 
 After setup, run `codex` and ask main Codex to delegate to Copilot (e.g. _"have copilot audit the auth module"_) — main Codex spawns the `copilot-companion` subagent via `spawn_agent`, the bridge starts inline, and the flow mirrors the Claude path. Session id continuity is handled server-side: Codex injects `_meta["x-codex-turn-metadata"].session_id` on every MCP request, and the bridge reads it directly — there is no `claude_session_id`/`host_session_id` to forward by hand.
 
+**Completion delivery on Codex 0.130.0 (V1 `multi_agent`).** When the `copilot-companion` subagent reaches a final status, Codex's V1 completion watcher injects the subagent's terminal message into main's session conversation via `inject_user_message_without_turn(...)` — but `trigger_turn` is hardcoded `false` (`codex-rs/core/src/agent/control.rs:1012`), so main does NOT auto-resume. Main reads the previously-injected message on its next user prompt; just send any prompt (`any updates?`) to give main a turn and the result surfaces in conversation history. The `multi_agent_v2` feature flag is `UnderDevelopment` and its `spawn_agent` schema (`task_name + message`) is incompatible with this plugin's V1-style invocation (`prompt`), so we deliberately do not enable it — and even if enabled, the V2 path skips the completion watcher entirely (`codex-rs/core/src/agent/control.rs:320-334`), so it wouldn't fix auto-resume anyway. This is an upstream limitation, not a plugin bug.
+
 If you'd rather install for both hosts in one shot:
 
 ```bash
@@ -217,11 +219,15 @@ copilot({ action: "reply",  job_id, message })
 copilot({ action: "cancel", job_id })
 ```
 
-`send` blocks up to `max_wait_sec` (default 480, max 540 — or 900 for
-`mode: "ANALYZE"` to permit longer single-turn analysis on large files).
-If the job hasn't terminated, the bridge returns `status: "still_running"`
-and the subagent loops on `wait` — emitting one short line between
-iterations to keep Claude Code's 600s stream-idle watchdog from firing.
+`send` enqueues the task and returns `status: "still_running"` with a
+`job_id` immediately — the worker runs in the background. The subagent
+then loops on `wait` (each up to `max_wait_sec`, default 480, max 540 —
+or 900 for `mode: "ANALYZE"` to permit longer single-turn analysis on
+large files), emitting one short line between iterations to keep the
+host's stream-idle watchdog from firing. Both hosts have generous per-
+tool-call budgets — Claude Code 600s, Codex 120s default (`tool_timeout_sec`
+in the agent TOML's `[mcp_servers.X]` block) — so the 540s clamp stays
+well under both.
 
 Terminal statuses returned by the bridge: `completed`, `failed`,
 `cancelled`, `stuck` (supervisor trip — model misbehavior), **`timeout`**
@@ -298,7 +304,7 @@ main decides which to try.
 
 1. **Strict isolation.** The `copilot-bridge` MCP server is bundled with the plugin but the subagent's `tools:` list is the only path through which it's invoked. Main never calls the bridge directly.
 2. **No activation lifecycle.** The bridge is spawned per subagent invocation by Claude Code's plugin MCP machinery. There's nothing to `start`, `stop`, or `pause`.
-3. **Bounded blocking.** `send` / `wait` always return within `max_wait_sec ≤ 540` (or `≤ 900` for ANALYZE) so the MCP transport never hits the 600s idle cap on non-ANALYZE work.
+3. **Bounded blocking.** `send` returns immediately with `still_running`; each `wait` returns within `max_wait_sec ≤ 540` (or `≤ 900` for ANALYZE) so the MCP transport stays well under both hosts' per-tool budgets (Claude 600s, Codex 120s default).
 4. **Orphan safety net.** Completion events are appended to `/tmp/copilot-completions.jsonl` with `consumed:false`; wait-terminal responses flip to `consumed:true`; the drain hook surfaces only unconsumed entries.
 5. **Rubber-duck always on.** Appended to every `send` server-side for every template except `plan_review` (which has its own critique instructions baked in). Not in the schema.
 6. **Model is config.** Read from `default-model` at worker start. Never a tool parameter.
