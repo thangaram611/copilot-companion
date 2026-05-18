@@ -156,20 +156,16 @@ test('classifyRubberDuck: ignores unrelated words after prefix', async () => {
   assert.equal(classifyRubberDuck('RUBBER-DUCK: revival'), 'missing');
 });
 
-// ---------- clampWaitSec: mode-aware caps ----------
+// ---------- clampWaitSec: single 1200s cap (mode-agnostic) ----------
 
-test('clampWaitSec: ANALYZE permits up to 900s', async () => {
+test('clampWaitSec: all modes permit up to 1200s', async () => {
   const { clampWaitSec } = await import('./server.mjs');
   assert.equal(clampWaitSec(700, 'ANALYZE'), 700);
-  assert.equal(clampWaitSec(900, 'ANALYZE'), 900);
-  assert.equal(clampWaitSec(1200, 'ANALYZE'), 900);
-});
-
-test('clampWaitSec: non-ANALYZE caps at 540', async () => {
-  const { clampWaitSec } = await import('./server.mjs');
-  assert.equal(clampWaitSec(700, 'EXECUTE'), 540);
-  assert.equal(clampWaitSec(700, 'PLAN'), 540);
-  assert.equal(clampWaitSec(540, 'EXECUTE'), 540);
+  assert.equal(clampWaitSec(1200, 'ANALYZE'), 1200);
+  assert.equal(clampWaitSec(1500, 'ANALYZE'), 1200);
+  assert.equal(clampWaitSec(700, 'EXECUTE'), 700);
+  assert.equal(clampWaitSec(1200, 'EXECUTE'), 1200);
+  assert.equal(clampWaitSec(1500, 'PLAN'), 1200);
   assert.equal(clampWaitSec(300, 'EXECUTE'), 300);
 });
 
@@ -228,6 +224,66 @@ test('formatTerminalContent: timeout body lists decompose / scope_hint / paralle
     assert.match(body.content, /scope_hint/);
     assert.match(body.content, /parallel: false/);
     assert.match(body.content, /\*\*Failed tools:\*\* view, grep/);
+  } finally {
+    jobs.delete(jobId);
+  }
+});
+
+test('formatTerminalContent: timeout body includes digest_path when promptId present', async () => {
+  const mod = await import('./server.mjs');
+  const { jobs } = mod;
+  const jobId = 'job-test-timeout-digest';
+  jobs.set(jobId, {
+    jobId,
+    status: 'timeout',
+    task: 'review CSP changes',
+    mode: 'ANALYZE',
+    durationMs: 600_000,
+    failedTools: [],
+    promptId: 'p-with-digest',
+    sessionId: 's-with-digest',
+    thread: 'companion-test',
+    parallel: true,
+    startedAt: Date.now() - 600_000,
+    terminalAt: Date.now(),
+    retentionExpiresAt: Date.now() + 60_000,
+  });
+  try {
+    const res = await mod.dispatch({ action: 'wait', job_id: jobId, max_wait_sec: 1 });
+    const body = JSON.parse(res.content[0].text);
+    assert.equal(body.status, 'timeout');
+    assert.match(body.content, /\*\*Partial transcript digest:\*\*/);
+    assert.match(body.content, /copilot-digest-job-test-timeout-digest\.md/);
+    assert.match(body.content, /Read the partial-transcript digest/);
+    assert.ok(body.meta.digest_path, 'meta.digest_path present');
+    assert.match(body.meta.digest_path, /copilot-digest-job-test-timeout-digest\.md$/);
+  } finally {
+    jobs.delete(jobId);
+  }
+});
+
+test('formatTerminalContent: timeout body omits digest line when promptId absent', async () => {
+  const mod = await import('./server.mjs');
+  const { jobs } = mod;
+  const jobId = 'job-test-timeout-nopid';
+  jobs.set(jobId, {
+    jobId,
+    status: 'timeout',
+    task: 'no prompt yet',
+    mode: 'EXECUTE',
+    durationMs: 5_000,
+    failedTools: [],
+    promptId: null,
+    startedAt: Date.now() - 5_000,
+    terminalAt: Date.now(),
+    retentionExpiresAt: Date.now() + 60_000,
+  });
+  try {
+    const res = await mod.dispatch({ action: 'wait', job_id: jobId, max_wait_sec: 1 });
+    const body = JSON.parse(res.content[0].text);
+    assert.equal(body.status, 'timeout');
+    assert.doesNotMatch(body.content, /Partial transcript digest/);
+    assert.equal(body.meta.digest_path, undefined);
   } finally {
     jobs.delete(jobId);
   }

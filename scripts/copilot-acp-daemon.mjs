@@ -60,11 +60,11 @@ const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — safely above the 10-
 const HEARTBEAT_DIR = '/tmp/copilot-companion-heartbeats';
 const HOST_LIVENESS_TTL_MS = 30 * 60 * 1000; // 30 min — see hooks/drain-completions.sh
 const HEARTBEAT_STALE_AFTER_MS = 24 * 60 * 60 * 1000; // 24h: unlink unused heartbeats
-const PROMPT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per prompt — must be >= MAX_LONG_POLL_WAIT_MS or legitimate long prompts are killed and surface as "prompt timeout" failures instead of real answers
+const PROMPT_TIMEOUT_MS = 25 * 60 * 1000; // 25 min per prompt — must be >= MAX_LONG_POLL_WAIT_MS or legitimate long prompts are killed and surface as "prompt timeout" failures instead of real answers. Raised from 10 min to accommodate /fleet jobs that legitimately decompose into multiple long-running sub-agents (e.g. multi-file code reviews).
 const PROMPT_RETENTION_MS = 60 * 60 * 1000; // retain terminal prompts for inspection
 const SPAWN_INIT_TIMEOUT_MS = 30 * 1000; // 30s for handshake
 const SILENCE_CHECK_INTERVAL_MS = 10 * 1000; // 10s — silence heuristic
-const MAX_LONG_POLL_WAIT_MS = 8 * 60 * 1000; // 8 min — caller-requested wait cap (must be <= PROMPT_TIMEOUT_MS)
+const MAX_LONG_POLL_WAIT_MS = 22 * 60 * 1000; // 22 min — caller-requested wait cap (must be <= PROMPT_TIMEOUT_MS)
 // replyPrompt must wait for the cancelled prompt to reach a TERMINAL_STATUSES
 // state before re-entering startPromptBg, otherwise the prior collector still
 // owns `sessionCollectors[sessionId]` and would be overwritten by the

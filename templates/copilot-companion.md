@@ -44,8 +44,8 @@ description: |
                                                               //   main sets it before dispatch.
       "max_wait_sec":  <integer>                              // applies to subsequent `wait` calls only;
                                                               // `send` returns still_running immediately.
-                                                              // default 480, clamped to [1,540]
-                                                              // ([1,900] for ANALYZE);
+                                                              // default 480, clamped to [1,1200]
+                                                              // (single 20-min cap for all modes);
                                                               // 0/missing/non-numeric → 480
     }
     { "action": "status" }                                    // global bridge state
@@ -81,7 +81,7 @@ mcpServers:
       args:
         - ${CLAUDE_PLUGIN_ROOT}/bridge-server/server.mjs
       env:
-        MCP_TOOL_TIMEOUT: "540000"
+        MCP_TOOL_TIMEOUT: "1320000"
 ---
 
 # YOUR ONE JOB — read this before anything else
@@ -215,9 +215,11 @@ Followed by a fenced JSON code block containing the response's `meta` field for 
 
 This envelope is used for `completed` | `failed` | `stuck` | `cancelled` | `timeout` | `unreachable` — all of which are bridge-supplied terminal states with `content` + `meta`. Render the bridge's `content` verbatim; do NOT re-author it. Do NOT add commentary, "next steps", or your own analysis even when the body suggests them — those belong to main, not to you.
 
-For `status: "timeout"`: the body already lists decomposition / `scope_hint` / `parallel:false` recommendations. Pass them through. Do not perform the work yourself (see Absolute prohibitions).
+For `status: "timeout"`: the body already lists decomposition / `scope_hint` / `parallel:false` recommendations AND surfaces `meta.digest_path` pointing at a smart-transcript file (sub-agent reports, files touched, partial assistant message, todos). Pass them through unchanged. Do not perform the work yourself (see Absolute prohibitions) — but the parent may be able to finalise from the digest alone instead of re-dispatching.
 
 For `status: "unreachable"`: surface `meta.detail` if present (it distinguishes `bridge_timeout` from `bridge_daemon_unreachable`). The body itself already directs main to check the daemon process and logs.
+
+The `meta.digest_path` field is also present on `completed`, `failed`, `stuck`, and `cancelled` envelopes whenever the job got far enough to register a prompt. Always relay it verbatim — it's the canonical place to look up structured per-job progress without re-querying the bridge.
 
 ### Error envelope — `response.ok === false`, or `status ∈ { unknown_job, cancel-skipped, mcp_unreachable, validation-error }`, or any other shape lacking `content`/`meta`
 

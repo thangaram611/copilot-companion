@@ -221,20 +221,47 @@ copilot({ action: "cancel", job_id })
 
 `send` enqueues the task and returns `status: "still_running"` with a
 `job_id` immediately — the worker runs in the background. The subagent
-then loops on `wait` (each up to `max_wait_sec`, default 480, max 540 —
-or 900 for `mode: "ANALYZE"` to permit longer single-turn analysis on
-large files), emitting one short line between iterations to keep the
-host's stream-idle watchdog from firing. Both hosts have generous per-
-tool-call budgets — Claude Code 600s, Codex 120s default (`tool_timeout_sec`
-in the agent TOML's `[mcp_servers.X]` block) — so the 540s clamp stays
-well under both.
+then loops on `wait` (each up to `max_wait_sec`, default 480, max 1200 —
+a single 20-min cap for all modes, sized to accommodate `/fleet` runs
+that decompose into long-running sub-agents), emitting one short line
+between iterations to reset the host's 600s stream-idle watchdog. The
+underlying daemon caps each Copilot prompt at 25 min (`PROMPT_TIMEOUT_MS`
+in `scripts/copilot-acp-daemon.mjs`); set `MCP_TOOL_TIMEOUT` on the
+subagent's MCP env to ≥22 min so the host's per-tool budget doesn't
+bite first (the shipped templates set `1320000`).
 
 Terminal statuses returned by the bridge: `completed`, `failed`,
 `cancelled`, `stuck` (supervisor trip — model misbehavior), **`timeout`**
 (model turn did not finish within the wait budget — recoverable; main
-should decompose or pass `template_args.scope_hint`), and **`unreachable`**
-(bridge socket / daemon process dead — `meta.detail` distinguishes
-`bridge_timeout` from `bridge_daemon_unreachable`).
+should read `meta.digest_path` for partial sub-agent output before
+deciding whether to re-dispatch), and **`unreachable`** (bridge socket
+/ daemon process dead — `meta.detail` distinguishes `bridge_timeout`
+from `bridge_daemon_unreachable`).
+
+### Progress digest (`meta.digest_path`)
+
+For every job that gets far enough to register a Copilot prompt, the
+bridge maintains a smart-transcript file at
+`/tmp/copilot-digest-<jobId>.md`. It is refreshed:
+
+- on every `status` call against the job,
+- on every supervisor interim alert (~60s during silence),
+- on every terminal emit (final snapshot).
+
+Contents (each section auto-skipped when empty):
+
+- Header (job id, status, mode, template, thread, started/terminal timestamps, age).
+- The task as dispatched.
+- Final / partial assistant message (concatenated `message` chunks; partial on timeout).
+- `/fleet` sub-agent reports (each paired with its `outputPreview`).
+- Files touched (deduped paths from `tool_call.locations`, with touch counts).
+- Tool-call summary (counts grouped by `kind`, plus sub-agent invocation count).
+- Todos snapshot (the latest `plan` event's entries).
+
+The path is surfaced via `meta.digest_path` on every terminal response
+and via `digest_path` on the `still_running` wait response and on every
+`status` reply. Reading the digest file is the canonical way for the
+parent agent to track progress without making another bridge round-trip.
 
 ## Thread continuity
 
@@ -304,7 +331,7 @@ main decides which to try.
 
 1. **Strict isolation.** The `copilot-bridge` MCP server is bundled with the plugin but the subagent's `tools:` list is the only path through which it's invoked. Main never calls the bridge directly.
 2. **No activation lifecycle.** The bridge is spawned per subagent invocation by Claude Code's plugin MCP machinery. There's nothing to `start`, `stop`, or `pause`.
-3. **Bounded blocking.** `send` returns immediately with `still_running`; each `wait` returns within `max_wait_sec ≤ 540` (or `≤ 900` for ANALYZE) so the MCP transport stays well under both hosts' per-tool budgets (Claude 600s, Codex 120s default).
+3. **Bounded blocking.** `send` returns immediately with `still_running`; each `wait` returns within `max_wait_sec ≤ 1200` (single 20-min cap for all modes). The companion's per-iteration "still running" emission resets Claude Code's 600s stream-idle watchdog; Codex callers raise `tool_timeout_sec` (the shipped TOML template sets `MCP_TOOL_TIMEOUT=1320000`).
 4. **Orphan safety net.** Completion events are appended to `/tmp/copilot-completions.jsonl` with `consumed:false`; wait-terminal responses flip to `consumed:true`; the drain hook surfaces only unconsumed entries.
 5. **Rubber-duck always on.** Appended to every `send` server-side for every template except `plan_review` (which has its own critique instructions baked in). Not in the schema.
 6. **Model is config.** Read from `default-model` at worker start. Never a tool parameter.

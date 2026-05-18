@@ -13,7 +13,9 @@
 // iterations to reset the host's stream-idle watchdog. Both hosts have
 // generous per-tool-call budgets (Claude 600s, Codex 120s per
 // `codex-rs/codex-mcp/src/rmcp_client.rs:79`); a single wait bounded by
-// clampWaitSec (≤540s, ≤900s for ANALYZE) returns well under both.
+// clampWaitSec (≤1200s) is fine for both hosts — Claude Code's 600s
+// stream-idle watchdog is satisfied by the companion's per-iteration
+// "still running" emission, and Codex callers raise tool_timeout_sec.
 //
 // Completion surfacing: each terminal/alert event is appended to a JSONL queue
 // file with `consumed:false`; the drain script (invoked from the subagent's
@@ -50,6 +52,7 @@ import {
 } from '../lib/state.mjs';
 import { sanitizeHostSessionId } from '../lib/host.mjs';
 import { createReqId, withReq, logEvent } from '../lib/log.mjs';
+import { writeDigest, digestPath } from '../lib/prompt-digest.mjs';
 
 // --- Queue (replaces dev-channel notifications) -----------------------------
 
@@ -205,15 +208,19 @@ function persistJob(jobId) {
   }
 }
 
-// Wait-budget clamp. ANALYZE permits longer single-turn analysis on large
-// files (cap 900s); other modes stay capped at 540s to leave headroom under
-// Claude Code's 600s stream-idle watchdog. Codex's per-tool MCP timeout
-// defaults to 120s (`codex-rs/codex-mcp/src/rmcp_client.rs:79`) but is
-// user-configurable via `[mcp_servers.X].tool_timeout_sec` in the agent
-// TOML — see README's Codex install section. Default 480s when input is
-// missing, non-numeric, or zero. Floor 1s to avoid no-wait races.
-export function clampWaitSec(input, mode) {
-  const cap = mode === 'ANALYZE' ? 900 : 540;
+// Wait-budget clamp. All modes share a single 1200s (20 min) cap; the
+// previous mode-aware split (900 ANALYZE / 540 other) was lifted when the
+// daemon prompt timeout grew from 10→25 min to accommodate /fleet jobs.
+// Claude Code's 600s stream-idle watchdog is satisfied by the companion's
+// per-iteration "still running" emission, so the clamp no longer needs to
+// stay under it. Codex's per-tool MCP timeout defaults to 120s
+// (`codex-rs/codex-mcp/src/rmcp_client.rs:79`) but is user-configurable
+// via `[mcp_servers.X].tool_timeout_sec` in the agent TOML — see README's
+// Codex install section. Default 480s when input is missing, non-numeric,
+// or zero. Floor 1s to avoid no-wait races. The `mode` arg is retained
+// for call-site compatibility but no longer affects the cap.
+export function clampWaitSec(input, _mode) {
+  const cap = 1200;
   return Math.max(1, Math.min(Number(input) || 480, cap));
 }
 
@@ -279,6 +286,32 @@ async function fetchPromptInspect(job, { includeTimeline = false, limit = 40 } =
   return resp.data;
 }
 
+// Refresh the on-disk digest from the prompt jsonl. Called from
+// handleStatus, runWatchLoop interim alerts, and emitNotification. Returns
+// the path on success, null when there is nothing to write yet (no promptId
+// or no events). Best-effort: any failure is swallowed so the bridge never
+// blocks a response on a digest write.
+export function refreshDigestForJob(job, statusOverride = null) {
+  if (!job || !job.promptId || !job.jobId) return null;
+  try {
+    return writeDigest(job.promptId, {
+      jobId:      job.jobId,
+      status:     statusOverride || job.status || 'running',
+      mode:       job.mode || null,
+      template:   job.template || null,
+      thread:     job.thread || null,
+      parallel:   !!job.parallel,
+      task:       job.task || null,
+      sessionId:  job.sessionId || null,
+      startedAt:  job.startedAt || null,
+      terminalAt: job.terminalAt || null,
+    });
+  } catch (err) {
+    log('WARN', 'refreshDigestForJob failed:', job.jobId, err.message);
+    return null;
+  }
+}
+
 export function buildJobResponse(job, inspect = null, { includeTimeline = false } = {}) {
   const data = inspect || {};
   // Status precedence: when the worker has emitted a bridge-level remap
@@ -324,6 +357,10 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
     activity_count:     includeTimeline ? (data.activityCount ?? 0) : undefined,
     activity_truncated: includeTimeline ? Boolean(data.activityTruncated) : undefined,
     session_reborn:     Boolean(job.sessionReborn),
+    // Path to the smart-transcript digest file. Always points at a stable
+    // location keyed by jobId; the file itself exists only if a digest has
+    // been written for this job (skipped when the prompt has no events yet).
+    digest_path: job.promptId ? digestPath(job.jobId) : null,
   };
 }
 
@@ -398,12 +435,20 @@ function buildWaitResponse(outcome) {
       // max_wait_sec} would only learn about the lost context on the next
       // poll iteration that resolves terminally.
       session_reborn: Boolean(job.sessionReborn),
+      // Path to the smart-transcript digest the parent can read for an
+      // up-to-date progress summary without making another status round-trip.
+      digest_path: job.promptId ? digestPath(job.jobId) : null,
       hint: 'call copilot({action:"wait", job_id, max_wait_sec}) again to continue blocking.',
     };
     if (job.reattached) stillRunning.reattached = true;
     return asJson(stillRunning);
   }
   markQueueConsumed(job.jobId);
+  // Final digest refresh for terminal-via-wait. This is the path the
+  // companion's wait loop hits when a long job finishes; without this the
+  // digest can lag behind by one supervisor-alert window (~60s).
+  refreshDigestForJob(job, job.status);
+  const digestFilePath = job.promptId ? digestPath(job.jobId) : null;
   const meta = {
     job_id: job.jobId, status: job.status,
     mode: job.mode || 'EXECUTE',
@@ -417,11 +462,12 @@ function buildWaitResponse(outcome) {
   if (job.sessionReborn) meta.session_reborn = 'true';
   if (job.reattached) meta.reattached = 'true';
   if (job.existingPromptId) meta.existing_prompt_id = String(job.existingPromptId);
+  if (digestFilePath) meta.digest_path = digestFilePath;
   return asJson({
     ok: true, action: 'wait', status: job.status,
     job_id: job.jobId,
     duration_ms: job.durationMs || null,
-    content: formatTerminalContent(job),
+    content: formatTerminalContent({ ...job, digestFilePath }),
     meta,
   });
 }
@@ -480,7 +526,7 @@ function emitRebirthAlert({ jobId, task, promptId, thread, previousSid, newSessi
 export function formatTerminalContent({
   jobId, status, task, mode, durationMs,
   summary, error, stuckReason, detail, failedTools, promptId,
-  sessionReborn = false,
+  sessionReborn = false, digestFilePath = null,
 }) {
   const rebirthBanner = sessionReborn
     ? '> ⚠ Copilot session was respawned mid-thread; prior in-process conversation context was lost. ' +
@@ -530,14 +576,20 @@ export function formatTerminalContent({
   if (status === 'timeout') {
     const failedLine = (Array.isArray(failedTools) && failedTools.length)
       ? `\n\n**Failed tools:** ${failedTools.slice(0, 10).join(', ')}` : '';
+    const digestLine = digestFilePath
+      ? `\n\n**Partial transcript digest:** \`${digestFilePath}\` — read this BEFORE re-dispatching. ` +
+        'It contains the partial assistant message, /fleet sub-agent reports (often near-complete), files touched, and todos. ' +
+        'You may be able to finalise from the digest alone, or use it to scope a much smaller follow-up send.'
+      : '';
     return taskHeader +
       `Copilot's model turn did not finish within the wait budget (${Math.round(duration / 1000)}s).\n\n` +
       'The daemon is alive; the task was too large for one turn (note: `/fleet` runs by default for general tasks). Recommended next steps for the parent:\n' +
+      '- Read the partial-transcript digest (path below) — sub-agent reports may already cover the work.\n' +
       '- Decompose the task into smaller, explicitly-scoped sub-sends (target ≤ ~100 LOC of source per send).\n' +
       '- For ANALYZE on large files, pass `template_args.scope_hint` (e.g. "imports/types only", "lines 1-120") to bind the analysis to a specific section.\n' +
-      '- Raise `max_wait_sec` (ANALYZE supports up to 900s; non-ANALYZE up to 540s) if the task is genuinely long.\n' +
+      '- Raise `max_wait_sec` (cap 1200s / 20 min for all modes) if the task is genuinely long.\n' +
       "- Try `parallel: false` once if you suspect /fleet's coordination overhead is the bottleneck for a strictly linear task." +
-      failedLine;
+      failedLine + digestLine;
   }
   if (status === 'unreachable') {
     const detailLine = detail ? ` (detail: ${detail})` : '';
@@ -604,10 +656,26 @@ export function emitNotification({
   const rubberDuck = classifyRubberDuck(summary?.message);
   if (status === 'completed') meta.rubber_duck = rubberDuck;
 
+  // Final digest refresh on terminal. We pass the current `status` because
+  // the job's stored status may not yet reflect a late remap (e.g. cancelled
+  // → stuck) we did above. Path is stable per jobId; surface it whether or
+  // not the write succeeded so the parent always knows where to look.
+  const digestFilePath = jobId ? digestPath(jobId) : null;
+  if (promptId && jobId) {
+    try {
+      writeDigest(promptId, {
+        jobId, status, mode, template: null, thread, parallel: false,
+        task, sessionId, startedAt: duration ? Date.now() - duration : null,
+        terminalAt: Date.now(),
+      });
+    } catch (err) { log('WARN', 'emit digest write failed:', jobId, err.message); }
+  }
+  if (digestFilePath) meta.digest_path = digestFilePath;
+
   const content = formatTerminalContent({
     jobId, status, task, mode, durationMs: duration,
     summary, error, stuckReason, detail, failedTools, promptId,
-    sessionReborn,
+    sessionReborn, digestFilePath,
   });
 
   enqueueEvent({ kind: 'terminal', jobId, content, meta });
@@ -646,7 +714,7 @@ export function classifyRubberDuck(message) {
 
 // --- Worker -----------------------------------------------------------------
 
-const MAX_JOB_MS = 30 * 60 * 1000;
+const MAX_JOB_MS = 40 * 60 * 1000;
 
 async function runWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, model, previousSid, parallel }) {
   const startedAt = Date.now();
@@ -756,6 +824,10 @@ async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cw
       result = await awaitTerminal(promptId, 480);
       if (result?.interim) {
         emitAlertNotification({ jobId, task, promptId, alert: result.alert, startedAt, reqId });
+        // Real-time digest refresh: every supervisor alert (~60s during
+        // silence) regenerates the on-disk digest so a parent that reads
+        // the file mid-flight sees an up-to-date snapshot.
+        refreshDigestForJob(jobs.get(jobId));
         if (Date.now() - startedAt > MAX_JOB_MS) throw new Error(`watch loop exceeded MAX_JOB_MS (${MAX_JOB_MS}ms)`);
         continue;
       }
@@ -839,7 +911,10 @@ async function emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd
 }
 
 async function awaitTerminal(promptId, maxWaitSec) {
-  const timeoutMs = Math.min((maxWaitSec + 120) * 1000, 10 * 60 * 1000);
+  // Cap aligned with the daemon's PROMPT_TIMEOUT_MS (25 min). The +120s
+  // padding gives the daemon room to return a terminal payload before we
+  // give up on the socket roundtrip.
+  const timeoutMs = Math.min((maxWaitSec + 120) * 1000, 25 * 60 * 1000);
   const resp = await sendToSocket(
     { command: 'watch', promptId, since: 0, raw: false, wait: maxWaitSec, summaryOnly: true },
     timeoutMs,
@@ -1001,9 +1076,8 @@ async function handleSend(args) {
 
 async function handleWait({ job_id, max_wait_sec }) {
   if (!job_id) return asJson({ ok: false, action: 'wait', error: 'job_id required' });
-  // Look up the job's stored mode so subsequent waits respect the
-  // ANALYZE 900s cap, not just the initial send. Falls back to EXECUTE
-  // (540s cap) when the job is unknown — defensive default.
+  // The clamp is mode-agnostic now (single 1200s cap), but we still pass
+  // mode through to keep the call signature stable for legacy callers.
   const job = getJob(job_id);
   const mode = job?.mode || 'EXECUTE';
   const max = clampWaitSec(max_wait_sec, mode);
@@ -1067,6 +1141,11 @@ async function handleStatus({ job_id, verbose }) {
       try { inspect = await fetchPromptInspect(job, { includeTimeline: verbose }); }
       catch (err) { log('WARN', 'status inspect failed:', job_id, err.message); }
     }
+    // Refresh the on-disk digest so the caller can read up-to-date detail
+    // (sub-agent reports, files touched, todos, partial assistant message)
+    // without having to inspect the raw jsonl. This is the primary mechanism
+    // the parent agent uses to track progress on long-running /fleet jobs.
+    refreshDigestForJob(job);
     return asJson(buildJobResponse(job, inspect, { includeTimeline: verbose }));
   }
   const modelInfo = readDefaultModel();
@@ -1181,12 +1260,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'number',
             description:
               '[send|wait] Upper bound on how long the bridge blocks before returning ' +
-              'still_running. Default 480, max 540 (or 900 for ANALYZE). Non-ANALYZE caps at 540 ' +
-              'to leave headroom under Claude Code\'s 600s stream-idle watchdog; ANALYZE allows ' +
-              'longer single-turn analysis on large files. On a fresh `send` this bound is moot — ' +
-              'the call returns still_running synchronously — but on a reattach to an in-flight ' +
-              'job, send blocks on the existing job up to this bound. Wait always blocks up to ' +
-              'this bound.',
+              'still_running. Default 480, max 1200 (20 min) for all modes. The companion emits ' +
+              'a "still running" line between wait iterations to reset Claude Code\'s 600s ' +
+              "stream-idle watchdog, so the clamp is no longer mode-scoped. On a fresh `send` " +
+              'this bound is moot — the call returns still_running synchronously — but on a ' +
+              'reattach to an in-flight job, send blocks on the existing job up to this bound. ' +
+              'Wait always blocks up to this bound.',
           },
           parallel: {
             type: 'boolean',
