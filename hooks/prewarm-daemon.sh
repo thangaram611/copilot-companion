@@ -22,9 +22,17 @@ ROOT="${CLAUDE_PLUGIN_ROOT:-}"
 CLIENT="$ROOT/bridge-server/daemon-client.mjs"
 [ -f "$CLIENT" ] || exit 0
 
+TOOLS="$ROOT/hooks/node-tools.sh"
+if [ -r "$TOOLS" ]; then
+  # shellcheck source=/dev/null
+  . "$TOOLS"
+fi
+NODE_BIN="$(resolve_node 2>/dev/null || true)"
+[ -n "$NODE_BIN" ] || exit 0
+
 cd "$ROOT/bridge-server" 2>/dev/null || exit 0
 
-nohup node -e "
+nohup "$NODE_BIN" -e "
 import('./daemon-client.mjs')
   .then((m) => m.ensureDaemon({}))
   .catch(() => {});

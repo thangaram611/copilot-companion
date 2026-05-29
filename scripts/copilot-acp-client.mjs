@@ -6,15 +6,16 @@
 
 import { connect as connectSocket } from 'node:net';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve as pathResolve } from 'node:path';
+import { dirname, isAbsolute, resolve as pathResolve } from 'node:path';
 
 const SOCKET_PATH = '/tmp/copilot-acp.sock';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DAEMON_PATH = pathResolve(__dirname, 'copilot-acp-daemon.mjs');
 const DAEMON_BOOT_TIMEOUT_MS = 8_000;
-const REQUEST_TIMEOUT_MS = 6 * 60 * 1000; // a bit longer than daemon's prompt timeout
+const REQUEST_TIMEOUT_MS = 6 * 60 * 1000;
+const MAX_LONG_POLL_WAIT_SEC = 22 * 60;
 
 // --- Socket I/O --------------------------------------------------------------
 
@@ -63,7 +64,7 @@ async function spawnDaemon() {
   if (!existsSync(DAEMON_PATH)) {
     throw new Error(`daemon not found at ${DAEMON_PATH}`);
   }
-  const child = spawn('node', [DAEMON_PATH], {
+  const child = spawn(process.execPath, [DAEMON_PATH], {
     detached: true,
     stdio: 'ignore',
   });
@@ -86,11 +87,18 @@ async function ensureDaemon() {
 // --- Subcommand handlers -----------------------------------------------------
 
 // Background prompt: returns immediately with promptId. Use `watch` to poll
-// progress and `cancel` to interrupt. Optional --session <sid> to use an
-// existing session; otherwise a new session is created.
+// progress and `cancel` to interrupt. --cwd is required so the daemon never
+// falls back to the client's current directory. Optional --session <sid> to
+// use an existing session; otherwise a new session is created.
 async function cmdPromptBg(args) {
-  await ensureDaemon();
-  const cwd = parseFlag(args, '--cwd') || process.cwd();
+  const cwd = parseFlag(args, '--cwd');
+  if (!cwd) throw new Error('usage: prompt-bg --cwd <absolute-path> [--session <sid>] <text>');
+  if (!isAbsolute(cwd)) throw new Error(`--cwd must be absolute: ${cwd}`);
+  try {
+    if (!statSync(cwd).isDirectory()) throw new Error('not a directory');
+  } catch (err) {
+    throw new Error(`--cwd must exist as a directory: ${cwd}`);
+  }
   const sessionId = parseFlag(args, '--session');
   const text = args
     .filter((a, i, arr) => {
@@ -99,7 +107,8 @@ async function cmdPromptBg(args) {
       return true;
     })
     .join(' ');
-  if (!text) throw new Error('usage: prompt-bg [--session <sid>] [--cwd <path>] <text>');
+  if (!text) throw new Error('usage: prompt-bg --cwd <absolute-path> [--session <sid>] <text>');
+  await ensureDaemon();
   return sendToSocket({ command: 'prompt-bg', cwd, sessionId, text });
 }
 
@@ -118,10 +127,10 @@ async function cmdWatch(args) {
   const summaryOnly = args.includes('--summary-only');
   const raw = args.includes('--raw');
   // When long-polling, extend the socket read deadline so the client doesn't
-  // time out before the daemon resolves the waiter. Cap at 9 min to stay
-  // safely under the daemon's 10-min inactivity shutdown.
+  // time out before the daemon resolves the waiter. Cap with the daemon's
+  // MAX_LONG_POLL_WAIT_MS (22 min) plus a small socket-return grace window.
   const timeoutMs = wait > 0
-    ? Math.min((wait + 30) * 1000, 9 * 60 * 1000)
+    ? (Math.min(wait, MAX_LONG_POLL_WAIT_SEC) + 30) * 1000
     : REQUEST_TIMEOUT_MS;
   return sendToSocket({ command: 'watch', promptId, since, raw, wait, summaryOnly }, timeoutMs);
 }
@@ -142,7 +151,7 @@ async function cmdAwait(args) {
   const promptId = args[0];
   if (!promptId) throw new Error('usage: await <promptId> [--max-wait <sec>]');
   const maxWait = parseInt(parseFlag(args, '--max-wait') || '480', 10);
-  const timeoutMs = Math.min((maxWait + 30) * 1000, 9 * 60 * 1000);
+  const timeoutMs = (Math.min(maxWait, MAX_LONG_POLL_WAIT_SEC) + 30) * 1000;
   return sendToSocket(
     { command: 'watch', promptId, since: 0, raw: false, wait: maxWait, summaryOnly: true },
     timeoutMs,
@@ -188,7 +197,7 @@ async function main() {
   if (!subcommand || subcommand === '--help' || subcommand === '-h') {
     console.log(
       'usage:\n' +
-        '  copilot-acp-client.mjs prompt-bg [--session <sid>] [--cwd <path>] <text...>\n' +
+        '  copilot-acp-client.mjs prompt-bg --cwd <absolute-path> [--session <sid>] <text...>\n' +
         '  copilot-acp-client.mjs watch <promptId> [--since <N>] [--raw] [--wait <sec>] [--summary-only]\n' +
         '  copilot-acp-client.mjs inspect <promptId> [--limit <N>]\n' +
         '  copilot-acp-client.mjs await <promptId> [--max-wait <sec>]\n' +

@@ -64,6 +64,10 @@ const fail = (m, code = 1) => {
   process.exit(code);
 };
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 if (!pluginRoot) {
   fail('--plugin-root <abs path> required; pass the directory containing .codex-plugin/plugin.json', 2);
 }
@@ -79,9 +83,14 @@ if (!path.isAbsolute(pluginRoot)) {
 // $CLAUDE_PLUGIN_ROOT internally) can resolve their own paths.
 function bashEntry(scriptRel, timeout) {
   const abs = path.join(pluginRoot, scriptRel);
+  const nodeDir = path.dirname(process.execPath);
+  const hookPath = [nodeDir, process.env.PATH || ''].filter(Boolean).join(':');
   return {
     type: 'command',
-    command: `CLAUDE_PLUGIN_ROOT='${pluginRoot}' bash '${abs}'`,
+    command:
+      `CLAUDE_PLUGIN_ROOT=${shellQuote(pluginRoot)} ` +
+      `COPILOT_COMPANION_NODE=${shellQuote(process.execPath)} ` +
+      `PATH=${shellQuote(hookPath)} bash ${shellQuote(abs)}`,
     timeout,
     [SENTINEL_KEY]: SENTINEL_VALUE,
   };

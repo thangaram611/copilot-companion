@@ -126,9 +126,10 @@ fi
 # with `---` so Claude Code's frontmatter parser sees a valid YAML block.
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
+SED_ROOT="$(printf '%s' "$ROOT" | sed 's/[\/&|]/\\&/g')"
 
 awk -v sentinel="$SENTINEL" 'NR==1 { print; print sentinel; next } { print }' "$TEMPLATE" \
-  | sed "s|\${CLAUDE_PLUGIN_ROOT}|$ROOT|g" \
+  | sed "s|\${CLAUDE_PLUGIN_ROOT}|$SED_ROOT|g" \
   > "$TMP"
 
 if [ -n "$NODE_BIN" ]; then
@@ -136,7 +137,8 @@ if [ -n "$NODE_BIN" ]; then
   # end-of-line) to avoid touching `command:` fields outside the MCP block,
   # and to be a no-op if the template ever switches to an absolute path.
   NODE_TMP="$(mktemp)"
-  sed "s|^\([[:space:]]*command:\) node[[:space:]]*$|\1 ${NODE_BIN}|" "$TMP" > "$NODE_TMP" \
+  SED_NODE_BIN="$(printf '%s' "$NODE_BIN" | sed 's/[\/&|]/\\&/g')"
+  sed "s|^\([[:space:]]*command:\) node[[:space:]]*$|\1 ${SED_NODE_BIN}|" "$TMP" > "$NODE_TMP" \
     && mv "$NODE_TMP" "$TMP"
 fi
 

@@ -79,7 +79,7 @@ async function spawnDaemon() {
     if (!existsSync(DAEMON_PATH)) {
       throw new Error(`daemon not found at ${DAEMON_PATH}`);
     }
-    const child = spawn('node', [DAEMON_PATH], { detached: true, stdio: 'ignore' });
+    const child = spawn(process.execPath, [DAEMON_PATH], { detached: true, stdio: 'ignore' });
     child.unref();
     // Exponential backoff probe — fastest case ~50 ms, capped at the boot
     // timeout. Old fixed-100 ms loop wasted ~6× boot latency.
@@ -138,4 +138,3 @@ export function _resetForTest() {
   _sendToSocketImpl = realSendToSocket;
   _ensureDaemonImpl = realEnsureDaemon;
 }
-

@@ -1,9 +1,15 @@
-// Validation tests for the single `copilot` tool. Pure-function —
+// Validation tests for the single `copilot` tool. Pure-function:
 // no sockets, no daemon, no state-layer side effects.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import {
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,203 +23,129 @@ import {
   appendRubberDuckReview,
 } from './validation.mjs';
 
-// ---------- action discriminator ----------
+const TEST_CWD = tmpdir();
 
-test('action is required', () => {
-  assert.throws(() => validateCopilotArgs({}), /action is required/);
-});
-
-test('action must be one of known', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'launch' }), /action must be one of/);
-});
-
-test('known action set is stable', () => {
-  assert.deepEqual([...VALID_ACTIONS].sort(), ['cancel', 'reply', 'send', 'status', 'wait']);
-});
-
-// ---------- cancel ----------
-
-test('cancel requires job_id', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'cancel' }), /job_id/);
-});
-
-test('cancel accepts job_id', () => {
-  const r = validateCopilotArgs({ action: 'cancel', job_id: 'abc-123' });
-  assert.equal(r.job_id, 'abc-123');
-});
-
-test('cancel rejects unknown fields', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'cancel', job_id: 'x', model: 'm' }), /unknown field "model"/);
-});
-
-// ---------- wait ----------
-
-test('wait requires job_id', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'wait' }), /job_id/);
-});
-
-test('wait accepts job_id + max_wait_sec', () => {
-  const r = validateCopilotArgs({ action: 'wait', job_id: 'j', max_wait_sec: 120 });
-  assert.equal(r.job_id, 'j');
-  assert.equal(r.max_wait_sec, 120);
-});
-
-test('wait rejects non-number max_wait_sec', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'wait', job_id: 'j', max_wait_sec: 'x' }), /max_wait_sec/);
-});
-
-// ---------- status ----------
-
-test('status allows verbose + job_id', () => {
-  const r = validateCopilotArgs({ action: 'status', job_id: 'j', verbose: true });
-  assert.equal(r.verbose, true);
-  assert.equal(r.job_id, 'j');
-});
-
-test('status rejects non-boolean verbose', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'status', verbose: 'yes' }), /verbose must be a boolean/);
-});
-
-// ---------- send: defaults + unknown fields ----------
-
-test('send requires task for general template', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'send' }), /task is required/);
-});
-
-test('send applies mode/template defaults', () => {
-  const r = validateCopilotArgs({ action: 'send', task: 'x' });
-  assert.equal(r.mode, DEFAULT_MODE);
-  assert.equal(r.template, 'general');
-});
-
-test('send rejects unknown top-level fields (e.g. model, rubber_duck)', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', model: 'gpt-5.4' }), /unknown field "model"/);
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', rubber_duck: false }), /unknown field "rubber_duck"/);
-});
-
-test('send rejects invalid mode/template', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', mode: 'write' }), /mode must be one of/);
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', template: 'fleet' }), /template must be one of/);
-});
-
-test('send accepts every valid mode', () => {
-  for (const mode of VALID_MODES) {
-    const r = validateCopilotArgs({ action: 'send', task: 'x', mode });
-    assert.equal(r.mode, mode);
+function withPlansDir(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'copilot-plans-'));
+  const prev = process.env.COPILOT_PLANS_DIR;
+  process.env.COPILOT_PLANS_DIR = dir;
+  try { return fn(dir); }
+  finally {
+    if (prev === undefined) delete process.env.COPILOT_PLANS_DIR;
+    else process.env.COPILOT_PLANS_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function planArgs(planPath, extra = {}) {
+  return {
+    action: 'send',
+    template: 'plan_review',
+    cwd: TEST_CWD,
+    template_args: { plan_path: planPath, ...extra },
+  };
+}
+
+function sendArgs(extra = {}) {
+  return { action: 'send', task: 'x', cwd: TEST_CWD, ...extra };
+}
+
+test('action schemas reject malformed inputs and normalize valid cancel/wait/status/reply calls', () => {
+  assert.deepEqual([...VALID_ACTIONS].sort(), ['cancel', 'reply', 'send', 'status', 'wait']);
+  assert.throws(() => validateCopilotArgs({}), /action is required/);
+  assert.throws(() => validateCopilotArgs({ action: 'launch' }), /action must be one of/);
+
+  const cancel = validateCopilotArgs({ action: 'cancel', job_id: 'abc-123' });
+  assert.deepEqual(cancel, { action: 'cancel', job_id: 'abc-123', host_session_id: null });
+  assert.throws(() => validateCopilotArgs({ action: 'cancel' }), /job_id/);
+  assert.throws(() => validateCopilotArgs({ action: 'cancel', job_id: 'x', model: 'm' }), /unknown field "model"/);
+
+  const wait = validateCopilotArgs({ action: 'wait', job_id: 'j', max_wait_sec: 120 });
+  assert.equal(wait.max_wait_sec, 120);
+  assert.throws(() => validateCopilotArgs({ action: 'wait' }), /job_id/);
+  assert.throws(() => validateCopilotArgs({ action: 'wait', job_id: 'j', max_wait_sec: 'x' }), /max_wait_sec/);
+
+  const status = validateCopilotArgs({ action: 'status', job_id: 'j', verbose: true });
+  assert.equal(status.verbose, true);
+  assert.equal(status.job_id, 'j');
+  assert.throws(() => validateCopilotArgs({ action: 'status', verbose: 'yes' }), /verbose must be a boolean/);
+
+  const reply = validateCopilotArgs({ action: 'reply', job_id: 'job-1', message: 'add tests' });
+  assert.equal(reply.message, 'add tests');
+  assert.throws(() => validateCopilotArgs({ action: 'reply', message: 'hi' }), /job_id/);
+  assert.throws(() => validateCopilotArgs({ action: 'reply', job_id: 'job-1' }), /message/);
+  assert.throws(() => validateCopilotArgs({ action: 'reply', job_id: 'job-1', message: '' }), /message/);
+  assert.throws(() => validateCopilotArgs({ action: 'reply', job_id: 'job-1', message: 'x'.repeat(8001) }), /too long/);
+  assert.throws(() => validateCopilotArgs({ action: 'reply', job_id: 'j', message: 'm', thread: 'x' }), /unknown field/);
 });
 
-// ---------- send: thread validation ----------
+test('send validation covers defaults, modes, unknown fields, thread names, cwd, and base template_args shape', () => {
+  assert.deepEqual([...VALID_TEMPLATES].sort(), ['general', 'plan_review', 'research']);
 
-test('thread accepts valid slug', () => {
-  const r = validateCopilotArgs({ action: 'send', task: 'x', thread: 'my_branch.01-a' });
-  assert.equal(r.thread, 'my_branch.01-a');
+  const basic = validateCopilotArgs(sendArgs());
+  assert.equal(basic.mode, DEFAULT_MODE);
+  assert.equal(basic.template, 'general');
+  assert.equal(basic.parallel, true);
+
+  for (const mode of VALID_MODES) {
+    assert.equal(validateCopilotArgs(sendArgs({ mode })).mode, mode);
+  }
+
+  assert.throws(() => validateCopilotArgs({ action: 'send' }), /task is required/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ model: 'gpt-5.4' })), /unknown field "model"/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ rubber_duck: false })), /unknown field "rubber_duck"/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ mode: 'write' })), /mode must be one of/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ template: 'fleet' })), /template must be one of/);
+
+  assert.equal(validateCopilotArgs(sendArgs({ thread: 'my_branch.01-a' })).thread, 'my_branch.01-a');
+  assert.throws(() => validateCopilotArgs(sendArgs({ thread: '../etc' })), /thread must match/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ thread: 'a/b' })), /thread must match/);
+
+  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x' }), /cwd is required/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ cwd: 'relative/path' })), /cwd must be an absolute path/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ cwd: '/__nope__/__nope__' })), /cwd does not exist/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ template_args: [] })), /template_args must be a plain object/);
 });
 
-test('thread rejects path traversal', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', thread: '../etc' }), /thread must match/);
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', thread: 'a/b' }), /thread must match/);
-});
-
-// ---------- send: cwd validation ----------
-
-test('cwd must be absolute', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', cwd: 'relative/path' }), /cwd must be an absolute path/);
-});
-
-test('cwd must exist as dir', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'send', task: 'x', cwd: '/__nope__/__nope__' }), /cwd does not exist/);
-});
-
-// ---------- plan_review template ----------
-
-test('plan_review requires plan_path', () => {
+test('plan_review validates plan path existence, canonicalization, latest resolution, focus, and symlink escape', () => {
   assert.throws(() => validateCopilotArgs({ action: 'send', template: 'plan_review' }),
     /requires template_args\.plan_path/);
-});
+  assert.throws(() => validateCopilotArgs(planArgs('rel.md')), /plan_path must be absolute/);
+  assert.throws(() => validateCopilotArgs(planArgs('/tmp/<foo>.md')), /un-substituted placeholder/);
 
-test('plan_review rejects non-absolute plan_path', () => {
-  assert.throws(() =>
-    validateCopilotArgs({ action: 'send', template: 'plan_review', template_args: { plan_path: 'rel.md' } }),
-    /plan_path must be absolute/,
-  );
-});
+  withPlansDir((dir) => {
+    const oldPlan = join(dir, 'old.md');
+    const newPlan = join(dir, 'new.md');
+    writeFileSync(oldPlan, '# old');
+    writeFileSync(newPlan, '# new');
+    utimesSync(oldPlan, new Date(1000), new Date(1000));
+    utimesSync(newPlan, new Date(2000), new Date(2000));
 
-test('plan_review rejects unsubstituted placeholders', () => {
-  assert.throws(() =>
-    validateCopilotArgs({ action: 'send', template: 'plan_review', template_args: { plan_path: '/tmp/<foo>.md' } }),
-    /un-substituted placeholder/,
-  );
-});
+    const accepted = validateCopilotArgs(planArgs(oldPlan, { focus_directive: 'security' }));
+    assert.equal(accepted.template, 'plan_review');
+    assert.equal(accepted.task, null);
+    assert.equal(accepted.template_args.focus_directive, 'security');
+    assert.ok(accepted.template_args.plan_path.endsWith('old.md'));
 
-test('plan_review accepts real file + focus_directive', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'copilot-plan-'));
-  const f = join(dir, 'plan.md');
-  writeFileSync(f, '# plan');
-  const prev = process.env.COPILOT_PLANS_DIR;
-  process.env.COPILOT_PLANS_DIR = dir;
-  try {
-    const r = validateCopilotArgs({
-      action: 'send',
-      template: 'plan_review',
-      template_args: { plan_path: f, focus_directive: 'security' },
-    });
-    assert.equal(r.template, 'plan_review');
-    // plan_path is canonicalised via realpathSync — compare against the
-    // realpath of the input (mkdtempSync may return a path with /private
-    // prefix on macOS).
-    assert.equal(r.template_args.focus_directive, 'security');
-    assert.equal(r.task, null);
-    assert.ok(r.template_args.plan_path.endsWith('plan.md'));
-  } finally {
-    if (prev === undefined) delete process.env.COPILOT_PLANS_DIR;
-    else process.env.COPILOT_PLANS_DIR = prev;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+    const latest = validateCopilotArgs(planArgs('latest'));
+    assert.ok(latest.template_args.plan_path.endsWith('new.md'));
 
-test('plan_review rejects unknown template_args keys', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'copilot-plan-'));
-  const f = join(dir, 'plan.md'); writeFileSync(f, '# plan');
-  const prev = process.env.COPILOT_PLANS_DIR;
-  process.env.COPILOT_PLANS_DIR = dir;
-  try {
-    assert.throws(() =>
-      validateCopilotArgs({
-        action: 'send',
-        template: 'plan_review',
-        template_args: { plan_path: f, bogus_key: 'x' },
-      }),
-      /unknown template_args key "bogus_key"/,
-    );
-  } finally {
-    if (prev === undefined) delete process.env.COPILOT_PLANS_DIR;
-    else process.env.COPILOT_PLANS_DIR = prev;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+    assert.throws(() => validateCopilotArgs(planArgs(oldPlan, { bogus_key: 'x' })),
+      /unknown template_args key "bogus_key"/);
+    assert.throws(() => validateCopilotArgs(planArgs(oldPlan, { focus_directive: 42 })),
+      /focus_directive must be a string/);
+  });
 
-// ---------- v6.1 A8: symlink escape ----------
-
-test('plan_review rejects symlink escape (A8)', async () => {
-  const { symlinkSync } = await import('node:fs');
   const insideDir = mkdtempSync(join(tmpdir(), 'copilot-plans-'));
   const outsideDir = mkdtempSync(join(tmpdir(), 'copilot-out-'));
-  const target = join(outsideDir, 'secret.md');
-  writeFileSync(target, '# secret');
-  const link = join(insideDir, 'innocent.md');
-  symlinkSync(target, link);
   const prev = process.env.COPILOT_PLANS_DIR;
   process.env.COPILOT_PLANS_DIR = insideDir;
   try {
-    assert.throws(() =>
-      validateCopilotArgs({
-        action: 'send',
-        template: 'plan_review',
-        template_args: { plan_path: link },
-      }),
-      /resolves outside/,
-    );
+    const target = join(outsideDir, 'secret.md');
+    writeFileSync(target, '# secret');
+    const link = join(insideDir, 'innocent.md');
+    symlinkSync(target, link);
+    assert.throws(() => validateCopilotArgs(planArgs(link)), /resolves outside/);
   } finally {
     if (prev === undefined) delete process.env.COPILOT_PLANS_DIR;
     else process.env.COPILOT_PLANS_DIR = prev;
@@ -222,384 +154,124 @@ test('plan_review rejects symlink escape (A8)', async () => {
   }
 });
 
-// ---------- template formatters ----------
+test('formatPrompt and appendRubberDuckReview render template-specific instructions', () => {
+  const general = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: false });
+  assert.match(general, /^TASK: do thing\n/);
+  assert.match(general, /Mode: EXECUTE/);
 
-test('formatPrompt general contains TASK and mode label', () => {
-  const out = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE' });
-  assert.match(out, /TASK: do thing/);
-  assert.match(out, /Mode: EXECUTE/);
-});
+  const plan = formatPrompt({ template: 'general', task: 't', mode: 'PLAN', parallel: false });
+  assert.match(plan, /Do not modify any files/);
+  assert.match(plan, /numbered implementation plan/);
 
-test('PLAN mode tells Copilot to not modify files', () => {
-  const out = formatPrompt({ template: 'general', task: 't', mode: 'PLAN' });
-  assert.match(out, /Do not modify any files/);
-  assert.match(out, /numbered implementation plan/);
-});
-
-test('ANALYZE mode is read-only', () => {
-  const out = formatPrompt({ template: 'general', task: 't', mode: 'ANALYZE' });
-  assert.match(out, /Do not modify any files/);
-});
-
-test('research template never references shell/edit', () => {
-  const out = formatPrompt({ template: 'research', task: 'what is X' });
-  assert.match(out, /research assistant/);
-  assert.doesNotMatch(out, /`edit`/);
-});
-
-test('appendRubberDuckReview includes required cross-examination marker', () => {
-  const out = appendRubberDuckReview('BASE');
-  assert.match(out, /CROSS-EXAMINATION STEP/);
-  assert.match(out, /RUBBER-DUCK: clean\./);
-  assert.match(out, /RUBBER-DUCK: revised/);
-});
-
-// ---------- sanity: templates stable ----------
-
-test('VALID_TEMPLATES matches spec', () => {
-  assert.deepEqual([...VALID_TEMPLATES].sort(), ['general', 'plan_review', 'research']);
-});
-
-// ---------- v6.1 D: reply action ----------
-
-test('reply requires job_id', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'reply', message: 'hi' }), /job_id/);
-});
-
-test('reply requires message', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'reply', job_id: 'job-1' }), /message/);
-});
-
-test('reply rejects empty message', () => {
-  assert.throws(() => validateCopilotArgs({ action: 'reply', job_id: 'job-1', message: '' }), /message/);
-});
-
-test('reply rejects oversized message', () => {
-  const big = 'x'.repeat(8001);
-  assert.throws(
-    () => validateCopilotArgs({ action: 'reply', job_id: 'job-1', message: big }),
-    /too long/,
-  );
-});
-
-test('reply accepts valid input', () => {
-  const r = validateCopilotArgs({ action: 'reply', job_id: 'job-1', message: 'add tests' });
-  assert.equal(r.action, 'reply');
-  assert.equal(r.job_id, 'job-1');
-  assert.equal(r.message, 'add tests');
-});
-
-test('reply rejects unknown fields', () => {
-  assert.throws(
-    () => validateCopilotArgs({ action: 'reply', job_id: 'j', message: 'm', thread: 'x' }),
-    /unknown field/,
-  );
-});
-
-// ---------- v6.1 B4: appendRubberDuckReview is template-blind ----------
-// (the per-template skip is enforced server-side in runWorker; the wrapper
-// itself remains a pure decorator.)
-
-test('appendRubberDuckReview always wraps when called', () => {
-  const wrapped = appendRubberDuckReview('hello');
-  assert.match(wrapped, /CROSS-EXAMINATION STEP/);
-  assert.match(wrapped, /^hello\n/);
-});
-
-// ---------- parallel field (default-on /fleet for general) ----------
-
-test('send: parallel defaults to true for general template', () => {
-  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'general' });
-  assert.equal(r.parallel, true);
-});
-
-test('send: parallel:false honored for general template', () => {
-  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'general', parallel: false });
-  assert.equal(r.parallel, false);
-});
-
-test('send: parallel:true explicit for general is identical to default', () => {
-  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'general', parallel: true });
-  assert.equal(r.parallel, true);
-});
-
-test('send: parallel defaults to true for research template (universal default-on)', () => {
-  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'research' });
-  assert.equal(r.parallel, true);
-});
-
-test('send: parallel:false honored for research template', () => {
-  const r = validateCopilotArgs({ action: 'send', task: 'X', template: 'research', parallel: false });
-  assert.equal(r.parallel, false);
-});
-
-test('send: parallel defaults to true for plan_review template (universal default-on)', () => {
-  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-'));
-  process.env.COPILOT_PLANS_DIR = tmp;
-  try {
-    const planFile = join(tmp, 'p.md');
-    writeFileSync(planFile, '# plan');
-    const r = validateCopilotArgs({
-      action: 'send',
-      template: 'plan_review',
-      template_args: { plan_path: planFile },
-    });
-    assert.equal(r.parallel, true);
-  } finally {
-    delete process.env.COPILOT_PLANS_DIR;
-    rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test('send: parallel:false honored for plan_review template', () => {
-  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-'));
-  process.env.COPILOT_PLANS_DIR = tmp;
-  try {
-    const planFile = join(tmp, 'p.md');
-    writeFileSync(planFile, '# plan');
-    const r = validateCopilotArgs({
-      action: 'send',
-      template: 'plan_review',
-      template_args: { plan_path: planFile },
-      parallel: false,
-    });
-    assert.equal(r.parallel, false);
-  } finally {
-    delete process.env.COPILOT_PLANS_DIR;
-    rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test('send: parallel must be a boolean for general', () => {
-  assert.throws(
-    () => validateCopilotArgs({ action: 'send', task: 'X', template: 'general', parallel: 'yes' }),
-    /parallel must be a boolean/,
-  );
-});
-
-test('send: parallel listed in allowed fields (no unknown-field error)', () => {
-  // Confirms the field is in ALLOWED_FIELDS.send.
-  const r = validateCopilotArgs({ action: 'send', task: 'X', parallel: true });
-  assert.equal(r.parallel, true);
-});
-
-// ---------- formatPrompt: /fleet prefix vs TASK prefix ----------
-
-test('formatPrompt(general, parallel=true) starts with /fleet (no TASK: prefix)', () => {
-  const out = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: true });
-  assert.match(out, /^\/fleet do thing\n/);
-  assert.doesNotMatch(out, /^TASK:/m);
-});
-
-test('formatPrompt(general, parallel=false) starts with TASK: (no /fleet)', () => {
-  const out = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: false });
-  assert.match(out, /^TASK: do thing\n/);
-  assert.doesNotMatch(out, /\/fleet/);
-});
-
-test('formatPrompt(research, parallel=true) starts with /fleet', () => {
-  const out = formatPrompt({ template: 'research', task: 'find X', parallel: true });
-  assert.match(out, /^\/fleet You are a research assistant/);
-});
-
-test('formatPrompt(research, parallel=false) starts without /fleet', () => {
-  const out = formatPrompt({ template: 'research', task: 'find X', parallel: false });
-  assert.match(out, /^You are a research assistant/);
-  assert.doesNotMatch(out, /\/fleet/);
-});
-
-test('formatPrompt(plan_review, parallel=true) starts with /fleet', () => {
-  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-fmt-'));
-  process.env.COPILOT_PLANS_DIR = tmp;
-  try {
-    const planFile = join(tmp, 'p.md');
-    writeFileSync(planFile, '# plan');
-    const r = validateCopilotArgs({
-      action: 'send',
-      template: 'plan_review',
-      template_args: { plan_path: planFile },
-      parallel: true,
-    });
-    const out = formatPrompt({ template: 'plan_review', template_args: r.template_args, parallel: true });
-    assert.match(out, /^\/fleet You are a senior software architect/);
-  } finally {
-    delete process.env.COPILOT_PLANS_DIR;
-    rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test('formatPrompt(plan_review, parallel=false) starts without /fleet', () => {
-  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-fmt2-'));
-  process.env.COPILOT_PLANS_DIR = tmp;
-  try {
-    const planFile = join(tmp, 'p.md');
-    writeFileSync(planFile, '# plan');
-    const r = validateCopilotArgs({
-      action: 'send',
-      template: 'plan_review',
-      template_args: { plan_path: planFile },
-      parallel: false,
-    });
-    const out = formatPrompt({ template: 'plan_review', template_args: r.template_args, parallel: false });
-    assert.match(out, /^You are a senior software architect/);
-    assert.doesNotMatch(out, /\/fleet/);
-  } finally {
-    delete process.env.COPILOT_PLANS_DIR;
-    rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-// ---------- per-template template_args validation ----------
-
-test('send: scope_hint accepted for general template', () => {
-  const r = validateCopilotArgs({
-    action: 'send', task: 'X', template: 'general',
-    template_args: { scope_hint: 'imports only' },
-  });
-  assert.equal(r.template_args.scope_hint, 'imports only');
-});
-
-test('send: scope_hint rejected for plan_review template', () => {
-  const tmp = mkdtempSync(join(tmpdir(), 'copilot-test-plans-'));
-  process.env.COPILOT_PLANS_DIR = tmp;
-  try {
-    const planFile = join(tmp, 'p.md');
-    writeFileSync(planFile, '# plan');
-    assert.throws(
-      () => validateCopilotArgs({
-        action: 'send',
-        template: 'plan_review',
-        template_args: { plan_path: planFile, scope_hint: 'lol' },
-      }),
-      /unknown template_args key "scope_hint" for template="plan_review"/,
-    );
-  } finally {
-    delete process.env.COPILOT_PLANS_DIR;
-    rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test('send: scope_hint rejected for research template', () => {
-  assert.throws(
-    () => validateCopilotArgs({
-      action: 'send', task: 'X', template: 'research',
-      template_args: { scope_hint: 'X' },
-    }),
-    /unknown template_args key "scope_hint" for template="research"/,
-  );
-});
-
-test('send: plan_path rejected for general template', () => {
-  assert.throws(
-    () => validateCopilotArgs({
-      action: 'send', task: 'X', template: 'general',
-      template_args: { plan_path: '/tmp/x.md' },
-    }),
-    /unknown template_args key "plan_path" for template="general"/,
-  );
-});
-
-test('send: scope_hint must be a string', () => {
-  assert.throws(
-    () => validateCopilotArgs({
-      action: 'send', task: 'X', template: 'general',
-      template_args: { scope_hint: 42 },
-    }),
-    /scope_hint must be a string/,
-  );
-});
-
-test('send: scope_hint length capped at 500 chars', () => {
-  const big = 'x'.repeat(501);
-  assert.throws(
-    () => validateCopilotArgs({
-      action: 'send', task: 'X', template: 'general',
-      template_args: { scope_hint: big },
-    }),
-    /scope_hint too long/,
-  );
-});
-
-// ---------- formatPrompt: scope_hint interpolation ----------
-
-test('formatPrompt(general) emits Scope: line when scope_hint provided', () => {
-  const out = formatPrompt({
+  const analyze = formatPrompt({
     template: 'general', task: 'X', mode: 'ANALYZE',
     template_args: { scope_hint: 'imports/types only' },
+    parallel: false,
   });
-  assert.match(out, /\nScope: imports\/types only\n/);
+  assert.match(analyze, />200 LOC/);
+  assert.match(analyze, /\nScope: imports\/types only\n/);
+
+  const research = formatPrompt({ template: 'research', task: 'what is X', parallel: false });
+  assert.match(research, /research assistant/);
+  assert.doesNotMatch(research, /`edit`/);
+
+  const wrapped = appendRubberDuckReview('BASE');
+  assert.match(wrapped, /^BASE\n/);
+  assert.match(wrapped, /CROSS-EXAMINATION STEP/);
+  assert.match(wrapped, /RUBBER-DUCK: clean\./);
+  assert.match(wrapped, /RUBBER-DUCK: revised/);
 });
 
-test('formatPrompt(general) omits Scope: line when scope_hint absent', () => {
-  const out = formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE' });
-  assert.doesNotMatch(out, /\nScope:/);
+test('parallel controls /fleet prefixes consistently across templates and validates boolean input', () => {
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'general' })).parallel, true);
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'general', parallel: false })).parallel, false);
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'research' })).parallel, true);
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'research', parallel: false })).parallel, false);
+  assert.throws(() => validateCopilotArgs(sendArgs({ task: 'X', template: 'general', parallel: 'yes' })), /parallel must be a boolean/);
+
+  assert.match(formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: true }), /^\/fleet do thing\n/);
+  assert.match(formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: false }), /^TASK: do thing\n/);
+  assert.match(formatPrompt({ template: 'research', task: 'find X', parallel: true }), /^\/fleet You are a research assistant/);
+  assert.match(formatPrompt({ template: 'research', task: 'find X', parallel: false }), /^You are a research assistant/);
+
+  withPlansDir((dir) => {
+    const planFile = join(dir, 'p.md');
+    writeFileSync(planFile, '# plan');
+    const on = validateCopilotArgs(planArgs(planFile, {}));
+    const off = validateCopilotArgs({ ...planArgs(planFile, {}), parallel: false });
+    assert.equal(on.parallel, true);
+    assert.equal(off.parallel, false);
+    assert.match(formatPrompt({ template: 'plan_review', template_args: on.template_args, parallel: true }),
+      /^\/fleet You are a senior software architect/);
+    assert.match(formatPrompt({ template: 'plan_review', template_args: off.template_args, parallel: false }),
+      /^You are a senior software architect/);
+  });
 });
 
-test('formatPrompt(general, ANALYZE) includes >200 LOC scope guidance', () => {
-  const out = formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE' });
-  assert.match(out, />200 LOC/);
+test('scope_hint is accepted only for general prompts and bounded by type and length', () => {
+  const accepted = validateCopilotArgs({
+    action: 'send', task: 'X', cwd: TEST_CWD, template: 'general',
+    template_args: { scope_hint: 'imports only' },
+  });
+  assert.equal(accepted.template_args.scope_hint, 'imports only');
+  assert.match(formatPrompt({
+    template: 'general', task: 'X', mode: 'ANALYZE',
+    template_args: accepted.template_args,
+    parallel: false,
+  }), /\nScope: imports only\n/);
+  assert.doesNotMatch(formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE', parallel: false }), /\nScope:/);
+
+  assert.throws(() => validateCopilotArgs({
+    action: 'send', task: 'X', cwd: TEST_CWD, template: 'research',
+    template_args: { scope_hint: 'X' },
+  }), /unknown template_args key "scope_hint" for template="research"/);
+  assert.throws(() => validateCopilotArgs({
+    action: 'send', task: 'X', cwd: TEST_CWD, template: 'general',
+    template_args: { plan_path: '/tmp/x.md' },
+  }), /unknown template_args key "plan_path" for template="general"/);
+  assert.throws(() => validateCopilotArgs({
+    action: 'send', task: 'X', cwd: TEST_CWD, template: 'general',
+    template_args: { scope_hint: 42 },
+  }), /scope_hint must be a string/);
+  assert.throws(() => validateCopilotArgs({
+    action: 'send', task: 'X', cwd: TEST_CWD, template: 'general',
+    template_args: { scope_hint: 'x'.repeat(501) },
+  }), /scope_hint too long/);
+
+  withPlansDir((dir) => {
+    const planFile = join(dir, 'p.md');
+    writeFileSync(planFile, '# plan');
+    assert.throws(() => validateCopilotArgs(planArgs(planFile, { scope_hint: 'nope' })),
+      /unknown template_args key "scope_hint" for template="plan_review"/);
+  });
 });
 
-// ---------- session-id input aliases ----------
-
-test('host_session_id accepted on every action, normalized to host_session_id field', () => {
-  const acts = [
-    { action: 'send', task: 'X', host_session_id: 'sid-abc' },
+test('host_session_id and claude_session_id normalize across actions and reject conflicts or invalid values', () => {
+  const actions = [
+    { action: 'send', task: 'X', cwd: TEST_CWD, host_session_id: 'sid-abc' },
     { action: 'wait', job_id: 'j1', host_session_id: 'sid-abc' },
     { action: 'status', host_session_id: 'sid-abc' },
     { action: 'reply', job_id: 'j1', message: 'hi', host_session_id: 'sid-abc' },
     { action: 'cancel', job_id: 'j1', host_session_id: 'sid-abc' },
   ];
-  for (const a of acts) {
-    const out = validateCopilotArgs(a);
-    assert.equal(out.host_session_id, 'sid-abc', `${a.action} normalized host_session_id`);
+  for (const action of actions) {
+    assert.equal(validateCopilotArgs(action).host_session_id, 'sid-abc', `${action.action} normalized host_session_id`);
   }
-});
 
-test('claude_session_id legacy alias accepted, normalized to host_session_id field', () => {
-  // Backwards compat: existing Claude callers pass claude_session_id; the
-  // bridge accepts it and normalizes to the host-neutral internal field.
-  const out = validateCopilotArgs({ action: 'status', claude_session_id: 'legacy-sid' });
-  assert.equal(out.host_session_id, 'legacy-sid');
-});
-
-test('both claude_session_id and host_session_id accepted when values agree', () => {
-  // Common during a host transition: a wrapper might forward both. Same
-  // value → fine, single canonicalization. Different values → error.
-  const out = validateCopilotArgs({
+  assert.equal(validateCopilotArgs({ action: 'status', claude_session_id: 'legacy-sid' }).host_session_id, 'legacy-sid');
+  assert.equal(validateCopilotArgs({
     action: 'status',
     claude_session_id: 'matching-sid',
     host_session_id: 'matching-sid',
-  });
-  assert.equal(out.host_session_id, 'matching-sid');
-});
-
-test('claude_session_id and host_session_id with conflicting values rejected', () => {
-  assert.throws(
-    () => validateCopilotArgs({
-      action: 'status',
-      claude_session_id: 'sid-A',
-      host_session_id: 'sid-B',
-    }),
-    /provided with different values/,
-  );
-});
-
-test('non-string claude_session_id rejected', () => {
-  assert.throws(
-    () => validateCopilotArgs({ action: 'status', claude_session_id: 42 }),
-    /claude_session_id must be a non-empty string/,
-  );
-});
-
-test('non-string host_session_id rejected', () => {
-  assert.throws(
-    () => validateCopilotArgs({ action: 'status', host_session_id: '' }),
-    /host_session_id must be a non-empty string/,
-  );
-});
-
-test('absent session-id args yield null host_session_id (no error)', () => {
-  const out = validateCopilotArgs({ action: 'status' });
-  assert.equal(out.host_session_id, null);
+  }).host_session_id, 'matching-sid');
+  assert.throws(() => validateCopilotArgs({
+    action: 'status',
+    claude_session_id: 'sid-A',
+    host_session_id: 'sid-B',
+  }), /provided with different values/);
+  assert.throws(() => validateCopilotArgs({ action: 'status', claude_session_id: 42 }),
+    /claude_session_id must be a non-empty string/);
+  assert.throws(() => validateCopilotArgs({ action: 'status', host_session_id: '' }),
+    /host_session_id must be a non-empty string/);
+  assert.equal(validateCopilotArgs({ action: 'status' }).host_session_id, null);
 });

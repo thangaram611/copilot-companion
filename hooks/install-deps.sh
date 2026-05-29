@@ -16,6 +16,21 @@
 ROOT="${CLAUDE_PLUGIN_ROOT:-}"
 [ -n "$ROOT" ] || exit 0
 
+TOOLS="$ROOT/hooks/node-tools.sh"
+if [ -r "$TOOLS" ]; then
+  # shellcheck source=/dev/null
+  . "$TOOLS"
+fi
+NODE_BIN="$(resolve_node 2>/dev/null || true)"
+if [ -n "$NODE_BIN" ]; then
+  export PATH="$(dirname "$NODE_BIN"):${PATH:-}"
+fi
+NPM_BIN="$(resolve_npm 2>/dev/null || true)"
+if [ -z "$NPM_BIN" ]; then
+  echo "copilot-companion: npm not found; cannot install bridge dependencies" >&2
+  exit 1
+fi
+
 # CLAUDE_PLUGIN_DATA is only populated for marketplace-installed plugins.
 # For --plugin-dir local-dev runs, fall back to a sibling dir under the
 # plugin root (not pretty, but keeps local-dev functional).
@@ -95,13 +110,13 @@ fi
 # Prefer `npm ci` when a lockfile is present: it wipes node_modules first, so
 # a killed prior install (SessionStart timeout) can't leave corrupt state.
 if [ -f "$PERSIST_DIR/package-lock.json" ]; then
-  INSTALL_CMD="npm ci --silent --no-audit --no-fund"
+  INSTALL_ARGS=(ci --silent --no-audit --no-fund)
 else
-  INSTALL_CMD="npm install --silent --no-audit --no-fund"
+  INSTALL_ARGS=(install --silent --no-audit --no-fund)
 fi
 
 cd "$PERSIST_DIR" || { echo "copilot-companion: cd $PERSIST_DIR failed" >&2; exit 1; }
-if ! $INSTALL_CMD >"$LOG" 2>&1; then
+if ! "$NPM_BIN" "${INSTALL_ARGS[@]}" >"$LOG" 2>&1; then
   rm -f "$MANIFEST_HASH"
   echo "copilot-companion: npm install failed (see $LOG)" >&2
   exit 1

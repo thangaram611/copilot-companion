@@ -17,6 +17,7 @@ import {
   writeFileSync,
   existsSync,
   renameSync,
+  chmodSync,
 } from 'node:fs';
 import { isAbsolute, join, sep as pathSep } from 'node:path';
 
@@ -26,6 +27,11 @@ import { plansDir, detectHost } from '../lib/host.mjs';
 
 export const BRIDGE_LOG_FILE = '/tmp/copilot-bridge.log';
 export const BRIDGE_LOG_MAX_BYTES = 1024 * 1024;
+const PRIVATE_FILE_MODE = 0o600;
+
+function chmodPrivate(path) {
+  try { chmodSync(path, PRIVATE_FILE_MODE); } catch {}
+}
 
 export function log(level, ...args) {
   const ts = new Date().toISOString();
@@ -36,10 +42,14 @@ export function log(level, ...args) {
       // v6.1 C4: keep the previous log in .bak instead of truncating in
       // place. Truncate-on-rotate dropped the most recent diagnostic data
       // exactly when something went wrong enough to fill the log.
-      try { renameSync(BRIDGE_LOG_FILE, BRIDGE_LOG_FILE + '.bak'); }
-      catch { writeFileSync(BRIDGE_LOG_FILE, ''); }
+      try {
+        renameSync(BRIDGE_LOG_FILE, BRIDGE_LOG_FILE + '.bak');
+        chmodPrivate(BRIDGE_LOG_FILE + '.bak');
+      }
+      catch { writeFileSync(BRIDGE_LOG_FILE, '', { mode: PRIVATE_FILE_MODE }); chmodPrivate(BRIDGE_LOG_FILE); }
     }
-    appendFileSync(BRIDGE_LOG_FILE, line);
+    appendFileSync(BRIDGE_LOG_FILE, line, { mode: PRIVATE_FILE_MODE });
+    chmodPrivate(BRIDGE_LOG_FILE);
   } catch { /* best-effort */ }
   if (level === 'WARN' || level === 'ERROR' || level === 'FATAL') {
     try { process.stderr.write(line); } catch {}
@@ -281,7 +291,12 @@ function assertThreadName(value) {
 }
 
 function assertCwd(cwd) {
-  if (cwd === undefined || cwd === null || cwd === '') return;
+  if (cwd === undefined || cwd === null || cwd === '') {
+    throw new Error(
+      'copilot: cwd is required for action="send" ' +
+      '(pass the absolute target repo/worktree path; refusing to default to the bridge process cwd)',
+    );
+  }
   if (typeof cwd !== 'string') throw new Error('copilot: cwd must be a string');
   if (!isAbsolute(cwd)) throw new Error(`copilot: cwd must be an absolute path, got "${cwd}"`);
   let st;
@@ -473,7 +488,7 @@ function validateSend(args) {
     mode,
     template,
     template_args: ta,
-    cwd: args.cwd || null,
+    cwd: args.cwd,
     thread: args.thread || null,
     max_wait_sec: args.max_wait_sec,
     parallel,

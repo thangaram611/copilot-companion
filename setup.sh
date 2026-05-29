@@ -101,6 +101,12 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 ok "npm $(npm --version)"
 
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq not found on PATH. Install jq; hook delivery depends on it."
+  exit 1
+fi
+ok "jq $(jq --version 2>/dev/null || echo found)"
+
 if command -v copilot >/dev/null 2>&1; then
   ok "copilot $(copilot --version 2>/dev/null || echo 'found')"
 else
@@ -130,7 +136,11 @@ echo ""
 printf "Installing bridge server dependencies...\n"
 BRIDGE_DIR="$SCRIPT_DIR/bridge-server"
 if [ -d "$BRIDGE_DIR" ] && [ -f "$BRIDGE_DIR/package.json" ]; then
-  cd "$BRIDGE_DIR" && npm install --silent --no-audit --no-fund
+  if [ -f "$BRIDGE_DIR/package-lock.json" ]; then
+    cd "$BRIDGE_DIR" && npm ci --silent --no-audit --no-fund
+  else
+    cd "$BRIDGE_DIR" && npm install --silent --no-audit --no-fund
+  fi
   ok "bridge-server node_modules installed"
 else
   fail "bridge-server/package.json not found at $BRIDGE_DIR"
@@ -299,15 +309,20 @@ fi
 
 printf "Syntax-checking scripts...\n"
 FAIL_COUNT=0
-for f in "$SCRIPT_DIR"/bridge-server/*.mjs "$SCRIPT_DIR"/scripts/*.mjs; do
+while IFS= read -r f; do
   [ -f "$f" ] || continue
   if node --check "$f" 2>/dev/null; then
-    ok "$(basename "$f")"
+    ok "${f#$SCRIPT_DIR/}"
   else
-    fail "$(basename "$f") — syntax error"
+    fail "${f#$SCRIPT_DIR/} — syntax error"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   fi
-done
+done < <(
+  find "$SCRIPT_DIR/bridge-server" "$SCRIPT_DIR/lib" "$SCRIPT_DIR/scripts" \
+       "$SCRIPT_DIR/hooks" "$SCRIPT_DIR/templates" \
+       -path '*/node_modules' -prune -o \
+       -type f -name '*.mjs' -print 2>/dev/null
+)
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
   fail "$FAIL_COUNT file(s) have syntax errors"
@@ -326,14 +341,16 @@ EXISTING=()
 while IFS= read -r f; do EXISTING+=("$f"); done < <(
   find "$SCRIPT_DIR/bridge-server" "$SCRIPT_DIR/lib" "$SCRIPT_DIR/scripts" \
        "$SCRIPT_DIR/hooks" "$SCRIPT_DIR/templates" \
-       -name '*.test.mjs' 2>/dev/null
+       -path '*/node_modules' -prune -o \
+       -type f -name '*.test.mjs' -print 2>/dev/null
 )
 
 if [ "${#EXISTING[@]}" -gt 0 ]; then
   if node --test "${EXISTING[@]}" 2>/dev/null; then
     ok "unit tests passed"
   else
-    warn "unit tests failed (non-blocking)"
+    fail "unit tests failed"
+    exit 1
   fi
 else
   warn "test files not found, skipping"

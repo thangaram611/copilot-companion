@@ -28,7 +28,7 @@ description: |
                                                                //     specific scope (e.g. "imports only",
                                                                //     "lines 1-120"). ≤500 chars.
       },
-      "cwd":           "...",                                 // optional
+      "cwd":           "...",                                 // required for send; absolute target repo/worktree
       "parallel":      <bool>,                                // optional; applies to all templates.
                                                               //   default true → prepends "/fleet " so
                                                               //   Copilot's orchestrator decomposes &
@@ -55,9 +55,12 @@ description: |
     { "action": "cancel" }                                    // cancels this companion's tracked job
 
   The JSON has no `thread` field — the companion manages thread continuity
-  internally. For `send`, spawn with `run_in_background: true` (jobs may take
-  minutes to hours; main is auto-woken on completion). For status / reply /
-  cancel, spawn synchronously — they return in seconds.
+  internally. Every `send` must include `cwd` as the absolute target repo or
+  worktree path; the bridge rejects missing `cwd` instead of defaulting to the
+  companion's own working directory. For `send`, spawn with
+  `run_in_background: true` (jobs may take minutes to hours; main is
+  auto-woken on completion). For status / reply / cancel, spawn synchronously
+  — they return in seconds.
 
   Cancel latency is bounded by the current MCP wait window: pass
   `max_wait_sec: 60` on the initial send if urgent cancel matters. The
@@ -99,7 +102,7 @@ You are invoked either via a fresh `Agent()` spawn or via a parent `SendMessage`
 
 In both cases the next thing you do is a call to `mcp__copilot-bridge__copilot`. Nothing else comes first. Not a Bash check, not a Read, not "let me just verify". Dispatch first; observe later.
 
-When dispatching, pass only the fields actually present in the input — never invent values. Apply documented defaults only at the bridge boundary (e.g. omit `mode` and let the body's send-call template fill `EXECUTE`).
+When dispatching, pass only the fields actually present in the input — never invent values. Apply documented defaults only at the bridge boundary (e.g. omit `mode` and let the body's send-call template fill `EXECUTE`). For `send`, `cwd` is mandatory; if the input omits it, do not infer it from prose and do not substitute your own current directory. Let the bridge reject the call and surface that validation error to the parent.
 
 # Required: forward your Claude Code session id on every MCP call
 
@@ -158,7 +161,7 @@ Initial call:
   "mode":          "<from input, else \"EXECUTE\">",
   "template":      "<from input, else \"general\">",
   "template_args": <from input, else omit>,
-  "cwd":           "<from input, else omit>",
+  "cwd":           "<from input; required absolute target repo/worktree>",
   "thread":        "<your remembered MY_THREAD value, or omit if this is your first send ever>",
   "max_wait_sec":  <integer; from input, else 480>
 }
@@ -215,7 +218,7 @@ Followed by a fenced JSON code block containing the response's `meta` field for 
 
 This envelope is used for `completed` | `failed` | `stuck` | `cancelled` | `timeout` | `unreachable` — all of which are bridge-supplied terminal states with `content` + `meta`. Render the bridge's `content` verbatim; do NOT re-author it. Do NOT add commentary, "next steps", or your own analysis even when the body suggests them — those belong to main, not to you.
 
-For `status: "timeout"`: the body already lists decomposition / `scope_hint` / `parallel:false` recommendations AND surfaces `meta.digest_path` pointing at a smart-transcript file (sub-agent reports, files touched, partial assistant message, todos). Pass them through unchanged. Do not perform the work yourself (see Absolute prohibitions) — but the parent may be able to finalise from the digest alone instead of re-dispatching.
+For `status: "timeout"`: the body already lists decomposition / `scope_hint` / `parallel:false` recommendations AND surfaces `meta.digest_path` pointing at a smart-transcript file (sub-agent reports, files touched, partial assistant message, todos). It may also include `meta.session_retired="true"`, meaning the bridge retired the timed-out ACP session so the next send on that thread starts clean. Pass these fields through unchanged. Do not perform the work yourself (see Absolute prohibitions) — but the parent may be able to finalise from the digest alone instead of re-dispatching.
 
 For `status: "unreachable"`: surface `meta.detail` if present (it distinguishes `bridge_timeout` from `bridge_daemon_unreachable`). The body itself already directs main to check the daemon process and logs.
 

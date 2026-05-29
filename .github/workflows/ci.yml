@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bridge-server/package-lock.json
+      - name: Install bridge dependencies
+        run: npm ci --silent --no-audit --no-fund
+        working-directory: bridge-server
+      - name: Shell syntax
+        run: bash -n setup.sh hooks/*.sh
+      - name: JavaScript syntax
+        run: find bridge-server lib scripts hooks templates -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - name: Tests with coverage
+        run: node --test --experimental-test-coverage $(find bridge-server lib scripts hooks templates -name '*.test.mjs')
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=moderate
+        working-directory: bridge-server

@@ -31,7 +31,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   appendFileSync, readFileSync, writeFileSync,
-  renameSync, existsSync, realpathSync,
+  renameSync, existsSync, realpathSync, chmodSync, unlinkSync,
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -45,7 +45,7 @@ import {
 import {
   readDefaultModel,
   isModelAllowed,
-  readThreadSid, writeThreadSid, listThreads,
+  readThreadSid, writeThreadSid, clearThread, listThreads,
   readHostSessionThread, writeHostSessionThread,
   writeJob, readJob, listJobsForSession, deleteJob,
   DEFAULT_MODEL,
@@ -62,6 +62,46 @@ import { writeDigest, digestPath } from '../lib/prompt-digest.mjs';
 // without subprocesses.
 function getQueuePath() {
   return process.env.COPILOT_QUEUE_PATH || '/tmp/copilot-completions.jsonl';
+}
+
+const PRIVATE_FILE_MODE = 0o600;
+
+function chmodPrivate(path) {
+  try { chmodSync(path, PRIVATE_FILE_MODE); } catch {}
+}
+
+function appendPrivateFile(path, content) {
+  appendFileSync(path, content, { encoding: 'utf8', mode: PRIVATE_FILE_MODE });
+  chmodPrivate(path);
+}
+
+function writePrivateFile(path, content) {
+  writeFileSync(path, content, { encoding: 'utf8', mode: PRIVATE_FILE_MODE });
+  chmodPrivate(path);
+}
+
+function appendQueueLines(path, lines) {
+  if (!Array.isArray(lines) || lines.length === 0) return;
+  appendPrivateFile(path, lines.join('\n') + '\n');
+}
+
+function rewriteQueueByMoveAside(suffix, transform) {
+  const queuePath = getQueuePath();
+  if (!existsSync(queuePath)) return false;
+  const drainPath = `${queuePath}.${suffix}.${process.pid}.${Date.now()}`;
+  try {
+    renameSync(queuePath, drainPath);
+  } catch {
+    return false;
+  }
+  try {
+    const lines = readFileSync(drainPath, 'utf8').split('\n').filter(Boolean);
+    const nextLines = transform(lines) || [];
+    appendQueueLines(queuePath, nextLines);
+    return true;
+  } finally {
+    try { unlinkSync(drainPath); } catch {}
+  }
 }
 
 // The bridge's resolved host session id. Three sources, in precedence:
@@ -132,7 +172,7 @@ function enqueueEvent(event) {
   const fromJob = event.jobId ? jobs.get(event.jobId)?.claudeSessionId : null;
   const sid = fromJob || getHostSessionId();
   try {
-    appendFileSync(
+    appendPrivateFile(
       getQueuePath(),
       JSON.stringify({
         ts: Date.now(),
@@ -140,7 +180,6 @@ function enqueueEvent(event) {
         claudeSessionId: sid,
         ...event,
       }) + '\n',
-      { encoding: 'utf8' },
     );
   } catch (err) {
     log('WARN', 'enqueue failed:', err.message);
@@ -149,21 +188,17 @@ function enqueueEvent(event) {
 
 function markQueueConsumed(jobId) {
   try {
-    const QUEUE_PATH = getQueuePath();
-    if (!existsSync(QUEUE_PATH)) return;
-    const lines = readFileSync(QUEUE_PATH, 'utf8').split('\n').filter(Boolean);
-    let changed = false;
-    const updated = lines.map((line) => {
-      try {
-        const e = JSON.parse(line);
-        if (e.jobId === jobId && !e.consumed) { e.consumed = true; changed = true; }
-        return JSON.stringify(e);
-      } catch { return line; }
+    rewriteQueueByMoveAside('consume', (lines) => {
+      let changed = false;
+      const updated = lines.map((line) => {
+        try {
+          const e = JSON.parse(line);
+          if (e.jobId === jobId && !e.consumed) { e.consumed = true; changed = true; }
+          return JSON.stringify(e);
+        } catch { return line; }
+      });
+      return changed ? updated : lines;
     });
-    if (!changed) return;
-    const tmp = `${QUEUE_PATH}.consume.${process.pid}`;
-    writeFileSync(tmp, updated.join('\n') + '\n');
-    renameSync(tmp, QUEUE_PATH);
   } catch (err) {
     log('WARN', 'markQueueConsumed failed:', err.message);
   }
@@ -269,7 +304,42 @@ function retainTerminalJob(jobId, patch) {
   return job;
 }
 
+function retireThreadSid(thread, sessionId, reason) {
+  if (!thread || !sessionId) return false;
+  try {
+    if (readThreadSid(thread) !== sessionId) return false;
+    clearThread(thread);
+    log('WARN', 'thread sid retired:', `thread=${thread} session=${sessionId} reason=${reason}`);
+    return true;
+  } catch (err) {
+    log('WARN', 'retireThreadSid failed:', err.message);
+    return false;
+  }
+}
+
+function isBlankText(value) {
+  return typeof value !== 'string' || value.trim().length === 0;
+}
+
+function isEmptyCompletedSummary(summary) {
+  if (!summary || typeof summary !== 'object') return true;
+  return isBlankText(summary.message) &&
+    isBlankText(summary.thoughts) &&
+    (!Array.isArray(summary.toolCalls) || summary.toolCalls.length === 0) &&
+    !summary.plan;
+}
+
 function iso(ts) { return ts ? new Date(ts).toISOString() : null; }
+function canonicalPathForCompare(path) {
+  if (!path) return null;
+  try { return realpathSync(path); }
+  catch { return String(path); }
+}
+function sameRequiredCwd(a, b) {
+  const ca = canonicalPathForCompare(a);
+  const cb = canonicalPathForCompare(b);
+  return !!ca && !!cb && ca === cb;
+}
 function normalizeInspectLimit(value) {
   const n = Number.parseInt(String(value ?? ''), 10);
   if (!Number.isFinite(n)) return 40;
@@ -357,6 +427,7 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
     activity_count:     includeTimeline ? (data.activityCount ?? 0) : undefined,
     activity_truncated: includeTimeline ? Boolean(data.activityTruncated) : undefined,
     session_reborn:     Boolean(job.sessionReborn),
+    session_retired:    Boolean(job.sessionRetired),
     // Path to the smart-transcript digest file. Always points at a stable
     // location keyed by jobId; the file itself exists only if a digest has
     // been written for this job (skipped when the prompt has no events yet).
@@ -460,6 +531,7 @@ function buildWaitResponse(outcome) {
   };
   if (job.detail) meta.detail = String(job.detail).slice(0, 80);
   if (job.sessionReborn) meta.session_reborn = 'true';
+  if (job.sessionRetired) meta.session_retired = 'true';
   if (job.reattached) meta.reattached = 'true';
   if (job.existingPromptId) meta.existing_prompt_id = String(job.existingPromptId);
   if (digestFilePath) meta.digest_path = digestFilePath;
@@ -526,7 +598,7 @@ function emitRebirthAlert({ jobId, task, promptId, thread, previousSid, newSessi
 export function formatTerminalContent({
   jobId, status, task, mode, durationMs,
   summary, error, stuckReason, detail, failedTools, promptId,
-  sessionReborn = false, digestFilePath = null,
+  sessionReborn = false, sessionRetired = false, digestFilePath = null,
 }) {
   const rebirthBanner = sessionReborn
     ? '> ⚠ Copilot session was respawned mid-thread; prior in-process conversation context was lost. ' +
@@ -556,6 +628,11 @@ export function formatTerminalContent({
       `\n\n**Tool calls:** ${(summary.toolCalls || []).length}  •  **Duration:** ${Math.round(duration / 1000)}s` +
       filesLine + failedLine + rubberDuckFooter;
   }
+  if (status === 'completed') {
+    return taskHeader +
+      'Copilot reported completion but returned no assistant message. ' +
+      'Treat this as a failed turn and re-dispatch with explicit context.';
+  }
   if (status === 'stuck') {
     return taskHeader +
       `Copilot got stuck on: \`${stuckReason || 'unknown'}\`.\n\n` +
@@ -581,6 +658,9 @@ export function formatTerminalContent({
         'It contains the partial assistant message, /fleet sub-agent reports (often near-complete), files touched, and todos. ' +
         'You may be able to finalise from the digest alone, or use it to scope a much smaller follow-up send.'
       : '';
+    const retiredLine = sessionRetired
+      ? '\n\n**Session:** the timed-out Copilot ACP session was retired; the next send on this thread starts a fresh session. Restate any needed context from the digest.'
+      : '';
     return taskHeader +
       `Copilot's model turn did not finish within the wait budget (${Math.round(duration / 1000)}s).\n\n` +
       'The daemon is alive; the task was too large for one turn (note: `/fleet` runs by default for general tasks). Recommended next steps for the parent:\n' +
@@ -589,7 +669,7 @@ export function formatTerminalContent({
       '- For ANALYZE on large files, pass `template_args.scope_hint` (e.g. "imports/types only", "lines 1-120") to bind the analysis to a specific section.\n' +
       '- Raise `max_wait_sec` (cap 1200s / 20 min for all modes) if the task is genuinely long.\n' +
       "- Try `parallel: false` once if you suspect /fleet's coordination overhead is the bottleneck for a strictly linear task." +
-      failedLine + digestLine;
+      failedLine + digestLine + retiredLine;
   }
   if (status === 'unreachable') {
     const detailLine = detail ? ` (detail: ${detail})` : '';
@@ -604,7 +684,7 @@ export function emitNotification({
   jobId, status, summary, error, stuckReason, detail = null, duration,
   task, mode, cwd, thread = null, promptId = null, sessionId = null,
   reconciled = false, bridgeReason = null, failedTools = [], reqId = null,
-  sessionReborn = false, extraMeta = null,
+  sessionReborn = false, sessionRetired = false, extraMeta = null,
 }) {
   if (
     status === 'completed' &&
@@ -627,6 +707,12 @@ export function emitNotification({
     status = 'failed';
     if (!detail) detail = 'copilot_capi_failure';
   }
+  if (status === 'completed' && isEmptyCompletedSummary(summary)) {
+    status = 'failed';
+    error = 'Copilot returned completed without any assistant message, tool calls, or plan updates.';
+    detail = detail || 'empty_completed';
+    sessionRetired = true;
+  }
 
   const meta = {
     job_id: jobId, status,
@@ -647,6 +733,7 @@ export function emitNotification({
   if (bridgeReason) meta.bridge_reason = String(bridgeReason).slice(0, 40);
   if (reqId)        meta.req_id = String(reqId);
   if (sessionReborn) meta.session_reborn = 'true';
+  if (sessionRetired) meta.session_retired = 'true';
   if (extraMeta && typeof extraMeta === 'object') {
     for (const [k, v] of Object.entries(extraMeta)) {
       if (v !== undefined && v !== null) meta[k] = String(v).slice(0, 80);
@@ -675,7 +762,7 @@ export function emitNotification({
   const content = formatTerminalContent({
     jobId, status, task, mode, durationMs: duration,
     summary, error, stuckReason, detail, failedTools, promptId,
-    sessionReborn, digestFilePath,
+    sessionReborn, sessionRetired, digestFilePath,
   });
 
   enqueueEvent({ kind: 'terminal', jobId, content, meta });
@@ -720,7 +807,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
   const startedAt = Date.now();
   const rlog = withReq(reqId, { job_id: jobId });
   rlog.info('worker.start', { mode, template, thread: thread || null, model, cwd: cwd || null, parallel: !!parallel });
-  log('INFO', 'worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} model=${model} cwd=${cwd || '(default)'} parallel=${!!parallel}`);
+  log('INFO', 'worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} model=${model} cwd=${cwd} parallel=${!!parallel}`);
   try {
     await ensureDaemon({ reqId });
 
@@ -737,7 +824,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       command: 'prompt-bg',
       sessionId: previousSid || null,
       text: formatted,
-      cwd: cwd || undefined,
+      cwd,
       model,
       reqId,
     });
@@ -748,16 +835,17 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       // through. Map to a clean terminal 'unreachable' envelope (with
       // detail=session_busy + existing_prompt_id) instead of throwing a
       // generic error that the caller would see as "unexpected terminal".
-      if (startResp.code === 'SESSION_BUSY') {
+      if (['SESSION_BUSY', 'CWD_BUSY', 'MODEL_BUSY'].includes(startResp.code)) {
+        const detail = String(startResp.code || 'SESSION_BUSY').toLowerCase();
         const existingPromptId = startResp.data?.existingPromptId || null;
         const conflictSessionId = startResp.data?.sessionId || null;
-        rlog.warn('worker.session_busy', { existing_prompt_id: existingPromptId, session_id: conflictSessionId });
-        log('WARN', 'worker session busy:', jobId, `existingPromptId=${existingPromptId} sessionId=${conflictSessionId}`);
+        rlog.warn('worker.daemon_busy', { code: startResp.code, existing_prompt_id: existingPromptId, session_id: conflictSessionId });
+        log('WARN', 'worker daemon busy:', jobId, `code=${startResp.code} existingPromptId=${existingPromptId} sessionId=${conflictSessionId}`);
         const duration = Date.now() - startedAt;
         retainTerminalJob(jobId, {
           status: 'unreachable',
-          detail: 'session_busy',
-          error: startResp.error || 'session busy',
+          detail,
+          error: startResp.error || 'daemon busy',
           existingPromptId,
           durationMs: duration,
           terminalAt: Date.now(),
@@ -766,9 +854,9 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
           jobId,
           status: 'unreachable',
           summary: null,
-          error: startResp.error || 'session busy',
+          error: startResp.error || 'daemon busy',
           stuckReason: null,
-          detail: 'session_busy',
+          detail,
           duration, task, mode, cwd, thread,
           promptId: null,
           sessionId: conflictSessionId,
@@ -842,8 +930,45 @@ async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cw
       result.status = 'timeout';
       result.stuckReason = null;
       result.error = null;
+      result.detail = 'prompt_timeout';
+      retireThreadSid(thread, sessionId, 'prompt_timeout');
+      result.sessionRetired = true;
       rlog.warn('worker.remap_prompt_timeout', { prompt_id: promptId });
-      log('INFO', 'remap prompt_timeout:', jobId, `promptId=${promptId} → status=timeout`);
+      log('INFO', 'remap prompt_timeout:', jobId, `promptId=${promptId} → status=timeout retired=${!!result.sessionRetired}`);
+    }
+
+    if (result.status === 'completed' && isEmptyCompletedSummary(result.summary)) {
+      result.status = 'failed';
+      result.error = 'Copilot returned completed without any assistant message, tool calls, or plan updates.';
+      result.detail = 'empty_completed';
+      retireThreadSid(thread, sessionId, 'empty_completed');
+      result.sessionRetired = true;
+      rlog.warn('worker.empty_completed', { prompt_id: promptId, session_retired: !!result.sessionRetired });
+      log('WARN', 'empty completed remapped:', jobId, `promptId=${promptId} retired=${!!result.sessionRetired}`);
+    }
+
+    if (result.status === 'failed' && result.error === 'empty completed response') {
+      result.error = 'Copilot returned completed without any assistant message, tool calls, or plan updates.';
+      result.detail = 'empty_completed';
+      retireThreadSid(thread, sessionId, 'empty_completed');
+      result.sessionRetired = true;
+    } else if (result.sessionRetired) {
+      retireThreadSid(thread, sessionId, result.detail || result.error || 'session_retired');
+      result.sessionRetired = true;
+    }
+
+    const currentJob = jobs.get(jobId);
+    if (currentJob?.supersedingPromptId === promptId && result.status === 'cancelled') {
+      currentJob.supersededPromptStatus = 'cancelled';
+      persistJob(jobId);
+      rlog.info('worker.prompt_superseded', { prompt_id: promptId, replacement_prompt_id: currentJob.promptId || null });
+      log('INFO', 'worker prompt superseded:', jobId, `promptId=${promptId}`);
+      return;
+    }
+    if (currentJob?.promptId && currentJob.promptId !== promptId) {
+      rlog.info('worker.prompt_obsolete', { prompt_id: promptId, current_prompt_id: currentJob.promptId });
+      log('INFO', 'worker obsolete prompt ignored:', jobId, `old=${promptId} current=${currentJob.promptId}`);
+      return;
     }
 
     const duration = Date.now() - startedAt;
@@ -856,8 +981,9 @@ async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cw
       failedTools, durationMs: duration,
       terminalAt: Date.now(),
       sessionReborn,
+      sessionRetired: !!result.sessionRetired,
     });
-    rlog.info('worker.terminal', { status: result.status, duration_ms: duration, failed_tools: failedTools?.length || 0, session_reborn: sessionReborn });
+    rlog.info('worker.terminal', { status: result.status, duration_ms: duration, failed_tools: failedTools?.length || 0, session_reborn: sessionReborn, session_retired: !!result.sessionRetired });
     emitNotification({
       jobId,
       status: result.status, summary: result.summary,
@@ -865,6 +991,7 @@ async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cw
       detail: result.detail || null,
       duration, task, mode, cwd, thread,
       promptId, sessionId, failedTools, reqId, sessionReborn,
+      sessionRetired: !!result.sessionRetired,
     });
   } catch (err) {
     await emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd, thread, rlog, sessionId });
@@ -880,32 +1007,46 @@ async function emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd
     /timeout/i.test(err?.message || '')
   );
   const reconciled = isReconcilableErr ? await reconcileAfterTimeout(promptId) : null;
+  let status = reconciled?.status ?? 'failed';
+  let summary = reconciled?.summary ?? null;
+  let error = reconciled?.error ?? err.message;
+  let detail = reconciled?.detail ?? null;
+  let sessionRetired = false;
+  if (status === 'completed' && isEmptyCompletedSummary(summary)) {
+    status = 'failed';
+    error = 'Copilot returned completed without any assistant message, tool calls, or plan updates.';
+    detail = 'empty_completed';
+    retireThreadSid(thread, currentSessionId, 'empty_completed');
+    sessionRetired = true;
+  }
   rlog.warn('worker.catch', { error: err.message, reconciled: reconciled?.status || null });
   log('WARN', 'worker catch:', jobId, `err="${err.message}" reconciled=${reconciled?.status || 'n/a'}`);
   retainTerminalJob(jobId, {
     promptId: promptId || null,
     sessionId: currentSessionId || null,
-    status: reconciled?.status ?? 'failed',
-    summary: reconciled?.summary ?? null,
-    error: reconciled?.error ?? err.message,
+    status,
+    summary,
+    error,
     stuckReason: reconciled?.stuckReason ?? null,
-    detail: reconciled?.detail ?? null,
+    detail,
     failedTools: promptId ? failedToolsFromJsonl(promptId) : [],
     durationMs: duration, terminalAt: Date.now(),
+    sessionRetired,
   });
   emitNotification({
     jobId,
-    status: reconciled?.status ?? 'failed',
-    summary: reconciled?.summary ?? null,
-    error: reconciled?.error ?? err.message,
+    status,
+    summary,
+    error,
     stuckReason: reconciled?.stuckReason ?? null,
-    detail: reconciled?.detail ?? null,
+    detail,
     duration, task, mode, cwd, thread,
     promptId: promptId || null,
     sessionId: currentSessionId || null,
     failedTools: promptId ? failedToolsFromJsonl(promptId) : [],
     bridgeReason: reconciled?.bridgeReason || null,
     reconciled: !!reconciled,
+    sessionRetired,
     reqId,
   });
 }
@@ -966,7 +1107,14 @@ function failedToolsFromJsonl(promptId) {
 
 // --- Action handlers --------------------------------------------------------
 
-function asJson(obj) { return { content: [{ type: 'text', text: JSON.stringify(obj) }] }; }
+function asJson(obj) {
+  const result = {
+    content: [{ type: 'text', text: JSON.stringify(obj) }],
+    structuredContent: obj,
+  };
+  if (obj?.ok === false) result.isError = true;
+  return result;
+}
 
 async function handleSend(args) {
   // The drain hook keys event delivery on claudeSessionId. Without it, every
@@ -1001,6 +1149,22 @@ async function handleSend(args) {
     if (existing.thread !== thread) continue;
     if (existing.claudeSessionId !== hostSid) continue;
     if (existing.terminalAt) continue;
+    if (!sameRequiredCwd(existing.cwd, args.cwd)) {
+      return asJson({
+        ok: false,
+        action: 'send',
+        status: 'cwd_mismatch',
+        job_id: existing.jobId,
+        current_status: existing.status || 'running',
+        thread,
+        existing_cwd: existing.cwd || null,
+        requested_cwd: args.cwd,
+        error:
+          `existing in-flight job ${existing.jobId} on thread ${thread} is rooted at ` +
+          `${existing.cwd || '(unknown)'}, but this send requested ${args.cwd}. ` +
+          'Refusing to reattach or start Copilot in the wrong workspace; wait/cancel the existing job or use a different thread.',
+      });
+    }
     existing.reattached = true;
     persistJob(existing.jobId);
     const maxWait = clampWaitSec(args.max_wait_sec, args.mode);
@@ -1112,23 +1276,71 @@ async function handleReply({ job_id, message }) {
   if (job.terminalAt) return asJson({ ok: false, action: 'reply', error: `job is already ${job.status} — start a new send` });
   if (job.replyInFlight) return asJson({ ok: false, action: 'reply', error: 'reply already in flight for this job' });
 
+  const originalPromptId = job.promptId;
   job.replyInFlight = true;
+  job.supersedingPromptId = originalPromptId;
+  job.supersededPromptStatus = null;
+  persistJob(job_id);
   try {
-    const resp = await sendToSocket({ command: 'reply', promptId: job.promptId, message }, 15_000);
+    const resp = await sendToSocket({ command: 'reply', promptId: originalPromptId, message }, 15_000);
     if (!resp.ok || !resp.data?.ok) {
       const reason = resp.data?.reason || resp.error || 'reply failed';
+      delete job.supersedingPromptId;
+      if (job.supersededPromptStatus === 'cancelled' && !job.terminalAt) {
+        retainTerminalJob(job_id, {
+          status: 'cancelled',
+          error: reason,
+          durationMs: Date.now() - (job.startedAt || Date.now()),
+          terminalAt: Date.now(),
+        });
+      } else {
+        persistJob(job_id);
+      }
       return asJson({ ok: false, action: 'reply', job_id, error: reason });
     }
-    log('INFO', 'copilot:reply', `job=${job_id} new_prompt=${resp.data.new_prompt_id}`);
+    const replacementPromptId = resp.data.new_prompt_id;
+    const replacementSessionId = resp.data.session_id || job.sessionId;
+    updateJob(job_id, {
+      promptId: replacementPromptId,
+      sessionId: replacementSessionId,
+      status: 'running',
+      inspectAvailable: true,
+      terminalAt: null,
+      retentionExpiresAt: null,
+      error: null,
+      stuckReason: null,
+      detail: null,
+      supersedingPromptId: null,
+      supersededPromptStatus: null,
+    });
+    delete job.supersedingPromptId;
+    delete job.supersededPromptStatus;
+
+    const reqId = job.reqId || createReqId();
+    runWatchLoop({
+      jobId: job_id,
+      promptId: replacementPromptId,
+      sessionId: replacementSessionId,
+      thread: job.thread || null,
+      task: job.task || message,
+      mode: job.mode || 'EXECUTE',
+      cwd: job.cwd || null,
+      startedAt: job.startedAt || Date.now(),
+      reqId,
+      sessionReborn: !!job.sessionReborn,
+    }).catch((err) => log('ERROR', 'reply watch loop error:', job_id, err.message));
+
+    log('INFO', 'copilot:reply', `job=${job_id} old_prompt=${originalPromptId} new_prompt=${replacementPromptId}`);
     return asJson({
       ok: true, action: 'reply', job_id,
       original_prompt_id: resp.data.original_prompt_id,
-      new_prompt_id: resp.data.new_prompt_id,
-      session_id: resp.data.session_id,
+      new_prompt_id: replacementPromptId,
+      session_id: replacementSessionId,
       hint: 'reply accepted. The original turn was cancelled; the follow-up runs as a new prompt on the same Copilot session.',
     });
   } finally {
     job.replyInFlight = false;
+    persistJob(job_id);
   }
 }
 
@@ -1161,6 +1373,7 @@ async function handleStatus({ job_id, verbose }) {
         status: j.status || 'starting',
         mode: j.mode || null,
         thread: j.thread || null,
+        cwd: j.cwd || null,
         prompt_id: j.promptId || null,
         started_at: iso(j.startedAt),
         age_s: Math.round((Date.now() - (j.startedAt || Date.now())) / 1000),
@@ -1247,7 +1460,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           cwd: {
             type: 'string',
-            description: '[send] Absolute working directory for Copilot. Useful for parallel isolated worktrees.',
+            description:
+              '[send required] Absolute target repo/worktree for Copilot. The bridge rejects missing cwd instead of defaulting to the bridge process cwd.',
           },
           thread: {
             type: 'string',
@@ -1298,6 +1512,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['action'],
+      },
+      outputSchema: {
+        type: 'object',
+        additionalProperties: true,
       },
     },
   ],
@@ -1391,9 +1609,13 @@ export function hydrateJobsFromLedger() {
     jobs.set(job.jobId, job);
     claimed++;
 
+    const isTerminal = !!job.terminalAt;
+
     // If thread + sessionId are both known but the thread file may not
     // exist (original bridge died before writeThreadSid ran), restore it.
-    if (job.thread && job.sessionId) {
+    // Do not restore timeout/empty-completed retirements: those sessions are
+    // intentionally poisoned and the next send must mint a clean ACP session.
+    if (job.thread && job.sessionId && !(isTerminal && job.sessionRetired)) {
       try { writeThreadSid(job.thread, job.sessionId); }
       catch (err) { log('WARN', 'hydrate writeThreadSid failed:', err.message); }
     }
@@ -1401,7 +1623,6 @@ export function hydrateJobsFromLedger() {
     // Resume the watch loop for non-terminal jobs that have a registered
     // promptId. Jobs in 'starting' (no prompt-bg yet) cannot be resumed —
     // mark them terminal:unreachable so wait/status return cleanly.
-    const isTerminal = !!job.terminalAt;
     if (isTerminal) continue;
     if (!job.promptId) {
       retainTerminalJob(job.jobId, {
@@ -1441,24 +1662,20 @@ export function sweepOwnSessionStaleQueueRows(nowMs = Date.now()) {
   const mySid = getHostSessionId();
   if (!mySid) return;
   _swept = true;
-  const QUEUE_PATH = getQueuePath();
-  if (!existsSync(QUEUE_PATH)) return;
   try {
-    const lines = readFileSync(QUEUE_PATH, 'utf8').split('\n').filter(Boolean);
     let dropped = 0;
-    const kept = [];
-    for (const line of lines) {
-      let e; try { e = JSON.parse(line); } catch { kept.push(line); continue; }
-      const isOwn = e.claudeSessionId === mySid;
-      const isStale = typeof e.ts === 'number' && (nowMs - e.ts > STARTUP_STALE_MS);
-      if (isOwn && isStale) { dropped++; continue; }
-      kept.push(line);
-    }
-    if (dropped === 0) return;
-    const tmp = `${QUEUE_PATH}.sweep.${process.pid}`;
-    writeFileSync(tmp, kept.length ? kept.join('\n') + '\n' : '');
-    renameSync(tmp, QUEUE_PATH);
-    log('INFO', 'startup sweep:', `dropped=${dropped} sid=${mySid}`);
+    const moved = rewriteQueueByMoveAside('sweep', (lines) => {
+      const kept = [];
+      for (const line of lines) {
+        let e; try { e = JSON.parse(line); } catch { kept.push(line); continue; }
+        const isOwn = e.claudeSessionId === mySid;
+        const isStale = typeof e.ts === 'number' && (nowMs - e.ts > STARTUP_STALE_MS);
+        if (isOwn && isStale) { dropped++; continue; }
+        kept.push(line);
+      }
+      return kept;
+    });
+    if (moved && dropped > 0) log('INFO', 'startup sweep:', `dropped=${dropped} sid=${mySid}`);
   } catch (err) {
     log('WARN', 'startup sweep failed:', err.message);
   }

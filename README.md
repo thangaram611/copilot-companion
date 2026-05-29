@@ -6,8 +6,9 @@ The entire public surface is a single subagent shipped inside this plugin (one
 Markdown variant for Claude Code, one TOML variant for Codex CLI). Main Claude
 or main Codex has **zero** direct MCP visibility into copilot-bridge; the MCP
 server is declared only in the subagent's frontmatter and only the subagent
-sees it. There is no slash command, no user-scope MCP registration, no
-main-session hooks, no skill, no session opt-in, no pause. Sends through the
+sees it. There is no slash command, no user-scope MCP registration, no skill,
+no session opt-in, no pause. Host hooks are used only for materialization,
+dependency prewarm, heartbeat, and completion drain. Sends through the
 `general` template invoke Copilot's built-in `/fleet` orchestrator by default;
 see [Parallel orchestration](#parallel-orchestration) for details and opt-out.
 
@@ -212,12 +213,17 @@ delegation, status checks, replies, or cancellation.
 ### Internal MCP surface (subagent-only)
 
 ```
-copilot({ action: "send",   task, mode?, template?, template_args?, cwd?, thread?, max_wait_sec? })
+copilot({ action: "send",   task, cwd, mode?, template?, template_args?, thread?, max_wait_sec? })
 copilot({ action: "wait",   job_id, max_wait_sec? })
 copilot({ action: "status", job_id?, verbose? })
 copilot({ action: "reply",  job_id, message })
 copilot({ action: "cancel", job_id })
 ```
+
+`cwd` is required on every `send` and must be the absolute target repo or
+worktree path. The bridge, CLI client, and daemon all reject missing `cwd`
+instead of defaulting to their own process working directory; this prevents a
+delegated review from silently running in the companion/plugin checkout.
 
 `send` enqueues the task and returns `status: "still_running"` with a
 `job_id` immediately — the worker runs in the background. The subagent
@@ -226,9 +232,10 @@ a single 20-min cap for all modes, sized to accommodate `/fleet` runs
 that decompose into long-running sub-agents), emitting one short line
 between iterations to reset the host's 600s stream-idle watchdog. The
 underlying daemon caps each Copilot prompt at 25 min (`PROMPT_TIMEOUT_MS`
-in `scripts/copilot-acp-daemon.mjs`); set `MCP_TOOL_TIMEOUT` on the
-subagent's MCP env to ≥22 min so the host's per-tool budget doesn't
-bite first (the shipped templates set `1320000`).
+in `scripts/copilot-acp-daemon.mjs`). Codex callers must set
+`tool_timeout_sec = 1320` on `[mcp_servers.copilot-bridge]`; environment
+variables only reach the server process and do not extend the host's MCP
+tool-call budget. Claude uses the subagent MCP env timeout.
 
 Terminal statuses returned by the bridge: `completed`, `failed`,
 `cancelled`, `stuck` (supervisor trip — model misbehavior), **`timeout`**
@@ -265,13 +272,11 @@ parent agent to track progress without making another bridge round-trip.
 
 ## Thread continuity
 
-Multi-turn Copilot conversations are preserved via subagent resume, not via
-main's state:
+Multi-turn Copilot conversations are preserved differently per host:
 
-1. First send: the subagent calls the bridge with no `thread`. The bridge auto-generates `companion-<jobId>` and returns it in the response.
-2. The subagent emits `MY_THREAD=<value>` as a visible line in its turn, so the handle is preserved in its conversation history.
-3. On follow-up `SendMessage` from main, the subagent auto-resumes with its full prior context, reads `MY_THREAD=` from its own history, and passes it back to the bridge — Copilot resumes the same ACP session.
-4. Main's context only carries the opaque `<agentId>`; it never sees or carries the thread name.
+1. Claude: first send omits `thread`; the bridge auto-generates `companion-<jobId>`, the subagent emits `MY_THREAD=<value>`, and later `SendMessage` resumes the subagent so it can pass that thread back.
+2. Codex: the TOML agent does not emit or parse `MY_THREAD`; the bridge reads Codex's MCP `_meta["x-codex-turn-metadata"].session_id` and persists a host-session-to-thread mapping under `~/.codex/copilot-companion/threads/by-host-session/`.
+3. Main's context only carries the opaque subagent handle; it never needs to carry the thread name.
 
 ### SendMessage invocation form (important)
 
@@ -331,10 +336,10 @@ main decides which to try.
 
 1. **Strict isolation.** The `copilot-bridge` MCP server is bundled with the plugin but the subagent's `tools:` list is the only path through which it's invoked. Main never calls the bridge directly.
 2. **No activation lifecycle.** The bridge is spawned per subagent invocation by Claude Code's plugin MCP machinery. There's nothing to `start`, `stop`, or `pause`.
-3. **Bounded blocking.** `send` returns immediately with `still_running`; each `wait` returns within `max_wait_sec ≤ 1200` (single 20-min cap for all modes). The companion's per-iteration "still running" emission resets Claude Code's 600s stream-idle watchdog; Codex callers raise `tool_timeout_sec` (the shipped TOML template sets `MCP_TOOL_TIMEOUT=1320000`).
+3. **Bounded blocking.** `send` returns immediately with `still_running`; each `wait` returns within `max_wait_sec ≤ 1200` (single 20-min cap for all modes). The companion's per-iteration "still running" emission resets Claude Code's 600s stream-idle watchdog; Codex callers raise `tool_timeout_sec` (the shipped TOML template sets `tool_timeout_sec = 1320`).
 4. **Orphan safety net.** Completion events are appended to `/tmp/copilot-completions.jsonl` with `consumed:false`; wait-terminal responses flip to `consumed:true`; the drain hook surfaces only unconsumed entries.
 5. **Rubber-duck always on.** Appended to every `send` server-side for every template except `plan_review` (which has its own critique instructions baked in). Not in the schema.
-6. **Model is config.** Read from `default-model` at worker start. Never a tool parameter.
+6. **Model is config.** Read from the host-routed `default-model` at worker start; the bridge forwards that value to the daemon so the Copilot process respawns when the configured model changes. Never a user tool parameter.
 7. **Node deps persist, code doesn't.** `bridge-server/node_modules` lives under `${CLAUDE_PLUGIN_DATA}` and survives plugin updates; bundled code under `${CLAUDE_PLUGIN_ROOT}` is re-copied on update.
 
 ## Subagent tool surface
@@ -371,6 +376,7 @@ grep '"event":"bridge.startup"' ~/.codex/copilot-companion/daemon.log
 ## Development
 
 - `node --check` should pass on every `.mjs` after edits.
+- `jq` is required for hook delivery.
 - Tests: `node --test $(find bridge-server lib scripts hooks templates -name '*.test.mjs')`
   — covers `bridge-server/{server,validation}.test.mjs`, `lib/{state,host,log,prompt-inspect,prompt-supervisor,heartbeat}.test.mjs`, `scripts/{copilot-acp-daemon,install-codex-hooks}.test.mjs`, `hooks/drain-completions.test.mjs`, and `templates/copilot-companion.toml.test.mjs`.
 - Validate the Claude plugin manifest: `claude plugin validate .` from the plugin root.

@@ -19,6 +19,10 @@ LOCK="${QUEUE}.lock"
 HEARTBEAT_DIR="${COPILOT_HEARTBEAT_DIR:-/tmp/copilot-companion-heartbeats}"
 
 PAYLOAD=$(cat)
+if ! command -v jq >/dev/null 2>&1; then
+  echo "copilot-companion: jq not found; cannot drain completion queue" >&2
+  exit 0
+fi
 HOOK_EVENT=$(printf '%s' "$PAYLOAD" | jq -r '.hook_event_name // "PostToolUse"')
 MY_SID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty')
 

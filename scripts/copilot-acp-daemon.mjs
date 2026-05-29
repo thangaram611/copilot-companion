@@ -13,6 +13,7 @@ import { createServer, connect as connectSocket } from 'node:net';
 import { appendFileSync, statSync, unlinkSync, renameSync, writeFileSync, existsSync, readFileSync, chmodSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { isAbsolute } from 'node:path';
 import { Supervisor, pollSupervisor } from '../lib/prompt-supervisor.mjs';
 import {
   parseJsonlEvents,
@@ -20,6 +21,7 @@ import {
   buildPromptInspection,
 } from '../lib/prompt-inspect.mjs';
 import { selectLiveHeartbeat } from '../lib/heartbeat.mjs';
+import { readDefaultModel } from '../lib/state.mjs';
 
 // --- Constants ---------------------------------------------------------------
 
@@ -47,7 +49,8 @@ const COPILOT_BIN = (() => {
 const SOCKET_PATH = '/tmp/copilot-acp.sock';
 const LOG_FILE = '/tmp/copilot-acp-daemon.log';
 const LOG_MAX_BYTES = 1024 * 1024; // 1 MB
-const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — safely above the 10-min prompt cap
+const PRIVATE_FILE_MODE = 0o600;
+const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
 
 // Heartbeat-driven liveness extension. Claude/Codex hooks touch a per-host-sid
 // file in HEARTBEAT_DIR on every tool turn (PostToolUse / UserPromptSubmit /
@@ -65,6 +68,8 @@ const PROMPT_RETENTION_MS = 60 * 60 * 1000; // retain terminal prompts for inspe
 const SPAWN_INIT_TIMEOUT_MS = 30 * 1000; // 30s for handshake
 const SILENCE_CHECK_INTERVAL_MS = 10 * 1000; // 10s — silence heuristic
 const MAX_LONG_POLL_WAIT_MS = 22 * 60 * 1000; // 22 min — caller-requested wait cap (must be <= PROMPT_TIMEOUT_MS)
+const PROMPT_TIMEOUT_ERROR = 'prompt timeout';
+const EMPTY_COMPLETED_ERROR = 'empty completed response';
 // replyPrompt must wait for the cancelled prompt to reach a TERMINAL_STATUSES
 // state before re-entering startPromptBg, otherwise the prior collector still
 // owns `sessionCollectors[sessionId]` and would be overwritten by the
@@ -87,34 +92,46 @@ export const REPLY_DRAIN_TIMEOUT_MS = 10 * 1000;
 // access is missing the flag is silently inert, no error.
 const COPILOT_DEFAULT_MODEL = 'gpt-5.5';
 
-// Read the effective model once at daemon boot. If the user updates
-// ~/.claude/copilot-companion/default-model they must restart the daemon
-// for the change to take effect — `/copilot model <id>` automates the
-// restart.  We capture the value here so the daemon reports it back to
-// the bridge on every prompt response and inconsistencies surface loudly.
+// Read the host-routed effective model. lib/state.mjs chooses
+// ~/.claude/copilot-companion or ~/.codex/copilot-companion from
+// COPILOT_COMPANION_HOST, so Codex and Claude config stay separate.
 function readConfiguredModel() {
   try {
-    const home = process.env.HOME || '';
-    const path = `${home}/.claude/copilot-companion/default-model`;
-    if (existsSync(path)) {
-      const v = readFileSync(path, 'utf8').trim();
-      if (v) return v;
-    }
+    const { model } = readDefaultModel();
+    if (model) return model;
   } catch {}
   return COPILOT_DEFAULT_MODEL;
 }
-const ACTIVE_MODEL = readConfiguredModel();
 
-const COPILOT_FLAGS = [
-  '--acp',
-  '--model', ACTIVE_MODEL,
-  '--reasoning-effort', 'xhigh',
-  '--no-ask-user',
-  '--allow-all-tools',
-  '--allow-all-paths',
-  '--allow-all-urls',
-  '--experimental',
-];
+function normalizeModel(model) {
+  const clean = String(model || '').trim();
+  return clean || readConfiguredModel();
+}
+
+function isBlankText(value) {
+  return typeof value !== 'string' || value.trim().length === 0;
+}
+
+function isEmptyCompletedResult(result) {
+  if (!result || typeof result !== 'object') return true;
+  return isBlankText(result.message) &&
+    isBlankText(result.thoughts) &&
+    (!Array.isArray(result.toolCalls) || result.toolCalls.length === 0) &&
+    !result.plan;
+}
+
+function buildCopilotFlags(model) {
+  return [
+    '--acp',
+    '--model', normalizeModel(model),
+    '--reasoning-effort', 'xhigh',
+    '--no-ask-user',
+    '--allow-all-tools',
+    '--allow-all-paths',
+    '--allow-all-urls',
+    '--experimental',
+  ];
+}
 
 // --- Logger ------------------------------------------------------------------
 //
@@ -128,20 +145,58 @@ const LOG_LEVEL = (process.env.COPILOT_DAEMON_LOG_LEVEL || 'INFO').toUpperCase()
 const LOG_LEVEL_RANK = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40, FATAL: 50 };
 const LOG_THRESHOLD = LOG_LEVEL_RANK[LOG_LEVEL] ?? LOG_LEVEL_RANK.INFO;
 
+function chmodPrivate(path) {
+  try { chmodSync(path, PRIVATE_FILE_MODE); } catch {}
+}
+
+function writePrivateFile(path, content) {
+  writeFileSync(path, content, { mode: PRIVATE_FILE_MODE });
+  chmodPrivate(path);
+}
+
+function appendPrivateFile(path, content) {
+  appendFileSync(path, content, { mode: PRIVATE_FILE_MODE });
+  chmodPrivate(path);
+}
+
 function log(level, ...args) {
   // Always write WARN/ERROR/FATAL and any non-standard level (e.g. COPILOT_STDERR).
   const rank = LOG_LEVEL_RANK[level];
   if (rank !== undefined && rank < LOG_THRESHOLD) return;
   try {
     if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > LOG_MAX_BYTES) {
-      writeFileSync(LOG_FILE, '');
+      writePrivateFile(LOG_FILE, '');
     }
     const ts = new Date().toISOString();
     const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-    appendFileSync(LOG_FILE, `${ts} [${level}] ${msg}\n`);
+    appendPrivateFile(LOG_FILE, `${ts} [${level}] ${msg}\n`);
   } catch {
     // best-effort logging
   }
+}
+
+function canonicalCwd(cwd) {
+  if (!cwd) return null;
+  try { return realpathSync(cwd); }
+  catch { return String(cwd); }
+}
+
+function requireAbsoluteDirectoryCwd(cwd, label = 'cwd') {
+  if (typeof cwd !== 'string' || cwd.trim() === '') {
+    throw new Error(`${label} is required (absolute target repo/worktree path; refusing to default to process.cwd())`);
+  }
+  if (!isAbsolute(cwd)) throw new Error(`${label} must be absolute: ${cwd}`);
+  let st;
+  try { st = statSync(cwd); }
+  catch { throw new Error(`${label} must exist as a directory: ${cwd}`); }
+  if (!st.isDirectory()) throw new Error(`${label} must be a directory: ${cwd}`);
+  return cwd;
+}
+
+function sameCwd(a, b) {
+  const ca = canonicalCwd(a);
+  const cb = canonicalCwd(b);
+  return !!ca && !!cb && ca === cb;
 }
 
 // Log the full Copilot argv exactly once per daemon boot. Subsequent spawns
@@ -208,8 +263,13 @@ class AcpConnection {
     return this.child !== null && !this.dead && this.child.exitCode === null;
   }
 
-  async spawn(cwd) {
-    logSpawn(COPILOT_BIN, COPILOT_FLAGS);
+  async spawn(cwd, model = null) {
+    this.cwd = requireAbsoluteDirectoryCwd(cwd, 'spawn cwd');
+    this.cwdReal = canonicalCwd(this.cwd);
+    this.model = normalizeModel(model);
+    const flags = buildCopilotFlags(this.model);
+    logSpawn(COPILOT_BIN, flags);
+    log('INFO', `copilot process cwd=${this.cwd} model=${this.model}`);
     const OTEL_TRACES_PATH = '/tmp/copilot-otel-traces.jsonl';
     // Rotate OTel traces file if it exceeds 1 MB (same threshold as daemon log).
     try {
@@ -220,8 +280,8 @@ class AcpConnection {
       }
     } catch { /* best-effort rotation */ }
 
-    this.child = spawn(COPILOT_BIN, COPILOT_FLAGS, {
-      cwd,
+    this.child = spawn(COPILOT_BIN, flags, {
+      cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
@@ -478,7 +538,7 @@ class AcpConnection {
         reject,
         timer: setTimeout(() => {
           this.sessionCollectors.delete(sessionId);
-          reject(new Error('prompt timeout'));
+          reject(new Error(PROMPT_TIMEOUT_ERROR));
         }, PROMPT_TIMEOUT_MS),
       };
       this.sessionCollectors.set(sessionId, collector);
@@ -565,6 +625,7 @@ class SessionManager {
   constructor() {
     this.connection = null;
     this.sessions = new Map(); // sessionId -> { cwd, promptCount, createdAt }
+    this._sessionMutation = Promise.resolve();
     // promptId -> {
     //   sessionId, cwd, eventsFile, status, summary, error, stuckReason,
     //   stuckDetail, startedAt, terminalAt, retentionExpiresAt,
@@ -601,12 +662,41 @@ class SessionManager {
     }
   }
 
+  async _withSessionMutation(fn) {
+    const prior = this._sessionMutation.catch(() => {});
+    let release;
+    this._sessionMutation = new Promise((resolve) => { release = resolve; });
+    await prior;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  _activePromptForCwdSwitch() {
+    for (const state of this.inFlightPrompts.values()) {
+      if (!TERMINAL_STATUSES.has(state.status)) return state;
+    }
+    return null;
+  }
+
   _markTerminalState(state, patch = {}) {
     const terminalAt = patch.terminalAt || Date.now();
     Object.assign(state, patch, {
       terminalAt,
       retentionExpiresAt: terminalAt + PROMPT_RETENTION_MS,
     });
+  }
+
+  retireSession(sessionId, reason) {
+    if (!sessionId) return false;
+    const existed = this.sessions.delete(sessionId);
+    if (this.connection && this.connection.isAlive()) {
+      try { this.connection.cancelSession(sessionId); } catch {}
+    }
+    log('WARN', 'session retired:', `sessionId=${sessionId} reason=${reason} existed=${existed}`);
+    return existed;
   }
 
   _gcExpiredPrompts(now = Date.now()) {
@@ -660,7 +750,7 @@ class SessionManager {
     const alert = { reason, tier, ts };
     state._lastAlertTs = ts;
     try {
-      appendFileSync(state.eventsFile, JSON.stringify({ type: 'alert', ...alert }) + '\n');
+      appendPrivateFile(state.eventsFile, JSON.stringify({ type: 'alert', ...alert }) + '\n');
     } catch (err) {
       log('WARN', 'failed to write alert event:', err.message);
     }
@@ -760,7 +850,7 @@ class SessionManager {
     log('WARN', 'prompt stuck:', state.promptId || '?', reason + detail, autoCancelOk ? '(cancelling)' : '(no-cancel)');
     try {
       const line = JSON.stringify({ type: 'stuck', reason, ts: Date.now() }) + '\n';
-      appendFileSync(state.eventsFile, line);
+      appendPrivateFile(state.eventsFile, line);
     } catch (err) {
       log('WARN', 'failed to write stuck event:', err.message);
     }
@@ -770,16 +860,48 @@ class SessionManager {
     this._drainTerminalWaiters(state);
   }
 
-  async ensureConnection(cwd) {
+  async ensureConnection(cwd, model = null) {
+    const requestedCwd = requireAbsoluteDirectoryCwd(cwd, 'session cwd');
+    const requestedReal = canonicalCwd(requestedCwd);
+    const requestedModel = normalizeModel(model);
     if (this.connection && this.connection.isAlive() && this.connection.initialized) {
-      return this.connection;
+      const currentReal = this.connection.cwdReal || canonicalCwd(this.connection.cwd);
+      const currentModel = this.connection.model || readConfiguredModel();
+      if ((!currentReal || currentReal === requestedReal) && currentModel === requestedModel) return this.connection;
+
+      const active = this._activePromptForCwdSwitch();
+      if (active) {
+        const modelMismatch = currentModel !== requestedModel;
+        const err = new Error(
+          modelMismatch
+            ? `cannot switch Copilot model from ${currentModel || '(unknown)'} to ${requestedModel}: ` +
+              `prompt ${active.promptId} is still ${active.status}`
+            : `cannot switch Copilot cwd from ${this.connection.cwd || '(unknown)'} to ${requestedCwd}: ` +
+          `prompt ${active.promptId} is still ${active.status}`,
+        );
+        err.code = modelMismatch ? 'MODEL_BUSY' : 'CWD_BUSY';
+        err.existingPromptId = active.promptId;
+        err.sessionId = active.sessionId;
+        throw err;
+      }
+
+      log('INFO', `connection config changed: respawning Copilot (` +
+        `cwd ${this.connection.cwd || '(unknown)'} -> ${requestedCwd}, ` +
+        `model ${currentModel || '(unknown)'} -> ${requestedModel})`);
+      this.connection.kill();
+      this.connection = null;
+      if (this.sessions.size > 0) {
+        log('INFO', `connection config change: invalidating ${this.sessions.size} stale session(s)`);
+        this.sessions.clear();
+      }
     }
     // Memoize the in-flight spawn so parallel callers don't race to spawn
     // multiple Copilot subprocesses (which would cause "Session not found"
     // errors when sessions registered on orphaned subprocesses are later used
     // via the surviving `this.connection` reference).
     if (this._pendingConnection) {
-      return this._pendingConnection;
+      await this._pendingConnection;
+      return this.ensureConnection(requestedCwd, requestedModel);
     }
     this._pendingConnection = (async () => {
       try {
@@ -801,7 +923,7 @@ class SessionManager {
           }
         }
         const conn = new AcpConnection();
-        await conn.spawn(cwd);
+        await conn.spawn(requestedCwd, requestedModel);
         await conn.initialize();
         this.connection = conn;
         this._resetInactivityTimer();
@@ -813,17 +935,29 @@ class SessionManager {
     return this._pendingConnection;
   }
 
-  async startSession(cwd) {
-    const conn = await this.ensureConnection(cwd);
-    const sessionId = await conn.createSession(cwd);
-    this.sessions.set(sessionId, { cwd, promptCount: 0, createdAt: Date.now() });
+  async _startSessionUnlocked(cwd, model = null) {
+    const requestedCwd = requireAbsoluteDirectoryCwd(cwd, 'session cwd');
+    const requestedModel = normalizeModel(model);
+    const conn = await this.ensureConnection(requestedCwd, requestedModel);
+    const sessionId = await conn.createSession(requestedCwd);
+    this.sessions.set(sessionId, {
+      cwd: requestedCwd,
+      cwdReal: canonicalCwd(requestedCwd),
+      model: requestedModel,
+      promptCount: 0,
+      createdAt: Date.now(),
+    });
     // Echo the resolved cwd into the daemon log so post-mortems can
     // confirm Copilot rooted where the bridge intended. ACP's session/new
     // accepts cwd silently and gives no read-back, so a daemon-side log
     // line is the only observable signal that the value was honored.
-    log('INFO', `session/new cwd=${cwd || '(none)'} sessionId=${sessionId}`);
+    log('INFO', `session/new cwd=${requestedCwd || '(none)'} model=${requestedModel} sessionId=${sessionId}`);
     this._resetInactivityTimer();
     return sessionId;
+  }
+
+  async startSession(cwd, model = null) {
+    return this._withSessionMutation(() => this._startSessionUnlocked(cwd, model));
   }
 
   // v6.1 C1: SessionManager.sendPrompt (blocking) and the matching IPC
@@ -866,7 +1000,7 @@ class SessionManager {
     const eventsFile = eventsFilePath(promptId);
     const sessionMeta = this.sessions.get(sessionId);
     // Reset / create the file
-    writeFileSync(eventsFile, '');
+    writePrivateFile(eventsFile, '');
 
     const state = {
       promptId,
@@ -891,7 +1025,7 @@ class SessionManager {
     const writeEvent = (event) => {
       try {
         const line = JSON.stringify({ ...event, ts: Date.now() }) + '\n';
-        appendFileSync(eventsFile, line);
+        appendPrivateFile(eventsFile, line);
         state.lastEventAt = Date.now();
       } catch (err) {
         log('WARN', 'failed to write event:', err.message);
@@ -926,11 +1060,22 @@ class SessionManager {
         // cancelSession). If so, don't overwrite the status — but DO drain
         // any waiters that registered after the stuck transition.
         if (state.status === 'running') {
-          this._markTerminalState(state, {
-            status: 'completed',
-            summary: result,
-          });
-          writeEvent({ type: 'done', stopReason: result?.stopReason || 'end_turn', summary: result });
+          if (isEmptyCompletedResult(result)) {
+            this.retireSession(sessionId, 'empty_completed');
+            this._markTerminalState(state, {
+              status: 'failed',
+              error: EMPTY_COMPLETED_ERROR,
+              stuckDetail: 'empty_completed',
+              sessionRetired: true,
+            });
+            writeEvent({ type: 'error', error: EMPTY_COMPLETED_ERROR, detail: 'empty_completed' });
+          } else {
+            this._markTerminalState(state, {
+              status: 'completed',
+              summary: result,
+            });
+            writeEvent({ type: 'done', stopReason: result?.stopReason || 'end_turn', summary: result });
+          }
         } else if (state.status === 'cancelling') {
           this._markTerminalState(state, { status: 'cancelled' });
           writeEvent({ type: 'cancelled', stopReason: result?.stopReason || 'cancelled' });
@@ -943,11 +1088,21 @@ class SessionManager {
       })
       .catch((err) => {
         if (state.status === 'running') {
+          const promptTimedOut = err?.message === PROMPT_TIMEOUT_ERROR;
+          if (promptTimedOut) this.retireSession(sessionId, 'prompt_timeout');
           this._markTerminalState(state, {
             status: 'failed',
             error: err.message,
+            sessionRetired: promptTimedOut,
           });
-          writeEvent({ type: 'error', error: err.message });
+          writeEvent({ type: 'error', error: err.message, detail: promptTimedOut ? 'prompt_timeout' : undefined });
+        } else if (state.status === 'cancelling') {
+          this._markTerminalState(state, {
+            status: 'cancelled',
+            error: null,
+            stuckDetail: err.message,
+          });
+          writeEvent({ type: 'cancelled', stopReason: 'cancelled', detail: err.message });
         }
         this._resetInactivityTimer();
         this._drainTerminalWaiters(state);
@@ -1001,11 +1156,13 @@ class SessionManager {
     // Build the response. Re-read the events file lazily — even on the long-poll
     // path, the caller may want to see new events that arrived during the wait.
     let lines = [];
-    try {
-      const content = readFileSync(state.eventsFile, 'utf8');
-      lines = content.split('\n').filter((l) => l.trim().length > 0);
-    } catch (err) {
-      log('WARN', 'failed to read events file:', err.message);
+    if (!opts.summaryOnly) {
+      try {
+        const content = readFileSync(state.eventsFile, 'utf8');
+        lines = content.split('\n').filter((l) => l.trim().length > 0);
+      } catch (err) {
+        log('WARN', 'failed to read events file:', err.message);
+      }
     }
 
     const baseResponse = {
@@ -1028,6 +1185,7 @@ class SessionManager {
       // should re-call watch to continue waiting for terminal.
       interim: interimAlert ? true : false,
       alert: interimAlert,
+      sessionRetired: !!state.sessionRetired,
     };
 
     if (opts.summaryOnly) {
@@ -1079,6 +1237,7 @@ class SessionManager {
         retentionExpiresAt: state.retentionExpiresAt || null,
         stuckReason: state.stuckReason || null,
         stuckDetail: state.stuckDetail || null,
+        sessionRetired: !!state.sessionRetired,
       },
       events,
       {
@@ -1197,9 +1356,13 @@ class SessionManager {
       connected: this.connection?.isAlive() ?? false,
       initialized: this.connection?.initialized ?? false,
       pid: this.connection?.child?.pid ?? null,
+      connectionCwd: this.connection?.cwd ?? null,
+      activeModel: this.connection?.model ?? null,
+      configuredModel: readConfiguredModel(),
       sessions: Array.from(this.sessions.entries()).map(([sid, meta]) => ({
         sessionId: sid,
         cwd: meta.cwd,
+        model: meta.model || null,
         promptCount: meta.promptCount,
         createdAt: meta.createdAt,
       })),
@@ -1411,58 +1574,78 @@ class IpcServer {
     log('DEBUG', 'dispatch:', msg.command, msg.reqId ? `req=${msg.reqId}` : '');
     switch (msg.command) {
       case 'prompt-bg': {
-        // Start a session if no sessionId given (auto mode), then fire prompt
-        // in background and return immediately with promptId.
-        //
-        // Rebirth: if the caller supplied a sessionId but either (a) the
-        // underlying Copilot subprocess is dead (so `this.connection` is null
-        // or its child has exited) or (b) the sid is unknown to this daemon
-        // (different daemon instance, sid GC'd, etc), the sid is stale —
-        // a fresh Copilot child won't recognize it and startPromptBg would
-        // throw 'no active connection — call start first' or 'unknown
-        // sessionId'. Drop the stale sid, mint a fresh session, and surface
-        // sessionReborn:true so the bridge can warn the parent that
-        // in-process conversation context was lost (Copilot's ACP
-        // session/load is process-local — github/copilot-cli#1767 — so
-        // cross-process resume isn't possible at the protocol layer).
-        let sessionId = msg.sessionId;
-        let sessionReborn = false;
-        if (sessionId) {
-          const conn = this.manager.connection;
-          const connAlive = !!(conn && conn.isAlive() && conn.initialized);
-          const sidKnown = this.manager.sessions.has(sessionId);
-          if (!connAlive || !sidKnown) {
-            log('WARN', `prompt-bg: stale sessionId ${sessionId} (connAlive=${connAlive} sidKnown=${sidKnown}) — minting fresh session`);
-            // Belt-and-suspenders with ensureConnection's session wipe: if the
-            // entry survived (e.g., connAlive=true but sidKnown=false reached
-            // here by a different path), evict it so no subsequent caller can
-            // mistake it for a live session and bypass this guard.
-            this.manager.sessions.delete(sessionId);
-            sessionId = null;
-            sessionReborn = true;
+        return this.manager._withSessionMutation(async () => {
+          // Start a session if no sessionId given (auto mode), then register
+          // the prompt before releasing the session/connection lock. This
+          // closes the cold-start race where a different-cwd caller could kill
+          // the process between session/new and startPromptBg.
+          let sessionId = msg.sessionId;
+          let sessionReborn = false;
+          let requestedCwd;
+          try {
+            requestedCwd = requireAbsoluteDirectoryCwd(msg.cwd, 'prompt-bg cwd');
+          } catch (err) {
+            return { ok: false, code: 'CWD_REQUIRED', error: err.message };
           }
-        }
-        if (!sessionId) {
-          sessionId = await this.manager.startSession(msg.cwd || process.cwd());
-        }
-        try {
-          const data = await this.manager.startPromptBg(sessionId, msg.text);
-          return { ok: true, data: { ...data, activeModel: ACTIVE_MODEL, sessionReborn } };
-        } catch (err) {
-          if (err && err.code === 'SESSION_BUSY') {
-            log('WARN', 'prompt-bg refused (session busy):', `sid=${err.sessionId} existing=${err.existingPromptId}`);
-            return {
-              ok: false,
-              code: 'SESSION_BUSY',
-              error: err.message,
-              data: {
-                existingPromptId: err.existingPromptId,
-                sessionId: err.sessionId,
-              },
-            };
+          const requestedModel = normalizeModel(msg.model);
+          if (sessionId) {
+            const conn = this.manager.connection;
+            const connAlive = !!(conn && conn.isAlive() && conn.initialized);
+            const sidKnown = this.manager.sessions.has(sessionId);
+            if (!connAlive || !sidKnown) {
+              log('WARN', `prompt-bg: stale sessionId ${sessionId} (connAlive=${connAlive} sidKnown=${sidKnown}) — minting fresh session`);
+              this.manager.sessions.delete(sessionId);
+              sessionId = null;
+              sessionReborn = true;
+            } else {
+              const meta = this.manager.sessions.get(sessionId);
+              const cwdMismatch = meta?.cwd && !sameCwd(meta.cwd, requestedCwd);
+              const modelMismatch = meta?.model && meta.model !== requestedModel;
+              if (cwdMismatch || modelMismatch) {
+                const activeForSession = [...this.manager.inFlightPrompts.values()]
+                  .find((state) => state.sessionId === sessionId && !TERMINAL_STATUSES.has(state.status));
+                if (activeForSession) {
+                  const code = modelMismatch ? 'MODEL_BUSY' : 'SESSION_BUSY';
+                  return {
+                    ok: false,
+                    code,
+                    error: `session ${modelMismatch ? 'model' : 'cwd'} switch blocked: prompt ${activeForSession.promptId} is still ${activeForSession.status}`,
+                    data: {
+                      existingPromptId: activeForSession.promptId,
+                      sessionId,
+                    },
+                  };
+                }
+                log('WARN', `prompt-bg: session config changed for ${sessionId} ` +
+                  `(cwd ${meta?.cwd || '(unknown)'} -> ${requestedCwd}, model ${meta?.model || '(unknown)'} -> ${requestedModel}) — minting fresh session`);
+                this.manager.sessions.delete(sessionId);
+                sessionId = null;
+                sessionReborn = true;
+              }
+            }
           }
-          throw err;
-        }
+          try {
+            if (!sessionId) {
+              sessionId = await this.manager._startSessionUnlocked(requestedCwd, requestedModel);
+            }
+            const data = await this.manager.startPromptBg(sessionId, msg.text);
+            return { ok: true, data: { ...data, activeModel: this.manager.connection?.model || requestedModel, sessionReborn } };
+          } catch (err) {
+            if (err && ['SESSION_BUSY', 'CWD_BUSY', 'MODEL_BUSY'].includes(err.code)) {
+              log('WARN', 'prompt-bg refused:', `code=${err.code} sid=${err.sessionId} existing=${err.existingPromptId}`);
+              return {
+                ok: false,
+                code: err.code,
+                error: err.message,
+                data: {
+                  existingPromptId: err.existingPromptId,
+                  sessionId: err.sessionId,
+                },
+              };
+            }
+            throw err;
+          }
+        });
       }
       case 'watch': {
         const data = await this.manager.watchPrompt(msg.promptId, msg.since || 0, {

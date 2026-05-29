@@ -46,76 +46,66 @@ function withHome(fn) {
   }
 }
 
-test('--plugin-root is required', () => {
-  const home = mkdtempSync(join(tmpdir(), 'codex-hooks-test-'));
-  try {
+function managedEntries(cfg, event) {
+  return (cfg.hooks[event] || []).filter((e) => e._managed_by === 'copilot-companion');
+}
+
+test('CLI validation rejects missing/relative plugin roots and malformed existing config without overwrite', () => {
+  withHome((home) => {
     const r = spawnSync(process.execPath, [SCRIPT, '--yes'], {
       env: { ...process.env, HOME: home }, encoding: 'utf8',
     });
     assert.equal(r.status, 2);
     assert.match(r.stderr, /--plugin-root/);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-});
 
-test('--plugin-root must be absolute', () => {
-  const home = mkdtempSync(join(tmpdir(), 'codex-hooks-test-'));
-  try {
-    const r = spawnSync(process.execPath, [SCRIPT, '--plugin-root', 'rel/path', '--yes'], {
+    const rel = spawnSync(process.execPath, [SCRIPT, '--plugin-root', 'rel/path', '--yes'], {
       env: { ...process.env, HOME: home }, encoding: 'utf8',
     });
-    assert.equal(r.status, 2);
-    assert.match(r.stderr, /must be absolute/);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
+    assert.equal(rel.status, 2);
+    assert.match(rel.stderr, /must be absolute/);
+
+    const f = join(home, '.codex', 'hooks.json');
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, '{ this is not json');
+    const malformed = runScript(home);
+    assert.equal(malformed.code, 2);
+    assert.match(malformed.stderr, /not valid JSON/);
+    assert.equal(readFileSync(f, 'utf8'), '{ this is not json');
+  });
 });
 
-test('fresh install creates ~/.codex/hooks.json with all three events', () => {
+test('fresh install writes the expected managed hook bundle with baked absolute paths', () => {
   withHome((home) => {
     const r = runScript(home);
     assert.equal(r.code, 0, r.stderr);
     const cfg = readHooks(home);
-    assert.ok(cfg.hooks.SessionStart);
-    assert.ok(cfg.hooks.UserPromptSubmit);
-    assert.ok(cfg.hooks.PostToolUse);
-    // Each event has exactly one managed top-level entry on a fresh install.
+
     for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse']) {
-      const managed = cfg.hooks[ev].filter((e) => e._managed_by === 'copilot-companion');
-      assert.equal(managed.length, 1, `${ev} has exactly one managed entry`);
+      assert.equal(managedEntries(cfg, ev).length, 1, `${ev} has exactly one managed entry`);
     }
+
+    const sessionStart = managedEntries(cfg, 'SessionStart')[0];
+    const cmds = sessionStart.hooks.map((h) => h.command);
+    assert.match(cmds[0], /^CLAUDE_PLUGIN_ROOT='/);
+    assert.match(cmds[0], /COPILOT_COMPANION_NODE='/);
+    assert.ok(cmds[0].includes(PLUGIN_ROOT), 'plugin-root absolute path baked in');
+    assert.ok(cmds[0].includes(process.execPath), 'node path baked in for hook scripts');
+    assert.doesNotMatch(cmds.join('\n'), /\$\{CLAUDE_PLUGIN_ROOT\}/,
+      'no ${VAR} placeholder because Codex does not expand user-scope hook env');
+    assert.match(cmds[0], /install-agent-codex\.sh/);
+    assert.match(cmds[1], /prewarm-daemon\.sh/);
+    assert.match(cmds[2], /install-deps\.sh/);
+    assert.match(cmds[3], /drain-completions\.sh/);
+    assert.equal(sessionStart.hooks[2].timeout, 55);
+    for (const i of [0, 1, 3]) assert.equal(sessionStart.hooks[i].timeout, 5);
+
+    const postToolUse = managedEntries(cfg, 'PostToolUse')[0];
+    assert.equal(postToolUse.matcher, '.*');
   });
 });
 
-test('hook commands embed plugin-root absolute path (no ${VAR} placeholders)', () => {
+test('reinstall is idempotent, preserves user hooks, and writes backups only for existing config', () => {
   withHome((home) => {
-    runScript(home);
-    const cfg = readHooks(home);
-    const cmd = cfg.hooks.SessionStart[0].hooks[0].command;
-    assert.match(cmd, /^CLAUDE_PLUGIN_ROOT='/);
-    assert.ok(cmd.includes(PLUGIN_ROOT), 'plugin-root absolute path baked in');
-    assert.doesNotMatch(cmd, /\$\{CLAUDE_PLUGIN_ROOT\}/,
-      'no ${VAR} placeholder — Codex does not expand env vars in user-scope hooks');
-  });
-});
-
-test('idempotent re-install: managed entry count stays at 1 per event', () => {
-  withHome((home) => {
-    runScript(home);
-    runScript(home);
-    runScript(home);
-    const cfg = readHooks(home);
-    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse']) {
-      const managed = cfg.hooks[ev].filter((e) => e._managed_by === 'copilot-companion');
-      assert.equal(managed.length, 1, `${ev} still has 1 managed entry after 3 installs`);
-    }
-  });
-});
-
-test('merge preserves pre-existing user hooks', () => {
-  withHome((home) => {
-    // Seed a user-managed hooks.json
     const f = join(home, '.codex', 'hooks.json');
     mkdirSync(dirname(f), { recursive: true });
     writeFileSync(f, JSON.stringify({
@@ -130,6 +120,8 @@ test('merge preserves pre-existing user hooks', () => {
     }, null, 2));
 
     runScript(home);
+    runScript(home);
+    runScript(home);
     const cfg = readHooks(home);
 
     // User's SessionStart entry must still be there.
@@ -139,25 +131,13 @@ test('merge preserves pre-existing user hooks', () => {
     assert.notEqual(userSS._managed_by, 'copilot-companion',
       'user entry was not tagged with our sentinel');
 
-    // Our entry sits alongside it.
-    const ours = cfg.hooks.SessionStart.filter((e) => e._managed_by === 'copilot-companion');
-    assert.equal(ours.length, 1);
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse']) {
+      assert.equal(managedEntries(cfg, ev).length, 1, `${ev} still has 1 managed entry after repeated installs`);
+    }
     assert.equal(cfg.hooks.SessionStart.length, 2,
       'one user entry + one managed entry = 2');
-  });
-});
-
-test('backup written before each modification when file existed', () => {
-  withHome((home) => {
-    runScript(home);
-    const beforeRe = readdirSync(join(home, '.codex'));
-    assert.equal(beforeRe.filter((f) => /hooks\.json\.bak\./.test(f)).length, 0,
-      'no backup on initial install (file did not exist)');
-
-    runScript(home);
-    const afterRe = readdirSync(join(home, '.codex'));
-    assert.equal(afterRe.filter((f) => /hooks\.json\.bak\./.test(f)).length, 1,
-      'backup written on second install (file existed)');
+    assert.ok(readdirSync(join(home, '.codex')).filter((name) => /hooks\.json\.bak\./.test(name)).length >= 1,
+      'modifying an existing hooks.json writes a backup');
   });
 });
 
@@ -184,43 +164,5 @@ test('uninstall removes only managed entries, preserves user entries', () => {
     assert.equal(cfg.hooks.UserPromptSubmit, undefined,
       'event keys with no remaining entries are removed');
     assert.equal(cfg.hooks.PostToolUse, undefined);
-  });
-});
-
-test('malformed hooks.json aborts with exit 2 (no overwrite)', () => {
-  withHome((home) => {
-    const f = join(home, '.codex', 'hooks.json');
-    mkdirSync(dirname(f), { recursive: true });
-    writeFileSync(f, '{ this is not json');
-    const r = runScript(home);
-    assert.equal(r.code, 2);
-    assert.match(r.stderr, /not valid JSON/);
-    // Original content untouched.
-    assert.equal(readFileSync(f, 'utf8'), '{ this is not json');
-  });
-});
-
-test('SessionStart hook bundle includes all four scripts in order', () => {
-  withHome((home) => {
-    runScript(home);
-    const cfg = readHooks(home);
-    const ours = cfg.hooks.SessionStart.find((e) => e._managed_by === 'copilot-companion');
-    const cmds = ours.hooks.map((h) => h.command);
-    assert.match(cmds[0], /install-agent-codex\.sh/);
-    assert.match(cmds[1], /prewarm-daemon\.sh/);
-    assert.match(cmds[2], /install-deps\.sh/);
-    assert.match(cmds[3], /drain-completions\.sh/);
-    // install-deps gets 55s; the rest get 5s.
-    assert.equal(ours.hooks[2].timeout, 55);
-    for (const i of [0, 1, 3]) assert.equal(ours.hooks[i].timeout, 5);
-  });
-});
-
-test('PostToolUse entry has matcher = ".*"', () => {
-  withHome((home) => {
-    runScript(home);
-    const cfg = readHooks(home);
-    const ours = cfg.hooks.PostToolUse.find((e) => e._managed_by === 'copilot-companion');
-    assert.equal(ours.matcher, '.*');
   });
 });

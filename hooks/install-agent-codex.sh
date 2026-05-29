@@ -102,10 +102,11 @@ fi
 # on PATH.
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
+SED_ROOT="$(printf '%s' "$ROOT" | sed 's/[\/&|]/\\&/g')"
 
 {
   printf '%s\n' "$SENTINEL"
-  sed "s|\${CLAUDE_PLUGIN_ROOT}|$ROOT|g" "$TEMPLATE"
+  sed "s|\${CLAUDE_PLUGIN_ROOT}|$SED_ROOT|g" "$TEMPLATE"
 } > "$TMP"
 
 if [ -n "$NODE_BIN" ]; then
@@ -113,7 +114,8 @@ if [ -n "$NODE_BIN" ]; then
   # surrounding whitespace) to avoid touching other literals and to be a
   # no-op if the template ever switches to an absolute path.
   NODE_TMP="$(mktemp)"
-  sed "s|^\([[:space:]]*command[[:space:]]*=[[:space:]]*\)\"node\"[[:space:]]*$|\1\"${NODE_BIN}\"|" "$TMP" > "$NODE_TMP" \
+  SED_NODE_BIN="$(printf '%s' "$NODE_BIN" | sed 's/[\/&|]/\\&/g')"
+  sed "s|^\([[:space:]]*command[[:space:]]*=[[:space:]]*\)\"node\"[[:space:]]*$|\1\"${SED_NODE_BIN}\"|" "$TMP" > "$NODE_TMP" \
     && mv "$NODE_TMP" "$TMP"
 fi
 
