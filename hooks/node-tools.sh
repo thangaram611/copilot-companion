@@ -9,7 +9,7 @@ _cc_validate_node() {
   local candidate="$1"
   [ -n "$candidate" ] && [ -x "$candidate" ] || return 1
   env -i HOME="$HOME" PATH=/usr/bin:/bin \
-    "$candidate" -e 'console.log(process.execPath)' 2>/dev/null
+    "$candidate" -e 'const major=Number(process.versions.node.split(".")[0]); if (major < 22) process.exit(1); console.log(process.execPath)' 2>/dev/null
 }
 
 resolve_node() {

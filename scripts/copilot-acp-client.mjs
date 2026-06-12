@@ -10,7 +10,8 @@ import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, isAbsolute, resolve as pathResolve } from 'node:path';
 
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
+import { daemonSocketPath } from '../lib/runtime-paths.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DAEMON_PATH = pathResolve(__dirname, 'copilot-acp-daemon.mjs');
 const DAEMON_BOOT_TIMEOUT_MS = 8_000;
@@ -21,7 +22,7 @@ const MAX_LONG_POLL_WAIT_SEC = 22 * 60;
 
 function sendToSocket(message, timeoutMs = REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const sock = connectSocket(SOCKET_PATH);
+    const sock = connectSocket(daemonSocketPath());
     let buf = '';
     const timer = setTimeout(() => {
       sock.destroy();

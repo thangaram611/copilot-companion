@@ -5,7 +5,7 @@
 # ${CLAUDE_PLUGIN_ROOT}/bridge-server/. Idempotent, concurrent-safe (flock),
 # lockfile-aware (sha256 of package.json + package-lock.json).
 #
-# NODE_PATH does NOT work for ESM bare imports (Node >= 20 — verified
+# NODE_PATH does NOT work for ESM bare imports (Node >= 22 — verified
 # empirically). We install to ${CLAUDE_PLUGIN_DATA}/bridge-server/ for update
 # persistence and symlink it into ${CLAUDE_PLUGIN_ROOT}/bridge-server/ so
 # ESM's ancestor-directory resolver finds the deps.

@@ -6,9 +6,9 @@
   "private": true,
   "main": "server.mjs",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

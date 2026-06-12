@@ -1,24 +1,16 @@
 #!/usr/bin/env node
 // install-codex-hooks.mjs — idempotently install the copilot-companion
-// hook entries into ~/.codex/hooks.json. Sibling of install-permissions.mjs;
-// owns the file format and merge semantics for Codex's user-scope hook
-// registry.
-//
-// Why we need this: Codex's `RawPluginManifest` has no `hooks` field that
-// fires for unmanaged plugins, and the `plugin_hooks` feature flag is
-// `UnderDevelopment` and OFF by default. The stable codex_hooks feature
-// reads only ~/.codex/hooks.json and per-project <repo>/.codex/hooks.json.
-// We route to the user-scope file so hooks fire across every Codex
-// session this user runs, not just those rooted in trusted repos.
+// hook entries into ~/.codex/hooks.json for source-checkout development.
+// A finalized marketplace package can move these hooks into plugin scope; this
+// script exists so a local checkout can exercise the same lifecycle without
+// requiring a publish/install round trip.
 //
 // Why a script instead of just shipping hooks/hooks-codex.json: the user
 // almost certainly has other hooks already in place (their own
 // PreToolUse/PostToolUse scripts, other plugins' entries). Overwriting
 // would destroy unrelated work. Also, user-scope hook commands cannot
-// reference ${CLAUDE_PLUGIN_ROOT} (Codex injects that var only for
-// plugin-scope hooks discovered via append_plugin_hook_sources). So we
-// have to substitute the absolute plugin path at install time, which
-// only this script knows.
+// reference ${CLAUDE_PLUGIN_ROOT}. We substitute the absolute plugin path at
+// install time, which only this script knows.
 //
 // Usage:
 //   node scripts/install-codex-hooks.mjs --plugin-root /abs/path [--yes]
@@ -89,6 +81,7 @@ function bashEntry(scriptRel, timeout) {
     type: 'command',
     command:
       `CLAUDE_PLUGIN_ROOT=${shellQuote(pluginRoot)} ` +
+      'COPILOT_COMPANION_HOST=codex ' +
       `COPILOT_COMPANION_NODE=${shellQuote(process.execPath)} ` +
       `PATH=${shellQuote(hookPath)} bash ${shellQuote(abs)}`,
     timeout,

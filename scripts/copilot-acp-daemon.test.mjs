@@ -19,6 +19,13 @@ import {
   REPLY_DRAIN_TIMEOUT_MS,
 } from './copilot-acp-daemon.mjs';
 
+const RUNTIME_SANDBOX = mkdtempSync(join(tmpdir(), 'copilot-daemon-runtime-'));
+process.env.COPILOT_RUNTIME_DIR = RUNTIME_SANDBOX;
+test.after(() => {
+  rmSync(RUNTIME_SANDBOX, { recursive: true, force: true });
+  delete process.env.COPILOT_RUNTIME_DIR;
+});
+
 // Stub AcpConnection: pretends to be alive; sendPrompt returns a controllable
 // promise (call resolveSendPrompt / rejectSendPrompt to settle it) so the
 // test can pin the prompt's lifecycle state. cancelSession is a no-op.

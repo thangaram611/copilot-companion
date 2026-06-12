@@ -10,10 +10,17 @@
 
 import { spawn, execSync } from 'node:child_process';
 import { createServer, connect as connectSocket } from 'node:net';
-import { appendFileSync, statSync, unlinkSync, renameSync, writeFileSync, existsSync, readFileSync, chmodSync, readdirSync, realpathSync } from 'node:fs';
+import { appendFileSync, statSync, lstatSync, unlinkSync, renameSync, writeFileSync, existsSync, readFileSync, chmodSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
+import {
+  daemonSocketPath,
+  daemonLogFile,
+  heartbeatDir,
+  promptEventsPath,
+  otelTracesPath,
+} from '../lib/runtime-paths.mjs';
 import { Supervisor, pollSupervisor } from '../lib/prompt-supervisor.mjs';
 import {
   parseJsonlEvents,
@@ -46,8 +53,6 @@ const COPILOT_BIN = (() => {
     'copilot binary not found on PATH. Install GitHub Copilot CLI or set $COPILOT_BIN.'
   );
 })();
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
-const LOG_FILE = '/tmp/copilot-acp-daemon.log';
 const LOG_MAX_BYTES = 1024 * 1024; // 1 MB
 const PRIVATE_FILE_MODE = 0o600;
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
@@ -60,7 +65,6 @@ const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
 // context with it) for the full lifetime of an active host session. The 15-min
 // idle timer alone would terminate the Copilot child mid-session, forcing a
 // rebirth on the next prompt-bg and losing context.
-const HEARTBEAT_DIR = '/tmp/copilot-companion-heartbeats';
 const HOST_LIVENESS_TTL_MS = 30 * 60 * 1000; // 30 min — see hooks/drain-completions.sh
 const HEARTBEAT_STALE_AFTER_MS = 24 * 60 * 60 * 1000; // 24h: unlink unused heartbeats
 const PROMPT_TIMEOUT_MS = 25 * 60 * 1000; // 25 min per prompt — must be >= MAX_LONG_POLL_WAIT_MS or legitimate long prompts are killed and surface as "prompt timeout" failures instead of real answers. Raised from 10 min to accommodate /fleet jobs that legitimately decompose into multiple long-running sub-agents (e.g. multi-file code reviews).
@@ -164,12 +168,13 @@ function log(level, ...args) {
   const rank = LOG_LEVEL_RANK[level];
   if (rank !== undefined && rank < LOG_THRESHOLD) return;
   try {
-    if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > LOG_MAX_BYTES) {
-      writePrivateFile(LOG_FILE, '');
+    const logFile = daemonLogFile();
+    if (existsSync(logFile) && statSync(logFile).size > LOG_MAX_BYTES) {
+      writePrivateFile(logFile, '');
     }
     const ts = new Date().toISOString();
     const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-    appendPrivateFile(LOG_FILE, `${ts} [${level}] ${msg}\n`);
+    appendPrivateFile(logFile, `${ts} [${level}] ${msg}\n`);
   } catch {
     // best-effort logging
   }
@@ -270,7 +275,7 @@ class AcpConnection {
     const flags = buildCopilotFlags(this.model);
     logSpawn(COPILOT_BIN, flags);
     log('INFO', `copilot process cwd=${this.cwd} model=${this.model}`);
-    const OTEL_TRACES_PATH = '/tmp/copilot-otel-traces.jsonl';
+    const OTEL_TRACES_PATH = otelTracesPath();
     // Rotate OTel traces file if it exceeds 1 MB (same threshold as daemon log).
     try {
       if (existsSync(OTEL_TRACES_PATH) && statSync(OTEL_TRACES_PATH).size > LOG_MAX_BYTES) {
@@ -505,7 +510,11 @@ class AcpConnection {
       },
       SPAWN_INIT_TIMEOUT_MS,
     );
-    log('INFO', 'initialize ok:', { agentInfo: result?.agentInfo });
+    this.agentCapabilities = result?.agentCapabilities || result?.capabilities || null;
+    log('INFO', 'initialize ok:', {
+      agentInfo: result?.agentInfo,
+      agentCapabilities: this.agentCapabilities,
+    });
     this._sendNotification('notifications/initialized', {});
     this.initialized = true;
     return result;
@@ -614,7 +623,7 @@ class AcpConnection {
 // --- SessionManager ----------------------------------------------------------
 
 function eventsFilePath(promptId) {
-  return `/tmp/copilot-acp-${promptId}.jsonl`;
+  return promptEventsPath(promptId);
 }
 
 // Set of all terminal status values for an in-flight prompt. The long-poll
@@ -1358,6 +1367,7 @@ class SessionManager {
       pid: this.connection?.child?.pid ?? null,
       connectionCwd: this.connection?.cwd ?? null,
       activeModel: this.connection?.model ?? null,
+      agentCapabilities: this.connection?.agentCapabilities ?? null,
       configuredModel: readConfiguredModel(),
       sessions: Array.from(this.sessions.entries()).map(([sid, meta]) => ({
         sessionId: sid,
@@ -1480,13 +1490,14 @@ class SessionManager {
   // stale-unlink predicate) is in lib/heartbeat.mjs so it can be unit-tested.
   _findLiveHeartbeat(now = Date.now()) {
     let names;
-    try { names = readdirSync(HEARTBEAT_DIR); }
+    const dir = heartbeatDir();
+    try { names = readdirSync(dir); }
     catch { return null; } // dir doesn't exist → no hosts yet
     const entries = [];
     for (const name of names) {
       if (!name.endsWith('.heartbeat')) continue;
       try {
-        const stat = statSync(`${HEARTBEAT_DIR}/${name}`);
+        const stat = statSync(`${dir}/${name}`);
         entries.push({ name, mtimeMs: stat.mtimeMs });
       } catch { /* file vanished between readdir and stat — skip */ }
     }
@@ -1496,7 +1507,7 @@ class SessionManager {
       staleAfterMs: HEARTBEAT_STALE_AFTER_MS,
     });
     for (const name of staleToUnlink) {
-      try { unlinkSync(`${HEARTBEAT_DIR}/${name}`); } catch {}
+      try { unlinkSync(`${dir}/${name}`); } catch {}
     }
     return liveSid;
   }
@@ -1511,10 +1522,18 @@ class IpcServer {
   }
 
   async start() {
+    const socketPath = daemonSocketPath();
     // Stale socket detection: try to connect; if refused, unlink
-    if (existsSync(SOCKET_PATH)) {
+    if (existsSync(socketPath)) {
+      try {
+        if (lstatSync(socketPath).isSymbolicLink()) {
+          log('ERROR', 'socket path is a symlink; refusing to use it:', socketPath);
+          console.error('refusing symlink socket path', socketPath);
+          process.exit(1);
+        }
+      } catch {}
       const inUse = await new Promise((resolve) => {
-        const probe = connectSocket(SOCKET_PATH);
+        const probe = connectSocket(socketPath);
         probe.on('connect', () => {
           probe.end();
           resolve(true);
@@ -1523,11 +1542,11 @@ class IpcServer {
       });
       if (inUse) {
         log('ERROR', 'socket already in use, daemon already running');
-        console.error('daemon already running at', SOCKET_PATH);
+        console.error('daemon already running at', socketPath);
         process.exit(1);
       }
       try {
-        unlinkSync(SOCKET_PATH);
+        unlinkSync(socketPath);
       } catch {}
     }
 
@@ -1536,12 +1555,12 @@ class IpcServer {
     this.server = createServer({ allowHalfOpen: true }, (sock) => this._onConnection(sock));
     return new Promise((resolve, reject) => {
       this.server.once('error', reject);
-      this.server.listen(SOCKET_PATH, () => {
+      this.server.listen(socketPath, () => {
         // v6.1 A6: lock the socket to the owning user so other accounts on
         // the host cannot speak to the daemon. Default umask leaves it 0666.
-        try { chmodSync(SOCKET_PATH, 0o600); }
+        try { chmodSync(socketPath, 0o600); }
         catch (err) { log('WARN', 'chmod socket failed:', err.message); }
-        log('INFO', 'listening on', SOCKET_PATH);
+        log('INFO', 'listening on', socketPath);
         resolve();
       });
     });
@@ -1697,9 +1716,10 @@ class IpcServer {
         this.server.close();
       } catch {}
     }
-    if (existsSync(SOCKET_PATH)) {
+    const socketPath = daemonSocketPath();
+    if (existsSync(socketPath)) {
       try {
-        unlinkSync(SOCKET_PATH);
+        unlinkSync(socketPath);
       } catch {}
     }
   }
@@ -1753,9 +1773,10 @@ if (isMain) {
   // command, inactivity timer), still unlink the socket. exit handlers
   // must be synchronous.
   process.on('exit', () => {
-    if (existsSync(SOCKET_PATH)) {
+    const socketPath = daemonSocketPath();
+    if (existsSync(socketPath)) {
       try {
-        unlinkSync(SOCKET_PATH);
+        unlinkSync(socketPath);
       } catch {}
     }
   });

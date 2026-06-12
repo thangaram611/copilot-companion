@@ -15,15 +15,11 @@ fail() { printf "${RED}[FAIL]${NC} %s\n" "$1"; }
 
 # --- Argument parsing -------------------------------------------------------
 #
-# --host claude  (default) — install the Claude Code surface only
+# --host claude            — install the Claude Code surface only
 # --host codex             — install the Codex CLI surface only
-# --host both              — install both (no auto-detection: explicit opt-in)
-#
-# Default is `claude` for backwards compatibility — auto-detection from PATH
-# would change behavior for existing Claude users who happen to also have
-# Codex installed.
+# --host both   (default) — install both modern host surfaces
 
-HOST="claude"
+HOST="both"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --host)
@@ -36,9 +32,9 @@ while [ "$#" -gt 0 ]; do
       cat <<EOF
 Usage: $(basename "$0") [--host claude|codex|both]
 
-  --host claude   (default) install Claude Code surface only
+  --host claude             install Claude Code surface only
   --host codex    install Codex CLI surface only
-  --host both     install both (explicit opt-in)
+  --host both     (default) install both
 EOF
       exit 0
       ;;
@@ -62,7 +58,7 @@ case "$HOST" in
   both)   DO_CLAUDE=1; DO_CODEX=1 ;;
 esac
 
-echo "=== copilot-companion v0.0.1 setup (host=$HOST) ==="
+echo "=== copilot-companion setup (host=$HOST) ==="
 echo ""
 echo "This directory is a dual-host plugin (Claude Code + Codex CLI). The"
 echo "subagent-scoped MCP architecture stays the same on both sides — only"
@@ -76,7 +72,7 @@ fi
 if [ "$DO_CODEX" = 1 ]; then
   echo "    .codex-plugin/plugin.json        Codex plugin manifest"
   echo "    templates/copilot-companion.toml subagent template (TOML)"
-  echo "    (no plugin-bundled hooks.json — setup writes ~/.codex/hooks.json directly)"
+  echo "    hooks/hooks.json                 hook source; setup also materializes dev hooks"
 fi
 echo ""
 
@@ -85,12 +81,12 @@ echo ""
 printf "Checking prerequisites...\n"
 
 if ! command -v node >/dev/null 2>&1; then
-  fail "node not found on PATH. Install Node.js >= 20."
+  fail "node not found on PATH. Install Node.js >= 22."
   exit 1
 fi
 NODE_VER=$(node -e "console.log(process.version.slice(1).split('.')[0])")
-if [ "$NODE_VER" -lt 20 ] 2>/dev/null; then
-  fail "Node.js >= 20 required (found v$NODE_VER)."
+if [ "$NODE_VER" -lt 22 ] 2>/dev/null; then
+  fail "Node.js >= 22 required (found v$NODE_VER)."
   exit 1
 fi
 ok "node v$(node --version | tr -d 'v')"
@@ -110,22 +106,31 @@ ok "jq $(jq --version 2>/dev/null || echo found)"
 if command -v copilot >/dev/null 2>&1; then
   ok "copilot $(copilot --version 2>/dev/null || echo 'found')"
 else
-  warn "copilot binary not found on PATH. Delegation features will not work until installed."
+  fail "copilot binary not found on PATH. Install GitHub Copilot CLI first."
+  exit 1
 fi
 
 if [ "$DO_CLAUDE" = 1 ]; then
   if command -v claude >/dev/null 2>&1; then
     ok "claude found"
   else
-    warn "claude (Claude Code CLI) not found. Install from https://claude.ai/code"
+    fail "claude (Claude Code CLI) not found. Install from https://claude.ai/code"
+    exit 1
   fi
 fi
 
 if [ "$DO_CODEX" = 1 ]; then
   if command -v codex >/dev/null 2>&1; then
     ok "codex $(codex --version 2>/dev/null | head -1 || echo 'found')"
+    if codex plugin add --help >/dev/null 2>&1; then
+      ok "codex plugin add available"
+    else
+      fail "codex plugin add is unavailable; install a current Codex CLI."
+      exit 1
+    fi
   else
-    warn "codex (Codex CLI) not found. Install from https://github.com/openai/codex"
+    fail "codex (Codex CLI) not found. Install from https://github.com/openai/codex"
+    exit 1
   fi
 fi
 
@@ -255,15 +260,11 @@ if [ "$DO_CLAUDE" = 1 ]; then
   echo ""
 fi
 
-# --- Step 6: Codex-host install (subagent TOML + hooks merge) ---------------
+# --- Step 6: Codex-host install (subagent TOML + dev hook materialization) ---
 #
-# Differences from Claude:
-#   - features.multi_agent is stable-on by default — no env var to set.
-#   - Permission injection is a no-op (Codex permission model differs;
-#     not addressed by this plan).
-#   - Hooks are NOT plugin-bundled. Codex's plugin_hooks feature is OFF
-#     by default; user-scope hooks at ~/.codex/hooks.json are the stable
-#     path. install-codex-hooks.mjs merges our entries into that file.
+# Codex has first-class plugin marketplace commands now. For this source
+# checkout, setup materializes the custom TOML agent and dev hooks directly;
+# the published path is marketplace registration plus `codex plugin add`.
 
 if [ "$DO_CODEX" = 1 ]; then
   printf "=== Codex CLI host install ===\n"

@@ -14,9 +14,14 @@
 # Empty queue or missing session id → no injection, no context pollution.
 
 set -e
-QUEUE="${COPILOT_QUEUE_PATH:-/tmp/copilot-completions.jsonl}"
+HOST_NAME="${COPILOT_COMPANION_HOST:-claude}"
+RUNTIME_DIR="${COPILOT_RUNTIME_DIR:-$HOME/.$HOST_NAME/copilot-companion/runtime}"
+mkdir -p "$RUNTIME_DIR" 2>/dev/null || true
+chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+
+QUEUE="${COPILOT_QUEUE_PATH:-$RUNTIME_DIR/completions.jsonl}"
 LOCK="${QUEUE}.lock"
-HEARTBEAT_DIR="${COPILOT_HEARTBEAT_DIR:-/tmp/copilot-companion-heartbeats}"
+HEARTBEAT_DIR="${COPILOT_HEARTBEAT_DIR:-$RUNTIME_DIR/heartbeats}"
 
 PAYLOAD=$(cat)
 if ! command -v jq >/dev/null 2>&1; then
@@ -40,6 +45,7 @@ MY_SID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty')
 # they're actively using Claude Code. Best-effort; failure here must not
 # block the drain.
 mkdir -p "$HEARTBEAT_DIR" 2>/dev/null || true
+chmod 700 "$HEARTBEAT_DIR" 2>/dev/null || true
 touch "$HEARTBEAT_DIR/$MY_SID.heartbeat" 2>/dev/null || true
 
 # Fast path: no queue file, or empty file → no-op silently. Outside the lock

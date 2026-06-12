@@ -17,9 +17,10 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
 
+import { daemonSocketPath } from '../lib/runtime-paths.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const SOCKET_PATH = '/tmp/copilot-acp.sock';
 const DAEMON_PATH = process.env.COPILOT_DAEMON_PATH || (() => {
   const pluginPath = pathResolve(__dirname, '..', 'scripts', 'copilot-acp-daemon.mjs');
   if (existsSync(pluginPath)) return pluginPath;
@@ -32,7 +33,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 6 * 60 * 1000;
 
 function realSendToSocket(message, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const sock = connectSocket(SOCKET_PATH);
+    const sock = connectSocket(daemonSocketPath());
     let buf = '';
     const timer = setTimeout(() => {
       sock.destroy();

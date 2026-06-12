@@ -7,7 +7,7 @@
 //
 // Nothing in here opens sockets, spawns processes, or reads state files —
 // it's safe to import from tests without side effects other than appending
-// a line to /tmp/copilot-bridge.log on the `log()` helper.
+// a line to the private runtime bridge log on the `log()` helper.
 
 import {
   readdirSync,
@@ -22,12 +22,16 @@ import {
 import { isAbsolute, join, sep as pathSep } from 'node:path';
 
 import { plansDir, detectHost } from '../lib/host.mjs';
+import { bridgeLogFile } from '../lib/runtime-paths.mjs';
 
 // --- Logger -----------------------------------------------------------------
 
-export const BRIDGE_LOG_FILE = '/tmp/copilot-bridge.log';
 export const BRIDGE_LOG_MAX_BYTES = 1024 * 1024;
 const PRIVATE_FILE_MODE = 0o600;
+
+export function getBridgeLogFile() {
+  return bridgeLogFile();
+}
 
 function chmodPrivate(path) {
   try { chmodSync(path, PRIVATE_FILE_MODE); } catch {}
@@ -37,19 +41,20 @@ export function log(level, ...args) {
   const ts = new Date().toISOString();
   const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
   const line = `${ts} [${level}] ${msg}\n`;
+  const logFile = getBridgeLogFile();
   try {
-    if (existsSync(BRIDGE_LOG_FILE) && statSync(BRIDGE_LOG_FILE).size > BRIDGE_LOG_MAX_BYTES) {
+    if (existsSync(logFile) && statSync(logFile).size > BRIDGE_LOG_MAX_BYTES) {
       // v6.1 C4: keep the previous log in .bak instead of truncating in
       // place. Truncate-on-rotate dropped the most recent diagnostic data
       // exactly when something went wrong enough to fill the log.
       try {
-        renameSync(BRIDGE_LOG_FILE, BRIDGE_LOG_FILE + '.bak');
-        chmodPrivate(BRIDGE_LOG_FILE + '.bak');
+        renameSync(logFile, logFile + '.bak');
+        chmodPrivate(logFile + '.bak');
       }
-      catch { writeFileSync(BRIDGE_LOG_FILE, '', { mode: PRIVATE_FILE_MODE }); chmodPrivate(BRIDGE_LOG_FILE); }
+      catch { writeFileSync(logFile, '', { mode: PRIVATE_FILE_MODE }); chmodPrivate(logFile); }
     }
-    appendFileSync(BRIDGE_LOG_FILE, line, { mode: PRIVATE_FILE_MODE });
-    chmodPrivate(BRIDGE_LOG_FILE);
+    appendFileSync(logFile, line, { mode: PRIVATE_FILE_MODE });
+    chmodPrivate(logFile);
   } catch { /* best-effort */ }
   if (level === 'WARN' || level === 'ERROR' || level === 'FATAL') {
     try { process.stderr.write(line); } catch {}
@@ -61,7 +66,9 @@ export function log(level, ...args) {
 export const VALID_ACTIONS   = new Set(['send', 'wait', 'status', 'reply', 'cancel']);
 export const VALID_MODES     = new Set(['PLAN', 'ANALYZE', 'EXECUTE']);
 export const VALID_TEMPLATES = new Set(['general', 'research', 'plan_review']);
+export const VALID_PARALLEL_STRATEGIES = new Set(['auto', 'always', 'never']);
 export const DEFAULT_MODE    = 'EXECUTE';
+export const DEFAULT_PARALLEL = 'auto';
 
 // Field surface per action. Anything outside these is an "unknown key" error.
 //
@@ -96,6 +103,22 @@ const SCOPE_HINT_MAX_CHARS = 500;
 
 // --- Prompt templates -------------------------------------------------------
 
+export function shouldUseFleet({ parallel = DEFAULT_PARALLEL, template = 'general', mode = DEFAULT_MODE, task = '' } = {}) {
+  if (parallel === 'always') return true;
+  if (parallel === 'never') return false;
+  if (parallel !== 'auto') return false;
+  if (template === 'plan_review') return true;
+  const text = String(task || '');
+  if (template === 'research') {
+    return text.length > 80 || /\b(compare|survey|latest|recent|sources|research|across|multiple)\b/i.test(text);
+  }
+  if (mode === 'ANALYZE') {
+    return text.length > 120 || /\b(review|audit|investigate|across|multiple|multi[- ]?file|large|exhaustive)\b/i.test(text);
+  }
+  return text.length > 180 ||
+    /\b(refactor|migration|feature|implement|across|multiple|multi[- ]?file|review|audit|exhaustive|parallel)\b/i.test(text);
+}
+
 export function formatGeneralTemplate({ task, mode, scope_hint, parallel }) {
   const analyzeLine =
     'Do not modify any files — no `edit`, `write`, or file-mutating `shell` commands. Read-only tools (`view`, `grep`, `glob`, `web_search`, `web_fetch`, and the `task` tool for read-only sub-agents) are fine. ' +
@@ -114,7 +137,8 @@ export function formatGeneralTemplate({ task, mode, scope_hint, parallel }) {
   // true we drop the literal `TASK:` prefix so the slash command is the
   // first non-whitespace token — fleet expects the objective immediately
   // after `/fleet `.
-  const taskLine = parallel ? `/fleet ${task}` : `TASK: ${task}`;
+  const useFleet = shouldUseFleet({ parallel, template: 'general', mode, task });
+  const taskLine = useFleet ? `/fleet ${task}` : `TASK: ${task}`;
   const lines = [
     taskLine,
     '',
@@ -149,7 +173,7 @@ export function formatResearchTemplate({ task, parallel }) {
     '',
     'Be concise. Skip filler.',
   ].join('\n');
-  return maybeFleetPrefix(body, parallel);
+  return maybeFleetPrefix(body, shouldUseFleet({ parallel, template: 'research', task }));
 }
 
 export function formatPlanReviewTemplate({ template_args, parallel }) {
@@ -185,7 +209,7 @@ export function formatPlanReviewTemplate({ template_args, parallel }) {
     '- A numbered list of concrete findings, each with file path and specific issue',
     '- A brief overall assessment (2-3 sentences)',
   ].filter(Boolean).join('\n');
-  return maybeFleetPrefix(body, parallel);
+  return maybeFleetPrefix(body, shouldUseFleet({ parallel, template: 'plan_review' }));
 }
 
 export function formatPrompt({ template, task, mode, template_args, parallel }) {
@@ -202,8 +226,8 @@ export function formatPrompt({ template, task, mode, template_args, parallel }) 
 // (Copilot's parser requirement). The rest of the body — role
 // description, rules, return format — becomes the orchestrator's
 // objective verbatim and is propagated to dispatched sub-agents.
-function maybeFleetPrefix(body, parallel) {
-  return parallel ? `/fleet ${body}` : body;
+function maybeFleetPrefix(body, useFleet) {
+  return useFleet ? `/fleet ${body}` : body;
 }
 
 // Rubber-duck cross-examination wrapper — always appended unconditionally.
@@ -471,16 +495,13 @@ function validateSend(args) {
     throw new Error('copilot: max_wait_sec must be a number');
   }
 
-  // Fleet (parallel) handling: applies to all templates uniformly.
-  // /fleet is a prompt-body slash command that triggers Copilot's built-in
-  // orchestrator (decomposes + dispatches isolated sub-agents in parallel
-  // where possible). Default-on for every template; opt out per-call with
-  // parallel:false on strictly linear / single-source tasks where the
-  // decomposition-analysis overhead would dominate.
-  if (args.parallel !== undefined && typeof args.parallel !== 'boolean') {
-    throw new Error('copilot: parallel must be a boolean');
+  // Fleet (parallel) handling. `auto` is the default: the bridge prepends
+  // /fleet only when the task looks broad enough to benefit. `always` and
+  // `never` are explicit overrides.
+  if (args.parallel !== undefined && !VALID_PARALLEL_STRATEGIES.has(args.parallel)) {
+    throw new Error('copilot: parallel must be one of auto|always|never');
   }
-  const parallel = args.parallel === undefined ? true : args.parallel;
+  const parallel = args.parallel || DEFAULT_PARALLEL;
 
   return {
     action: 'send',

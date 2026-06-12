@@ -155,7 +155,7 @@ test('wait response formatting covers timeout, digest metadata, unreachable deta
   assert.match(body.content, /Copilot's model turn did not finish/);
   assert.match(body.content, /Decompose the task/);
   assert.match(body.content, /scope_hint/);
-  assert.match(body.content, /parallel: false/);
+  assert.match(body.content, /parallel: "never"/);
   assert.match(body.content, /\*\*Failed tools:\*\* view, grep/);
   assert.match(body.content, /Partial transcript digest/);
   assert.match(body.meta.digest_path, /copilot-digest-job-timeout\.md$/);
@@ -497,7 +497,7 @@ test('handleSend returns immediately and reattaches to existing jobs without dae
           cwd: TEST_CWD,
           host_session_id: 'sid-send',
           max_wait_sec: 9999,
-          parallel: false,
+          parallel: 'never',
         });
         return { body: parse(res), elapsed: performance.now() - t0 };
       },
@@ -530,7 +530,7 @@ test('handleSend returns immediately and reattaches to existing jobs without dae
         cwd: TEST_CWD,
         host_session_id: 'sid-send',
         max_wait_sec: 1,
-        parallel: false,
+        parallel: 'never',
       })),
     );
     assert.equal(reattached.status, 'still_running');
@@ -560,7 +560,7 @@ test('handleSend returns immediately and reattaches to existing jobs without dae
         cwd: TEST_CWD,
         host_session_id: 'sid-send',
         max_wait_sec: 1,
-        parallel: false,
+        parallel: 'never',
       })),
     );
     assert.equal(mismatch.ok, false);
@@ -599,7 +599,7 @@ test('handleSend returns immediately and reattaches to existing jobs without dae
           cwd: TEST_CWD,
           host_session_id: 'sid-send',
           max_wait_sec: 5,
-          parallel: false,
+          parallel: 'never',
         }));
       },
     );
@@ -650,7 +650,7 @@ test('runWorker retires persisted thread sid on prompt timeout and empty complet
           thread,
           host_session_id: 'sid-retire',
           max_wait_sec: 5,
-          parallel: false,
+          parallel: 'never',
         }));
         assert.equal(sendBody.status, 'still_running');
         for (let i = 0; i < 20 && !jobs.get(sendBody.job_id)?.terminalAt; i++) {
@@ -738,7 +738,7 @@ test('runWorker maps daemon SESSION_BUSY into a terminal unreachable response', 
           thread: 'thread-busy-C',
           host_session_id: 'sid-busy-C',
           max_wait_sec: 5,
-          parallel: false,
+          parallel: 'never',
         }));
         assert.equal(sendBody.status, 'still_running');
         return parse(await dispatch({
@@ -776,7 +776,7 @@ test('handleReply rebinds a running job to the replacement prompt and watcher re
     task: 'original task',
     mode: 'EXECUTE',
     template: 'general',
-    parallel: false,
+    parallel: 'never',
     status: 'running',
     promptId: 'prompt-old',
     sessionId: 'session-reply-1',

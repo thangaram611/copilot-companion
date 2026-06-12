@@ -85,7 +85,7 @@ test('send validation covers defaults, modes, unknown fields, thread names, cwd,
   const basic = validateCopilotArgs(sendArgs());
   assert.equal(basic.mode, DEFAULT_MODE);
   assert.equal(basic.template, 'general');
-  assert.equal(basic.parallel, true);
+  assert.equal(basic.parallel, 'auto');
 
   for (const mode of VALID_MODES) {
     assert.equal(validateCopilotArgs(sendArgs({ mode })).mode, mode);
@@ -155,23 +155,23 @@ test('plan_review validates plan path existence, canonicalization, latest resolu
 });
 
 test('formatPrompt and appendRubberDuckReview render template-specific instructions', () => {
-  const general = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: false });
+  const general = formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: 'never' });
   assert.match(general, /^TASK: do thing\n/);
   assert.match(general, /Mode: EXECUTE/);
 
-  const plan = formatPrompt({ template: 'general', task: 't', mode: 'PLAN', parallel: false });
+  const plan = formatPrompt({ template: 'general', task: 't', mode: 'PLAN', parallel: 'never' });
   assert.match(plan, /Do not modify any files/);
   assert.match(plan, /numbered implementation plan/);
 
   const analyze = formatPrompt({
     template: 'general', task: 'X', mode: 'ANALYZE',
     template_args: { scope_hint: 'imports/types only' },
-    parallel: false,
+    parallel: 'never',
   });
   assert.match(analyze, />200 LOC/);
   assert.match(analyze, /\nScope: imports\/types only\n/);
 
-  const research = formatPrompt({ template: 'research', task: 'what is X', parallel: false });
+  const research = formatPrompt({ template: 'research', task: 'what is X', parallel: 'never' });
   assert.match(research, /research assistant/);
   assert.doesNotMatch(research, /`edit`/);
 
@@ -182,28 +182,29 @@ test('formatPrompt and appendRubberDuckReview render template-specific instructi
   assert.match(wrapped, /RUBBER-DUCK: revised/);
 });
 
-test('parallel controls /fleet prefixes consistently across templates and validates boolean input', () => {
-  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'general' })).parallel, true);
-  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'general', parallel: false })).parallel, false);
-  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'research' })).parallel, true);
-  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'research', parallel: false })).parallel, false);
-  assert.throws(() => validateCopilotArgs(sendArgs({ task: 'X', template: 'general', parallel: 'yes' })), /parallel must be a boolean/);
+test('parallel strategy controls /fleet prefixes consistently across templates', () => {
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'general' })).parallel, 'auto');
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'general', parallel: 'never' })).parallel, 'never');
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'research' })).parallel, 'auto');
+  assert.equal(validateCopilotArgs(sendArgs({ task: 'X', template: 'research', parallel: 'always' })).parallel, 'always');
+  assert.throws(() => validateCopilotArgs(sendArgs({ task: 'X', template: 'general', parallel: 'yes' })), /parallel must be one of auto\|always\|never/);
+  assert.throws(() => validateCopilotArgs(sendArgs({ task: 'X', template: 'general', parallel: false })), /parallel must be one of auto\|always\|never/);
 
-  assert.match(formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: true }), /^\/fleet do thing\n/);
-  assert.match(formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: false }), /^TASK: do thing\n/);
-  assert.match(formatPrompt({ template: 'research', task: 'find X', parallel: true }), /^\/fleet You are a research assistant/);
-  assert.match(formatPrompt({ template: 'research', task: 'find X', parallel: false }), /^You are a research assistant/);
+  assert.match(formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: 'always' }), /^\/fleet do thing\n/);
+  assert.match(formatPrompt({ template: 'general', task: 'do thing', mode: 'EXECUTE', parallel: 'never' }), /^TASK: do thing\n/);
+  assert.match(formatPrompt({ template: 'research', task: 'find X across several sources', parallel: 'auto' }), /^\/fleet You are a research assistant/);
+  assert.match(formatPrompt({ template: 'research', task: 'find X', parallel: 'never' }), /^You are a research assistant/);
 
   withPlansDir((dir) => {
     const planFile = join(dir, 'p.md');
     writeFileSync(planFile, '# plan');
     const on = validateCopilotArgs(planArgs(planFile, {}));
-    const off = validateCopilotArgs({ ...planArgs(planFile, {}), parallel: false });
-    assert.equal(on.parallel, true);
-    assert.equal(off.parallel, false);
-    assert.match(formatPrompt({ template: 'plan_review', template_args: on.template_args, parallel: true }),
+    const off = validateCopilotArgs({ ...planArgs(planFile, {}), parallel: 'never' });
+    assert.equal(on.parallel, 'auto');
+    assert.equal(off.parallel, 'never');
+    assert.match(formatPrompt({ template: 'plan_review', template_args: on.template_args, parallel: 'auto' }),
       /^\/fleet You are a senior software architect/);
-    assert.match(formatPrompt({ template: 'plan_review', template_args: off.template_args, parallel: false }),
+    assert.match(formatPrompt({ template: 'plan_review', template_args: off.template_args, parallel: 'never' }),
       /^You are a senior software architect/);
   });
 });
@@ -217,9 +218,9 @@ test('scope_hint is accepted only for general prompts and bounded by type and le
   assert.match(formatPrompt({
     template: 'general', task: 'X', mode: 'ANALYZE',
     template_args: accepted.template_args,
-    parallel: false,
+    parallel: 'never',
   }), /\nScope: imports only\n/);
-  assert.doesNotMatch(formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE', parallel: false }), /\nScope:/);
+  assert.doesNotMatch(formatPrompt({ template: 'general', task: 'X', mode: 'ANALYZE', parallel: 'never' }), /\nScope:/);
 
   assert.throws(() => validateCopilotArgs({
     action: 'send', task: 'X', cwd: TEST_CWD, template: 'research',

@@ -40,6 +40,7 @@ import {
   log,
   formatPrompt,
   appendRubberDuckReview,
+  shouldUseFleet,
   validateCopilotArgs,
 } from './validation.mjs';
 import {
@@ -48,9 +49,9 @@ import {
   readThreadSid, writeThreadSid, clearThread, listThreads,
   readHostSessionThread, writeHostSessionThread,
   writeJob, readJob, listJobsForSession, deleteJob,
-  DEFAULT_MODEL,
 } from '../lib/state.mjs';
 import { sanitizeHostSessionId } from '../lib/host.mjs';
+import { queuePath, promptEventsPath, runtimeDir, bridgeLogFile, daemonLogFile } from '../lib/runtime-paths.mjs';
 import { createReqId, withReq, logEvent } from '../lib/log.mjs';
 import { writeDigest, digestPath } from '../lib/prompt-digest.mjs';
 
@@ -61,7 +62,7 @@ import { writeDigest, digestPath } from '../lib/prompt-digest.mjs';
 // of the process and made queue-write tests unrunnable from node:test
 // without subprocesses.
 function getQueuePath() {
-  return process.env.COPILOT_QUEUE_PATH || '/tmp/copilot-completions.jsonl';
+  return queuePath();
 }
 
 const PRIVATE_FILE_MODE = 0o600;
@@ -370,7 +371,8 @@ export function refreshDigestForJob(job, statusOverride = null) {
       mode:       job.mode || null,
       template:   job.template || null,
       thread:     job.thread || null,
-      parallel:   !!job.parallel,
+      parallel:   !!job.fleet,
+      parallelStrategy: job.parallelStrategy || job.parallel || null,
       task:       job.task || null,
       sessionId:  job.sessionId || null,
       startedAt:  job.startedAt || null,
@@ -400,6 +402,8 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
     prompt_id: data.promptId || job.promptId || null,
     session_id: data.sessionId || job.sessionId || null,
     mode: job.mode || null,
+    parallel: job.parallelStrategy || job.parallel || null,
+    fleet: Boolean(job.fleet),
     thread: job.thread || null,
     cwd: data.cwd || job.cwd || null,
     started_at: data.startedAt || iso(job.startedAt),
@@ -499,6 +503,8 @@ function buildWaitResponse(outcome) {
       // recover it. (v6.1 thread-continuity invariant.)
       thread: job.thread || null,
       current_status: job.status || 'running',
+      parallel: job.parallelStrategy || job.parallel || null,
+      fleet: Boolean(job.fleet),
       started_at: iso(job.startedAt),
       age_s: Math.round((Date.now() - (job.startedAt || Date.now())) / 1000),
       // Mirror the terminal-path field so a poll that catches the job mid-run
@@ -523,6 +529,8 @@ function buildWaitResponse(outcome) {
   const meta = {
     job_id: job.jobId, status: job.status,
     mode: job.mode || 'EXECUTE',
+    parallel: job.parallelStrategy || job.parallel || '',
+    fleet: Boolean(job.fleet) ? 'true' : 'false',
     thread: job.thread || null,
     prompt_id: job.promptId || null,
     session_id: job.sessionId || null,
@@ -663,19 +671,19 @@ export function formatTerminalContent({
       : '';
     return taskHeader +
       `Copilot's model turn did not finish within the wait budget (${Math.round(duration / 1000)}s).\n\n` +
-      'The daemon is alive; the task was too large for one turn (note: `/fleet` runs by default for general tasks). Recommended next steps for the parent:\n' +
+      'The daemon is alive; the task was too large for one turn. Recommended next steps for the parent:\n' +
       '- Read the partial-transcript digest (path below) — sub-agent reports may already cover the work.\n' +
       '- Decompose the task into smaller, explicitly-scoped sub-sends (target ≤ ~100 LOC of source per send).\n' +
       '- For ANALYZE on large files, pass `template_args.scope_hint` (e.g. "imports/types only", "lines 1-120") to bind the analysis to a specific section.\n' +
       '- Raise `max_wait_sec` (cap 1200s / 20 min for all modes) if the task is genuinely long.\n' +
-      "- Try `parallel: false` once if you suspect /fleet's coordination overhead is the bottleneck for a strictly linear task." +
+      "- Try `parallel: \"never\"` once if you suspect /fleet's coordination overhead is the bottleneck for a strictly linear task." +
       failedLine + digestLine + retiredLine;
   }
   if (status === 'unreachable') {
     const detailLine = detail ? ` (detail: ${detail})` : '';
     return taskHeader +
       `Bridge could not reach the Copilot daemon (or socket reconciliation failed)${detailLine}.\n\n` +
-      'This is infrastructure-level — check `ps -ef | grep copilot-acp-daemon` and tail `/tmp/copilot-bridge.log` / `/tmp/copilot-acp-daemon.log` to confirm the daemon is alive.';
+      `This is infrastructure-level — check \`ps -ef | grep copilot-acp-daemon\` and tail \`${bridgeLogFile()}\` / \`${daemonLogFile()}\` to confirm the daemon is alive.`;
   }
   return taskHeader + `Unexpected terminal status: ${status}`;
 }
@@ -684,7 +692,7 @@ export function emitNotification({
   jobId, status, summary, error, stuckReason, detail = null, duration,
   task, mode, cwd, thread = null, promptId = null, sessionId = null,
   reconciled = false, bridgeReason = null, failedTools = [], reqId = null,
-  sessionReborn = false, sessionRetired = false, extraMeta = null,
+  sessionReborn = false, sessionRetired = false, fleet = false, extraMeta = null,
 }) {
   if (
     status === 'completed' &&
@@ -734,6 +742,7 @@ export function emitNotification({
   if (reqId)        meta.req_id = String(reqId);
   if (sessionReborn) meta.session_reborn = 'true';
   if (sessionRetired) meta.session_retired = 'true';
+  meta.fleet = fleet ? 'true' : 'false';
   if (extraMeta && typeof extraMeta === 'object') {
     for (const [k, v] of Object.entries(extraMeta)) {
       if (v !== undefined && v !== null) meta[k] = String(v).slice(0, 80);
@@ -751,7 +760,7 @@ export function emitNotification({
   if (promptId && jobId) {
     try {
       writeDigest(promptId, {
-        jobId, status, mode, template: null, thread, parallel: false,
+        jobId, status, mode, template: null, thread, parallel: !!fleet,
         task, sessionId, startedAt: duration ? Date.now() - duration : null,
         terminalAt: Date.now(),
       });
@@ -805,9 +814,10 @@ const MAX_JOB_MS = 40 * 60 * 1000;
 
 async function runWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, model, previousSid, parallel }) {
   const startedAt = Date.now();
+  const fleet = shouldUseFleet({ parallel, template, mode, task });
   const rlog = withReq(reqId, { job_id: jobId });
-  rlog.info('worker.start', { mode, template, thread: thread || null, model, cwd: cwd || null, parallel: !!parallel });
-  log('INFO', 'worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} model=${model} cwd=${cwd} parallel=${!!parallel}`);
+  rlog.info('worker.start', { mode, template, thread: thread || null, model, cwd: cwd || null, parallel_strategy: parallel, fleet });
+  log('INFO', 'worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} model=${model} cwd=${cwd} parallel=${parallel} fleet=${fleet}`);
   try {
     await ensureDaemon({ reqId });
 
@@ -862,6 +872,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
           sessionId: conflictSessionId,
           failedTools: [],
           reqId,
+          fleet,
           extraMeta: existingPromptId ? { existing_prompt_id: String(existingPromptId) } : undefined,
         });
         return;
@@ -890,7 +901,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
       emitRebirthAlert({ jobId, task, promptId, thread, previousSid, newSessionId: sessionId, startedAt, reqId });
     }
 
-    await runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId, sessionReborn: !!sessionReborn });
+    await runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId, sessionReborn: !!sessionReborn, fleet });
   } catch (err) {
     // Failure before the prompt was registered (ensureDaemon, prompt-bg, etc).
     // No promptId yet → not reconcilable, just record terminal failure.
@@ -904,7 +915,7 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
 // Watch-loop and terminal handling, factored out so a rehydrated bridge can
 // re-attach to a daemon-owned promptId without re-running prompt-bg. Called
 // from runWorker (fresh prompt) and from rehydrate (recovery after restart).
-async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId, sessionReborn = false }) {
+async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cwd, startedAt, reqId, sessionReborn = false, fleet = false }) {
   const rlog = withReq(reqId, { job_id: jobId });
   try {
     let result;
@@ -992,6 +1003,7 @@ async function runWatchLoop({ jobId, promptId, sessionId, thread, task, mode, cw
       duration, task, mode, cwd, thread,
       promptId, sessionId, failedTools, reqId, sessionReborn,
       sessionRetired: !!result.sessionRetired,
+      fleet,
     });
   } catch (err) {
     await emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd, thread, rlog, sessionId });
@@ -1002,6 +1014,7 @@ async function emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd
   const duration = Date.now() - startedAt;
   const promptId = jobs.get(jobId)?.promptId;
   const currentSessionId = jobs.get(jobId)?.sessionId || sessionId;
+  const fleet = !!jobs.get(jobId)?.fleet;
   const isReconcilableErr = !!promptId && (
     (err && typeof err.code === 'string' && ['ECONNREFUSED', 'ENOENT', 'EPIPE', 'ETIMEDOUT'].includes(err.code)) ||
     /timeout/i.test(err?.message || '')
@@ -1047,6 +1060,7 @@ async function emitWorkerFailure({ jobId, err, startedAt, reqId, task, mode, cwd
     bridgeReason: reconciled?.bridgeReason || null,
     reconciled: !!reconciled,
     sessionRetired,
+    fleet,
     reqId,
   });
 }
@@ -1089,7 +1103,7 @@ async function reconcileAfterTimeout(promptId) {
 
 function failedToolsFromJsonl(promptId) {
   try {
-    const content = readFileSync(`/tmp/copilot-acp-${promptId}.jsonl`, 'utf8');
+    const content = readFileSync(promptEventsPath(promptId), 'utf8');
     const byId = new Map();
     const names = new Set();
     for (const line of content.split('\n')) {
@@ -1114,6 +1128,15 @@ function asJson(obj) {
   };
   if (obj?.ok === false) result.isError = true;
   return result;
+}
+
+function invalidArgsResult(err) {
+  return asJson({
+    ok: false,
+    action: 'validate',
+    code: 'INVALID_ARGUMENTS',
+    error: err?.message || String(err),
+  });
 }
 
 async function handleSend(args) {
@@ -1192,13 +1215,20 @@ async function handleSend(args) {
   }
 
   const reqId = createReqId();
+  const fleet = shouldUseFleet({
+    parallel: args.parallel,
+    template: args.template,
+    mode: args.mode,
+    task: args.task,
+  });
   jobs.set(jobId, {
     jobId, reqId,
     claudeSessionId: getHostSessionId(),
     task: args.task, mode: args.mode,
     template: args.template, cwd: args.cwd,
     thread,
-    parallel: !!args.parallel,
+    parallelStrategy: args.parallel,
+    fleet,
     startedAt: Date.now(),
     status: 'starting', inspectAvailable: false,
   });
@@ -1207,16 +1237,17 @@ async function handleSend(args) {
     req_id: reqId, job_id: jobId,
     template: args.template, mode: args.mode,
     thread, model,
-    parallel: !!args.parallel,
+    parallel_strategy: args.parallel,
+    fleet,
   });
-  log('INFO', 'copilot:send', `job=${jobId} req=${reqId} template=${args.template} mode=${args.mode} thread=${thread} model=${model} parallel=${!!args.parallel}`);
+  log('INFO', 'copilot:send', `job=${jobId} req=${reqId} template=${args.template} mode=${args.mode} thread=${thread} model=${model} parallel=${args.parallel} fleet=${fleet}`);
 
   runWorker({
     jobId, reqId,
     task: args.task, mode: args.mode,
     template: args.template, template_args: args.template_args,
     cwd: args.cwd, thread, model, previousSid,
-    parallel: !!args.parallel,
+    parallel: args.parallel,
   }).catch((err) => log('ERROR', 'worker error:', err.message));
 
   // Return immediately with still_running. The worker continues in the
@@ -1231,6 +1262,8 @@ async function handleSend(args) {
     job_id: jobId,
     thread,
     current_status: job?.status || 'starting',
+    parallel: args.parallel,
+    fleet,
     started_at: iso(job?.startedAt || Date.now()),
     age_s: 0,
     session_reborn: false,
@@ -1372,6 +1405,8 @@ async function handleStatus({ job_id, verbose }) {
         job_id: j.jobId,
         status: j.status || 'starting',
         mode: j.mode || null,
+        parallel: j.parallelStrategy || j.parallel || null,
+        fleet: Boolean(j.fleet),
         thread: j.thread || null,
         cwd: j.cwd || null,
         prompt_id: j.promptId || null,
@@ -1390,14 +1425,12 @@ const mcp = new Server(
     capabilities: { tools: {} },
     instructions:
       'Internal MCP server for the copilot-companion subagent. Spawned inline ' +
-      'per invocation via the subagent\'s `mcpServers` frontmatter (the standalone ' +
-      'agent at ~/.claude/agents/copilot-companion.md, materialized by the ' +
-      'plugin\'s install-agent.sh SessionStart hook). Not registered at session ' +
-      'scope — main Claude does not see this tool surface. Actions: send ' +
-      '(returns still_running synchronously), wait (blocks until terminal), ' +
-      'status, reply, cancel. The companion uses send for kickoff then loops ' +
-      'on wait until terminal. Completion events are also appended to ' +
-      '/tmp/copilot-completions.jsonl for the plugin\'s drain hooks.',
+      'per invocation by the companion agent. Actions: send (returns ' +
+      'still_running synchronously), wait (blocks until terminal), status, ' +
+      'reply, cancel. The companion uses send for kickoff then loops on wait ' +
+      'until terminal. Parallel orchestration is strategy-based: auto, always, ' +
+      'or never. Runtime IPC, logs, prompt streams, digests, and completion ' +
+      `queue live under the private directory ${runtimeDir()}.`,
   },
 );
 
@@ -1482,14 +1515,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
               'Wait always blocks up to this bound.',
           },
           parallel: {
-            type: 'boolean',
+            type: 'string',
+            enum: ['auto', 'always', 'never'],
             description:
-              '[send] Default true. When true (default), prepends "/fleet " to the prompt so ' +
-              "Copilot's built-in orchestrator decomposes the task and dispatches isolated " +
-              'sub-agents in parallel where possible. Applies to all templates: general, research ' +
-              '(multi-source web research), and plan_review (per-claim verification). Set false to ' +
-              "skip /fleet overhead on strictly linear / single-source work where the orchestrator's " +
-              'decomposition-analysis cost would dominate.',
+              '[send] Parallel orchestration strategy. "auto" (default) prepends "/fleet " only ' +
+              'when the bridge judges the task broad enough to benefit. "always" forces /fleet. ' +
+              '"never" skips /fleet for strictly linear or single-source work.',
           },
           job_id:  { type: 'string',  description: '[wait|status|reply|cancel] Target a specific job.' },
           verbose: { type: 'boolean', description: '[status] Include full activity timeline when a job_id is given.' },
@@ -1516,6 +1547,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       outputSchema: {
         type: 'object',
         additionalProperties: true,
+        required: ['ok'],
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          status: { type: 'string' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          job_id: { type: 'string' },
+          thread: { type: 'string' },
+          prompt_id: { type: ['string', 'null'] },
+          session_id: { type: ['string', 'null'] },
+          digest_path: { type: ['string', 'null'] },
+          meta: { type: 'object', additionalProperties: true },
+          content: { type: 'string' },
+          fleet: { type: 'boolean' },
+          parallel: { type: 'string' },
+        },
       },
     },
   ],
@@ -1539,6 +1587,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (err && err.code === 'BRIDGE_SID_CONFLICT') {
       log('ERROR', 'sid conflict on MCP call:', err.message);
       return asJson({ ok: false, error: err.message, code: 'BRIDGE_SID_CONFLICT' });
+    }
+    if (/^copilot: /.test(err?.message || '')) {
+      log('WARN', 'invalid MCP arguments:', err.message);
+      return invalidArgsResult(err);
     }
     throw err;
   }
@@ -1643,6 +1695,7 @@ export function hydrateJobsFromLedger() {
       cwd: job.cwd || null,
       startedAt: job.startedAt || Date.now(),
       reqId: job.reqId || createReqId(),
+      fleet: !!job.fleet,
     }).catch((err) => log('ERROR', 'rehydrate watch error:', job.jobId, err.message));
     resumed++;
   }
@@ -1706,8 +1759,9 @@ const isMain = (() => {
 })();
 if (isMain) {
   // One-line startup log so a user troubleshooting host routing can grep
-  // /tmp/copilot-bridge.log for "host detected" and see what the bridge
-  // resolved on this run. The README's Diagnostics section points readers here.
+  // the private runtime bridge log for "host detected" and see what the
+  // bridge resolved on this run. The README's Diagnostics section points
+  // readers here.
   const { detectHost } = await import('../lib/host.mjs');
   logEvent('info', 'bridge.startup', { host_detected: detectHost() });
 
