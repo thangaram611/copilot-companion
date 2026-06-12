@@ -17,17 +17,17 @@ import {
   mkdirSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, 'install-codex-hooks.mjs');
 const PLUGIN_ROOT = dirname(HERE); // repo root
 
-function runScript(home, extraArgs = []) {
+function runScript(home, extraArgs = [], extraEnv = {}) {
   const args = [SCRIPT, '--plugin-root', PLUGIN_ROOT, '--yes', ...extraArgs];
   const r = spawnSync(process.execPath, args, {
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, ...extraEnv, HOME: home },
     encoding: 'utf8',
   });
   return { code: r.status, stdout: r.stdout, stderr: r.stderr };
@@ -76,7 +76,17 @@ test('CLI validation rejects missing/relative plugin roots and malformed existin
 
 test('fresh install writes the expected managed hook bundle with baked absolute paths', () => {
   withHome((home) => {
-    const r = runScript(home);
+    const transientPath = join(home, '.codex', 'tmp', 'arg0', 'codex-abc123');
+    const stablePath = join(home, 'bin');
+    const r = runScript(home, [], {
+      PATH: [
+        transientPath,
+        stablePath,
+        dirname(process.execPath),
+        stablePath,
+        process.env.PATH || '',
+      ].join(delimiter),
+    });
     assert.equal(r.code, 0, r.stderr);
     const cfg = readHooks(home);
 
@@ -90,6 +100,13 @@ test('fresh install writes the expected managed hook bundle with baked absolute 
     assert.match(cmds[0], /COPILOT_COMPANION_NODE='/);
     assert.ok(cmds[0].includes(PLUGIN_ROOT), 'plugin-root absolute path baked in');
     assert.ok(cmds[0].includes(process.execPath), 'node path baked in for hook scripts');
+    const pathMatch = cmds[0].match(/PATH='([^']+)'/);
+    assert.ok(pathMatch, 'PATH is baked into hook command');
+    const pathEntries = pathMatch[1].split(delimiter);
+    assert.equal(pathEntries.includes(transientPath), false,
+      'transient Codex temp PATH entries are not persisted');
+    assert.equal(pathEntries.filter((entry) => entry === stablePath).length, 1,
+      'PATH entries are deduplicated');
     assert.doesNotMatch(cmds.join('\n'), /\$\{CLAUDE_PLUGIN_ROOT\}/,
       'no ${VAR} placeholder because Codex does not expand user-scope hook env');
     assert.match(cmds[0], /install-agent-codex\.sh/);
@@ -138,6 +155,51 @@ test('reinstall is idempotent, preserves user hooks, and writes backups only for
       'one user entry + one managed entry = 2');
     assert.ok(readdirSync(join(home, '.codex')).filter((name) => /hooks\.json\.bak\./.test(name)).length >= 1,
       'modifying an existing hooks.json writes a backup');
+  });
+});
+
+test('install migrates legacy untagged copilot-companion hook entries', () => {
+  withHome((home) => {
+    const f = join(home, '.codex', 'hooks.json');
+    mkdirSync(dirname(f), { recursive: true });
+    const legacy = (script) => ({
+      type: 'command',
+      command: `CLAUDE_PLUGIN_ROOT='${PLUGIN_ROOT}' bash '${join(PLUGIN_ROOT, script)}'`,
+    });
+    writeFileSync(f, JSON.stringify({
+      hooks: {
+        SessionStart: [{
+          hooks: [
+            legacy('hooks/install-agent-codex.sh'),
+            legacy('hooks/prewarm-daemon.sh'),
+            legacy('hooks/install-deps.sh'),
+            legacy('hooks/drain-completions.sh'),
+          ],
+        }],
+        UserPromptSubmit: [{
+          hooks: [legacy('hooks/drain-completions.sh')],
+        }],
+        PostToolUse: [{
+          matcher: '.*',
+          hooks: [legacy('hooks/drain-completions.sh')],
+        }],
+      },
+    }, null, 2));
+
+    const r = runScript(home);
+    assert.equal(r.code, 0, r.stderr);
+    const cfg = readHooks(home);
+
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse']) {
+      assert.equal(cfg.hooks[ev].length, 1, `${ev} legacy entry replaced`);
+      assert.equal(managedEntries(cfg, ev).length, 1, `${ev} has one managed entry`);
+    }
+
+    const commands = cfg.hooks.SessionStart[0].hooks.map((hook) => hook.command);
+    assert.ok(commands.every((command) => command.includes('COPILOT_COMPANION_HOST=codex')),
+      'replacement commands are codex-host routed');
+    assert.ok(commands.every((command) => command.includes('COPILOT_COMPANION_NODE=')),
+      'replacement commands bake the node executable');
   });
 });
 

@@ -43,6 +43,12 @@ import readline from 'node:readline/promises';
 const HOOKS_FILE = path.join(homedir(), '.codex', 'hooks.json');
 const SENTINEL_KEY = '_managed_by';
 const SENTINEL_VALUE = 'copilot-companion';
+const MANAGED_HOOK_SCRIPTS = [
+  'hooks/install-agent-codex.sh',
+  'hooks/prewarm-daemon.sh',
+  'hooks/install-deps.sh',
+  'hooks/drain-completions.sh',
+];
 
 const args = process.argv.slice(2);
 const yes = args.includes('--yes') || args.includes('-y');
@@ -73,10 +79,28 @@ if (!path.isAbsolute(pluginRoot)) {
 // append_plugin_hook_sources). We export the var explicitly in the
 // command line so the underlying scripts (which still reference
 // $CLAUDE_PLUGIN_ROOT internally) can resolve their own paths.
+function scriptPath(scriptRel) {
+  return path.join(pluginRoot, scriptRel);
+}
+
+function buildHookPath(nodeDir) {
+  const seen = new Set();
+  const entries = [nodeDir, ...(process.env.PATH || '').split(path.delimiter)]
+    .filter(Boolean)
+    .filter((entry) => !entry.includes(`${path.sep}.codex${path.sep}tmp${path.sep}`));
+  const out = [];
+  for (const entry of entries) {
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    out.push(entry);
+  }
+  return out.join(path.delimiter);
+}
+
 function bashEntry(scriptRel, timeout) {
-  const abs = path.join(pluginRoot, scriptRel);
+  const abs = scriptPath(scriptRel);
   const nodeDir = path.dirname(process.execPath);
-  const hookPath = [nodeDir, process.env.PATH || ''].filter(Boolean).join(':');
+  const hookPath = buildHookPath(nodeDir);
   return {
     type: 'command',
     command:
@@ -146,15 +170,27 @@ if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
   cfg.hooks = {};
 }
 
-// Drop every entry whose top-level _managed_by === SENTINEL_VALUE. Used
-// by both uninstall and the re-install merge (so a re-install picks up
-// the latest path/script set without leaving stale duplicates from a
-// previous run).
+function commandReferencesManagedScript(command) {
+  if (typeof command !== 'string') return false;
+  return MANAGED_HOOK_SCRIPTS.some((scriptRel) => command.includes(scriptPath(scriptRel)));
+}
+
+function legacyManagedEntry(entry) {
+  if (!entry || typeof entry !== 'object' || !Array.isArray(entry.hooks)) return false;
+  const commands = entry.hooks.map((hook) => hook?.command);
+  return commands.length > 0 && commands.every(commandReferencesManagedScript);
+}
+
+// Drop every entry whose top-level _managed_by === SENTINEL_VALUE. Also drop
+// legacy source-checkout entries from pre-sentinel installs: those commands
+// referenced this checkout's hook scripts directly, but lacked
+// COPILOT_COMPANION_HOST=codex and would otherwise survive as duplicate stale
+// hooks after an upgrade.
 function dropManaged(eventName) {
   const list = cfg.hooks[eventName];
   if (!Array.isArray(list)) return;
   const filtered = list.filter((entry) => {
-    return !entry || entry[SENTINEL_KEY] !== SENTINEL_VALUE;
+    return !entry || (entry[SENTINEL_KEY] !== SENTINEL_VALUE && !legacyManagedEntry(entry));
   });
   if (filtered.length === 0) {
     delete cfg.hooks[eventName];

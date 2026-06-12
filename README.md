@@ -187,11 +187,13 @@ node scripts/install-codex-hooks.mjs --plugin-root "$(pwd)" --uninstall --yes
 The subagent invokes five split MCP tools: `mcp__copilot-bridge__copilot_send`,
 `mcp__copilot-bridge__copilot_wait`, `mcp__copilot-bridge__copilot_status`,
 `mcp__copilot-bridge__copilot_reply`, and
-`mcp__copilot-bridge__copilot_cancel`. Without explicit allow rules, the first
-invocation in a session can surface a permission prompt — even with
-`defaultMode: "auto"`. Plugin-level `settings.json` cannot declare permissions
-(Claude Code honors only `agent` and `subagentStatusLine` there), so the entries
-must live in your user or project settings.
+`mcp__copilot-bridge__copilot_cancel`. On Claude, it also runs one minimal
+`echo "$CLAUDE_CODE_SESSION_ID"` probe so the bridge can tag queue rows to the
+current Claude session. Without explicit allow rules, the first invocation in a
+session can surface a permission prompt — even with `defaultMode: "auto"`.
+Plugin-level `settings.json` cannot declare permissions (Claude Code honors
+only `agent` and `subagentStatusLine` there), so the entries must live in your
+user or project settings.
 
 **Pick whichever fits your install path:**
 
@@ -219,7 +221,8 @@ The plugin source lives under `~/.claude/plugins/cache/<hash>/...`, which isn't 
          "mcp__copilot-bridge__copilot_wait",
          "mcp__copilot-bridge__copilot_status",
          "mcp__copilot-bridge__copilot_reply",
-         "mcp__copilot-bridge__copilot_cancel"
+         "mcp__copilot-bridge__copilot_cancel",
+         "Bash(echo \"$CLAUDE_CODE_SESSION_ID\")"
        ]
      }
    }

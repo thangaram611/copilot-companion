@@ -197,7 +197,19 @@ If a new user turn appears between iterations, treat it as a new dispatch input 
 
 ## Return
 
-Two render paths, depending on the response shape. Pick one and emit nothing else (no preamble, no commentary).
+Three render paths, depending on the response shape. Pick one and emit nothing else (no preamble, no commentary).
+
+### Status envelope — response has `action: "status"` and `ok: true`
+
+Render exactly:
+
+    ## Copilot `unknown` — **status**
+
+    ```json
+    <the complete status response JSON>
+    ```
+
+This envelope is used for global status responses, which intentionally do not have `content` + `meta`. Render the response object as JSON. Do NOT read fields that are absent, and never emit `undefined`.
 
 ### Terminal envelope — response has `content` + `meta`
 

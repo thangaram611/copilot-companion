@@ -232,9 +232,9 @@ if [ "$DO_CLAUDE" = 1 ]; then
   # invocation of a copilot-bridge MCP tool can surface a permission
   # prompt. Plugin-shipped settings.json cannot declare permissions, so
   # we merge into the user's ~/.claude/settings.json.
-  printf "Granting MCP permission in ~/.claude/settings.json...\n"
+  printf "Granting Claude companion permissions in ~/.claude/settings.json...\n"
   if node "$SCRIPT_DIR/scripts/install-permissions.mjs" --host claude --yes; then
-    ok "permission entry present"
+    ok "permission entries present"
   else
     fail "permission step failed — see error above; re-run \`node scripts/install-permissions.mjs --host claude --yes\` after fixing"
     exit 1

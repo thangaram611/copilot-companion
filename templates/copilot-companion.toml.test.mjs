@@ -58,6 +58,8 @@ test('top-level TOML fields stay before the first table and use an allowlisted m
   const body = di[1];
   assert.match(body, /spawn_agent/);
   assert.match(body, /send_input/);
+  assert.match(body, /Status envelope/);
+  assert.match(body, /never emit `undefined`/);
   assert.doesNotMatch(body, /\bAgent\(\)/, 'Claude-specific Agent() call should be replaced');
   assert.doesNotMatch(body, /SendMessage\(\)/, 'Claude-specific SendMessage() should be replaced');
 });
