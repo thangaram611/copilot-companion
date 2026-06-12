@@ -35,6 +35,8 @@ import {
   copyFileSync,
   mkdirSync,
   renameSync,
+  accessSync,
+  constants,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -48,6 +50,14 @@ const MANAGED_HOOK_SCRIPTS = [
   'hooks/prewarm-daemon.sh',
   'hooks/install-deps.sh',
   'hooks/drain-completions.sh',
+];
+const STABLE_HOOK_PATH_DIRS = [
+  '/opt/homebrew/bin',
+  '/usr/local/bin',
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
 ];
 
 const args = process.argv.slice(2);
@@ -85,9 +95,10 @@ function scriptPath(scriptRel) {
 
 function buildHookPath(nodeDir) {
   const seen = new Set();
-  const entries = [nodeDir, ...(process.env.PATH || '').split(path.delimiter)]
-    .filter(Boolean)
-    .filter((entry) => !entry.includes(`${path.sep}.codex${path.sep}tmp${path.sep}`));
+  const entries = [
+    nodeDir,
+    ...STABLE_HOOK_PATH_DIRS,
+  ].filter(Boolean);
   const out = [];
   for (const entry of entries) {
     if (seen.has(entry)) continue;
@@ -97,17 +108,38 @@ function buildHookPath(nodeDir) {
   return out.join(path.delimiter);
 }
 
+function findExecutable(name, searchDirs) {
+  const candidates = searchDirs
+    .filter(Boolean)
+    .map((dir) => path.join(dir, name));
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return null;
+}
+
 function bashEntry(scriptRel, timeout) {
   const abs = scriptPath(scriptRel);
   const nodeDir = path.dirname(process.execPath);
   const hookPath = buildHookPath(nodeDir);
+  const npmBin = findExecutable('npm', [nodeDir, ...STABLE_HOOK_PATH_DIRS]);
+  const jqBin = findExecutable('jq', STABLE_HOOK_PATH_DIRS);
+  const env = [
+    `CLAUDE_PLUGIN_ROOT=${shellQuote(pluginRoot)}`,
+    'COPILOT_COMPANION_HOST=codex',
+    `COPILOT_COMPANION_NODE=${shellQuote(process.execPath)}`,
+  ];
+  if (npmBin) env.push(`COPILOT_COMPANION_NPM=${shellQuote(npmBin)}`);
+  if (jqBin) env.push(`COPILOT_COMPANION_JQ=${shellQuote(jqBin)}`);
+  env.push(`PATH=${shellQuote(hookPath)}`);
   return {
     type: 'command',
-    command:
-      `CLAUDE_PLUGIN_ROOT=${shellQuote(pluginRoot)} ` +
-      'COPILOT_COMPANION_HOST=codex ' +
-      `COPILOT_COMPANION_NODE=${shellQuote(process.execPath)} ` +
-      `PATH=${shellQuote(hookPath)} bash ${shellQuote(abs)}`,
+    command: `${env.join(' ')} /bin/bash ${shellQuote(abs)}`,
     timeout,
     [SENTINEL_KEY]: SENTINEL_VALUE,
   };

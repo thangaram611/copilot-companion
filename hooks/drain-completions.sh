@@ -24,12 +24,17 @@ LOCK="${QUEUE}.lock"
 HEARTBEAT_DIR="${COPILOT_HEARTBEAT_DIR:-$RUNTIME_DIR/heartbeats}"
 
 PAYLOAD=$(cat)
-if ! command -v jq >/dev/null 2>&1; then
+if [ -n "${COPILOT_COMPANION_JQ:-}" ] && [ -x "$COPILOT_COMPANION_JQ" ]; then
+  JQ_BIN="$COPILOT_COMPANION_JQ"
+else
+  JQ_BIN="$(command -v jq 2>/dev/null || true)"
+fi
+if [ -z "$JQ_BIN" ]; then
   echo "copilot-companion: jq not found; cannot drain completion queue" >&2
   exit 0
 fi
-HOOK_EVENT=$(printf '%s' "$PAYLOAD" | jq -r '.hook_event_name // "PostToolUse"')
-MY_SID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty')
+HOOK_EVENT=$(printf '%s' "$PAYLOAD" | "$JQ_BIN" -r '.hook_event_name // "PostToolUse"')
+MY_SID=$(printf '%s' "$PAYLOAD" | "$JQ_BIN" -r '.session_id // empty')
 
 # Without a session id we cannot tell which rows belong to us — refuse to
 # inject anything. Hook payloads from real Claude Code sessions always carry
@@ -92,7 +97,7 @@ TERMINAL_CUTOFF=$((NOW_MS - TERMINAL_TTL_MS))
 #   .deliver — rows belonging to this session, fresh, unconsumed → injected
 #   .keep    — rows belonging to other sessions, fresh, unconsumed → retained
 #   (everything else dropped: untagged, own-already-consumed, any-stale-past-TTL)
-PARTITIONS=$(jq -rs \
+PARTITIONS=$("$JQ_BIN" -rs \
   --arg sid "$MY_SID" \
   --argjson alertCutoff "$ALERT_CUTOFF" \
   --argjson terminalCutoff "$TERMINAL_CUTOFF" '
@@ -113,7 +118,7 @@ PARTITIONS=$(jq -rs \
 # appenders since the rename). printf >> uses O_APPEND; per-line writes for
 # JSONL rows in this codebase (terminal envelopes ~1-5 KB) are atomic on POSIX
 # below PIPE_BUF=4096 — well within margin in practice.
-KEEP_LINES=$(printf '%s' "$PARTITIONS" | jq -r '.keep[] | @json')
+KEEP_LINES=$(printf '%s' "$PARTITIONS" | "$JQ_BIN" -r '.keep[] | @json')
 if [ -n "$KEEP_LINES" ]; then
   printf '%s\n' "$KEEP_LINES" >> "$QUEUE"
 fi
@@ -121,7 +126,7 @@ fi
 rm -f "$DRAIN"
 
 # Build the injection content from the deliver partition (snapshot-derived).
-CONTENT=$(printf '%s' "$PARTITIONS" | jq -r '
+CONTENT=$(printf '%s' "$PARTITIONS" | "$JQ_BIN" -r '
   .deliver |
   map(
     "## Copilot `\(.jobId // "?")` — **\(.meta.status // .kind // "unknown")**\n\n" +
@@ -131,7 +136,7 @@ CONTENT=$(printf '%s' "$PARTITIONS" | jq -r '
 
 if [ -z "$CONTENT" ]; then exit 0; fi
 
-jq -n --arg ctx "$CONTENT" --arg evt "$HOOK_EVENT" '{
+"$JQ_BIN" -n --arg ctx "$CONTENT" --arg evt "$HOOK_EVENT" '{
   hookSpecificOutput: {
     hookEventName: $evt,
     additionalContext: $ctx

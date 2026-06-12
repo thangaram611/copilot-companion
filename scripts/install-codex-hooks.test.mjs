@@ -77,13 +77,16 @@ test('CLI validation rejects missing/relative plugin roots and malformed existin
 test('fresh install writes the expected managed hook bundle with baked absolute paths', () => {
   withHome((home) => {
     const transientPath = join(home, '.codex', 'tmp', 'arg0', 'codex-abc123');
-    const stablePath = join(home, 'bin');
+    const arbitraryPath = join(home, 'bin');
+    mkdirSync(arbitraryPath, { recursive: true });
+    writeFileSync(join(arbitraryPath, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(arbitraryPath, 'jq'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const r = runScript(home, [], {
       PATH: [
         transientPath,
-        stablePath,
+        arbitraryPath,
         dirname(process.execPath),
-        stablePath,
+        arbitraryPath,
         process.env.PATH || '',
       ].join(delimiter),
     });
@@ -98,15 +101,24 @@ test('fresh install writes the expected managed hook bundle with baked absolute 
     const cmds = sessionStart.hooks.map((h) => h.command);
     assert.match(cmds[0], /^CLAUDE_PLUGIN_ROOT='/);
     assert.match(cmds[0], /COPILOT_COMPANION_NODE='/);
+    assert.match(cmds[0], /\/bin\/bash '/);
     assert.ok(cmds[0].includes(PLUGIN_ROOT), 'plugin-root absolute path baked in');
     assert.ok(cmds[0].includes(process.execPath), 'node path baked in for hook scripts');
     const pathMatch = cmds[0].match(/PATH='([^']+)'/);
     assert.ok(pathMatch, 'PATH is baked into hook command');
     const pathEntries = pathMatch[1].split(delimiter);
+    assert.ok(pathEntries.includes(dirname(process.execPath)), 'node directory included in short PATH');
+    assert.ok(pathEntries.includes('/usr/bin'), 'system binary directory included in short PATH');
+    assert.ok(pathEntries.includes('/bin'), 'shell utility directory included in short PATH');
     assert.equal(pathEntries.includes(transientPath), false,
       'transient Codex temp PATH entries are not persisted');
-    assert.equal(pathEntries.filter((entry) => entry === stablePath).length, 1,
-      'PATH entries are deduplicated');
+    assert.equal(pathEntries.includes(arbitraryPath), false,
+      'arbitrary caller PATH entries are not persisted');
+    assert.equal(cmds[0].includes(join(arbitraryPath, 'npm')), false,
+      'npm is not baked from arbitrary caller PATH entries');
+    assert.equal(cmds[0].includes(join(arbitraryPath, 'jq')), false,
+      'jq is not baked from arbitrary caller PATH entries');
+    assert.equal(new Set(pathEntries).size, pathEntries.length, 'PATH entries are deduplicated');
     assert.doesNotMatch(cmds.join('\n'), /\$\{CLAUDE_PLUGIN_ROOT\}/,
       'no ${VAR} placeholder because Codex does not expand user-scope hook env');
     assert.match(cmds[0], /install-agent-codex\.sh/);
