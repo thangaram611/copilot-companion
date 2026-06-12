@@ -1,6 +1,7 @@
 threads/
 bridge-server/node_modules
 .plugin-data/
+dist/
 default-model
 *.log
 .DS_Store

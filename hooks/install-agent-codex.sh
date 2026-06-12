@@ -26,7 +26,7 @@
 # Sentinel-guarded: leaves alone any user-authored agent file at the same
 # path (no auto-generated header → don't touch).
 
-ROOT="${CLAUDE_PLUGIN_ROOT:-}"
+ROOT="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
 [ -n "$ROOT" ] || exit 0
 
 TEMPLATE="$ROOT/templates/copilot-companion.toml"

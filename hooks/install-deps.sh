@@ -1,19 +1,19 @@
 #!/bin/bash
 # install-deps.sh — SessionStart hook
 #
-# Ensures bridge-server's node_modules is installed and reachable from
-# ${CLAUDE_PLUGIN_ROOT}/bridge-server/. Idempotent, concurrent-safe (flock),
+# Ensures bridge-server's node_modules is installed and reachable from the
+# plugin root's bridge-server/. Idempotent, concurrent-safe (flock),
 # lockfile-aware (sha256 of package.json + package-lock.json).
 #
 # NODE_PATH does NOT work for ESM bare imports (Node >= 22 — verified
-# empirically). We install to ${CLAUDE_PLUGIN_DATA}/bridge-server/ for update
-# persistence and symlink it into ${CLAUDE_PLUGIN_ROOT}/bridge-server/ so
+# empirically). We install to plugin data when the host provides it for update
+# persistence and symlink it into the plugin root's bridge-server/ so
 # ESM's ancestor-directory resolver finds the deps.
 #
 # Exits silently on the fast path. Emits a one-line summary on install; writes
 # full npm output to install.log.
 
-ROOT="${CLAUDE_PLUGIN_ROOT:-}"
+ROOT="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
 [ -n "$ROOT" ] || exit 0
 
 TOOLS="$ROOT/hooks/node-tools.sh"
@@ -31,10 +31,10 @@ if [ -z "$NPM_BIN" ]; then
   exit 1
 fi
 
-# CLAUDE_PLUGIN_DATA is only populated for marketplace-installed plugins.
+# CLAUDE_PLUGIN_DATA/PLUGIN_DATA is only populated for marketplace-installed plugins.
 # For --plugin-dir local-dev runs, fall back to a sibling dir under the
 # plugin root (not pretty, but keeps local-dev functional).
-DATA="${CLAUDE_PLUGIN_DATA:-$ROOT/.plugin-data}"
+DATA="${CLAUDE_PLUGIN_DATA:-${PLUGIN_DATA:-$ROOT/.plugin-data}}"
 
 BUNDLED_PKG="$ROOT/bridge-server/package.json"
 BUNDLED_LOCK="$ROOT/bridge-server/package-lock.json"

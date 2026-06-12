@@ -1,7 +1,15 @@
 {
   "name": "copilot-companion",
   "version": "0.0.1",
-  "description": "GitHub Copilot delegation companion for Codex CLI. Spawns a subagent that owns a dedicated MCP bridge + ACP daemon and delegates token-heavy tasks to Copilot CLI, freeing the parent's context.",
+  "description": "GitHub Copilot delegation companion for Codex CLI. Spawns a subagent that owns a dedicated MCP bridge and delegates token-heavy coding tasks to Copilot CLI while keeping the parent context clean.",
+  "author": {
+    "name": "thangaram611",
+    "email": "thangaram611@gmail.com",
+    "url": "https://github.com/thangaram611"
+  },
+  "homepage": "https://github.com/thangaram611/copilot-companion",
+  "repository": "https://github.com/thangaram611/copilot-companion",
+  "license": "MIT",
   "keywords": [
     "copilot",
     "delegation",
@@ -9,5 +17,26 @@
     "subagent",
     "acp",
     "codex"
-  ]
+  ],
+  "hooks": "./hooks/hooks-codex.json",
+  "interface": {
+    "displayName": "Copilot Companion",
+    "shortDescription": "Delegate large coding tasks to GitHub Copilot.",
+    "longDescription": "Adds a Codex subagent that delegates implementation, review, and research work to GitHub Copilot CLI through a private MCP bridge, per-host runtime state, and completion drain hooks.",
+    "developerName": "thangaram611",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/thangaram611/copilot-companion",
+    "defaultPrompt": [
+      "Ask Copilot to review this repository",
+      "Delegate this implementation to Copilot",
+      "Check Copilot job status"
+    ],
+    "brandColor": "#0969DA",
+    "screenshots": []
+  }
 }

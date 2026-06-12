@@ -27,7 +27,7 @@
 # the parser drop the file from /agents listing. We insert the sentinel as
 # line 2, right after the opening `---`.
 
-ROOT="${CLAUDE_PLUGIN_ROOT:-}"
+ROOT="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
 [ -n "$ROOT" ] || exit 0
 
 TEMPLATE="$ROOT/templates/copilot-companion.md"

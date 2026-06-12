@@ -16,7 +16,7 @@
 # only use Node built-ins (node:net, node:fs, node:child_process, etc.) — no
 # bare imports — so they don't need bridge-server/node_modules to be present.
 
-ROOT="${CLAUDE_PLUGIN_ROOT:-}"
+ROOT="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
 [ -n "$ROOT" ] || exit 0
 
 CLIENT="$ROOT/bridge-server/daemon-client.mjs"

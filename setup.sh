@@ -72,7 +72,8 @@ fi
 if [ "$DO_CODEX" = 1 ]; then
   echo "    .codex-plugin/plugin.json        Codex plugin manifest"
   echo "    templates/copilot-companion.toml subagent template (TOML)"
-  echo "    hooks/hooks.json                 hook source; setup also materializes dev hooks"
+  echo "    hooks/hooks-codex.json           plugin-scoped hooks for marketplace packages"
+  echo "    scripts/install-codex-hooks.mjs  source-checkout dev hook materialization"
 fi
 echo ""
 
@@ -262,9 +263,10 @@ fi
 
 # --- Step 6: Codex-host install (subagent TOML + dev hook materialization) ---
 #
-# Codex has first-class plugin marketplace commands now. For this source
-# checkout, setup materializes the custom TOML agent and dev hooks directly;
-# the published path is marketplace registration plus `codex plugin add`.
+# Codex has first-class plugin marketplace commands now. Published packages use
+# hooks/hooks-codex.json in plugin scope. For this source checkout, setup
+# materializes the custom TOML agent and dev hooks directly so local iteration
+# does not require a package/install round trip.
 
 if [ "$DO_CODEX" = 1 ]; then
   printf "=== Codex CLI host install ===\n"

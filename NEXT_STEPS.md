@@ -46,9 +46,10 @@ claude plugin validate .
    - Next: verify Claude and Codex host tool registration, permission prompts, and subagent instructions against the split surface.
 
 4. Published packaging
-   - Finalize Codex marketplace packaging and decide whether lifecycle hooks should be
-     plugin-scoped there instead of dev-materialized into `~/.codex/hooks.json`.
-   - Re-check Claude marketplace packaging after `defaultEnabled: false`.
+   - Done in current packaging phase: Codex manifest now carries marketplace UI metadata and plugin-scoped hooks via `hooks/hooks-codex.json`.
+   - Done in current packaging phase: `scripts/build-codex-marketplace.mjs` materializes the Codex-required marketplace root with `./plugins/copilot-companion`.
+   - Source-checkout Codex setup still uses `scripts/install-codex-hooks.mjs` to merge dev hooks into `~/.codex/hooks.json`; published Codex packages no longer need that mutation.
+   - Verified in current packaging phase: generated Codex marketplace package installs with isolated `CODEX_HOME` on `codex-cli 0.139.0`; Claude marketplace validation also passes with `defaultEnabled: false`.
 
 5. Live end-to-end smoke
    - Run one Claude-host delegation and one Codex-host delegation in a disposable repo.

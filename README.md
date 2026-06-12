@@ -35,6 +35,7 @@ copilot-companion/                            ← plugin root
 │   └── copilot-companion.toml                Codex subagent template (TOML; runtime equivalent)
 ├── hooks/
 │   ├── hooks.json                            Claude SessionStart + PostToolUse + UserPromptSubmit
+│   ├── hooks-codex.json                      Codex plugin-scoped lifecycle hooks
 │   ├── drain-completions.sh                  surfaces orphan Copilot completions (host-agnostic)
 │   ├── install-deps.sh                       installs bridge-server node_modules
 │   ├── install-agent.sh                      Claude SessionStart: materialize Markdown subagent
@@ -58,7 +59,8 @@ copilot-companion/                            ← plugin root
 │   ├── copilot-acp-daemon.mjs                long-lived Copilot parent process
 │   ├── copilot-acp-client.mjs                daemon stop/status CLI
 │   ├── install-permissions.mjs               --host claude (Claude permissions); --host codex no-op
-│   └── install-codex-hooks.mjs               dev checkout hook materialization
+│   ├── install-codex-hooks.mjs               source-checkout Codex hook materialization
+│   └── build-codex-marketplace.mjs           generated Codex marketplace package
 ├── setup.sh                                  --host claude|codex|both (default: both)
 └── ~/.{claude,codex}/copilot-companion/      per-host state + private runtime
 ```
@@ -118,17 +120,31 @@ Once submitted and approved:
 
 ## Install for Codex CLI
 
-Current Codex CLI supports plugin marketplaces and `codex plugin add`. The
-published install path is:
+Current Codex CLI supports plugin marketplaces and `codex plugin add`. Codex
+marketplaces must have `.agents/plugins/marketplace.json` at the marketplace
+root and plugin source under `./plugins/<name>`, so this dual-host source tree
+builds a Codex marketplace package before publishing or local marketplace
+testing:
+
+```bash
+node scripts/build-codex-marketplace.mjs --out dist/codex-marketplace
+codex plugin marketplace add dist/codex-marketplace
+codex plugin add copilot-companion@copilot-companion --json
+```
+
+The generated package installs plugin-scoped Codex hooks from
+`hooks/hooks-codex.json`; it does not mutate `~/.codex/hooks.json`.
+
+For an already-published marketplace, the user-facing install path is:
 
 ```bash
 codex plugin marketplace add <marketplace-source>
 codex plugin add copilot-companion@<marketplace-name> --json
 ```
 
-For this source checkout, use the local dev setup path. It materializes the
-custom TOML agent and dev hooks directly without requiring a marketplace
-publish/install round trip:
+For this source checkout, use the local dev setup path when you do not want a
+marketplace package/install round trip. It materializes the custom TOML agent
+and dev hooks directly:
 
 ```bash
 bash setup.sh --host codex
@@ -137,7 +153,7 @@ bash setup.sh --host codex
 What that does, end-to-end:
 
 1. **Materializes the TOML subagent** to `~/.codex/agents/copilot-companion.toml` (the only place Codex looks for unmanaged subagents — `~/.codex/agents/` and `<repo>/.codex/agents/` per `agent_roles.rs`). `${CLAUDE_PLUGIN_ROOT}` in the bridge MCP `args` is substituted to the absolute install path at materialization time, because Codex MCP `args` are runtime literals (no `${VAR}` expansion).
-2. **Merges dev hook entries** into `~/.codex/hooks.json` via `scripts/install-codex-hooks.mjs`. Pre-existing user hooks are preserved (read-merge-backup-write); each managed entry carries `_managed_by: "copilot-companion"` so a later `--uninstall` only removes our entries. A timestamped backup is written before each modification. The marketplace package can move these hooks into plugin scope once that packaging is finalized.
+2. **Merges source-checkout dev hook entries** into `~/.codex/hooks.json` via `scripts/install-codex-hooks.mjs`. Pre-existing user hooks are preserved (read-merge-backup-write); each managed entry carries `_managed_by: "copilot-companion"` so a later `--uninstall` only removes our entries. A timestamped backup is written before each modification. Published Codex packages use plugin-scoped hooks from `hooks/hooks-codex.json` instead.
 3. **Skips Claude-specific steps**: no `~/.claude/settings.json` permission injection (Codex's permission/sandbox/trust model is not addressed by this plan), no `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` (Codex's `features.multi_agent` is `Stable` and on by default).
 4. **Writes a diagnostic marker** at `~/.codex/copilot-companion/.host` containing the literal `codex` so you can `cat` it to confirm what was installed where.
 
@@ -456,7 +472,9 @@ node scripts/doctor.mjs --json
 - `node --check` should pass on every `.mjs` after edits.
 - `jq` is required for hook delivery.
 - Tests: `node --test $(find bridge-server lib scripts hooks templates -name '*.test.mjs')`
-  — covers `bridge-server/{server,validation}.test.mjs`, `lib/{state,host,log,prompt-inspect,prompt-supervisor,heartbeat}.test.mjs`, `scripts/{copilot-acp-daemon,install-codex-hooks}.test.mjs`, `hooks/drain-completions.test.mjs`, and `templates/copilot-companion.toml.test.mjs`.
+  — covers `bridge-server/{server,validation}.test.mjs`, `lib/{state,host,log,prompt-inspect,prompt-supervisor,heartbeat}.test.mjs`, `scripts/{build-codex-marketplace,copilot-acp-daemon,install-codex-hooks}.test.mjs`, `hooks/drain-completions.test.mjs`, and `templates/copilot-companion.toml.test.mjs`.
+- Build and validate the generated Codex marketplace package:
+  `node scripts/build-codex-marketplace.mjs --out dist/codex-marketplace`, then install it in an isolated `CODEX_HOME` during release checks.
 - Validate the Claude plugin manifest: `claude plugin validate .` from the plugin root.
 
 ## Out of scope
