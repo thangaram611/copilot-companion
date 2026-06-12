@@ -34,8 +34,9 @@ claude plugin validate .
    - Next: keep ACP as default until full Claude-host and Codex-host end-to-end smokes pass.
 
 2. MCP resource polish
-   - Expose digest files through MCP resources or `resource_link` results.
-   - Keep file paths in responses until both Claude and Codex behavior is verified.
+   - Done in current MCP resource phase: expose digest files through MCP `resources/list`, `resources/templates/list`, `resources/read`, and tool-result `resource_link` blocks.
+   - File paths intentionally remain in responses until both Claude and Codex resource UX is verified.
+   - Next: run full Claude-host and Codex-host resource reads from real companion turns, then decide whether digest paths can become debug-only.
 
 3. MCP tool-surface split
    - Evaluate replacing the multiplexed `copilot` tool with separate tools:

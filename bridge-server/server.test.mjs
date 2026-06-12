@@ -196,6 +196,56 @@ test('wait response formatting covers timeout, digest metadata, unreachable deta
   jobs.delete('job-empty-completed');
 });
 
+test('digest MCP resources list, read, template, and tool resource links', async () => {
+  const mod = await bridge();
+  const {
+    digestJobIdFromResourceUri,
+    digestResourceForJobId,
+    digestResourceUri,
+    listDigestResourceTemplates,
+    listDigestResources,
+    readDigestResource,
+  } = mod;
+  const { jobs } = mod;
+  const { digestPath } = await import('../lib/prompt-digest.mjs');
+
+  const jobId = 'job-resource-1';
+  const path = digestPath(jobId);
+  writeFileSync(path, '# Digest\n\nResource body.\n');
+
+  assert.equal(digestResourceUri(jobId), `copilot-digest://${jobId}`);
+  assert.equal(digestJobIdFromResourceUri(`copilot-digest://${jobId}`), jobId);
+  assert.equal(digestJobIdFromResourceUri('file:///tmp/nope'), null);
+
+  const resource = digestResourceForJobId(jobId);
+  assert.equal(resource.uri, `copilot-digest://${jobId}`);
+  assert.equal(resource.mimeType, 'text/markdown');
+  assert.equal(resource._meta.digest_path, path);
+  assert.equal(listDigestResources().some((r) => r.uri === resource.uri), true);
+
+  const templates = listDigestResourceTemplates();
+  assert.equal(templates[0].uriTemplate, 'copilot-digest://{job_id}');
+
+  const read = readDigestResource(resource.uri);
+  assert.equal(read.contents[0].uri, resource.uri);
+  assert.match(read.contents[0].text, /Resource body/);
+  assert.throws(() => readDigestResource('copilot-digest://missing-resource'), /digest not found/);
+  assert.throws(() => readDigestResource('copilot-digest://bad/path'), /unknown digest resource uri/);
+
+  jobs.set(jobId, terminalJob(jobId, 'completed', {
+    promptId: 'p-resource',
+    summary: { message: 'done.\n\nRUBBER-DUCK: clean.', toolCalls: [] },
+  }));
+  const result = await mod.dispatch({ action: 'status', job_id: jobId, verbose: false });
+  const body = parse(result);
+  assert.equal(body.digest_path, path);
+  assert.equal(result.content[0].type, 'text');
+  const link = result.content.find((entry) => entry.type === 'resource_link');
+  assert.equal(link.uri, resource.uri);
+  assert.equal(link.mimeType, 'text/markdown');
+  jobs.delete(jobId);
+});
+
 test('buildJobResponse and session-reborn content preserve bridge-owned status/detail metadata', async () => {
   const { buildJobResponse, formatTerminalContent } = await bridge();
   assert.equal(buildJobResponse(

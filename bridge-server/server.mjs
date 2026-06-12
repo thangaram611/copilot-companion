@@ -28,10 +28,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+  ListResourceTemplatesRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   appendFileSync, readFileSync, writeFileSync,
   renameSync, existsSync, realpathSync, chmodSync, unlinkSync,
+  readdirSync, statSync,
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -59,7 +63,7 @@ import {
   writeJob, readJob, listJobsForSession, deleteJob,
 } from '../lib/state.mjs';
 import { sanitizeHostSessionId } from '../lib/host.mjs';
-import { queuePath, promptEventsPath, runtimeDir, bridgeLogFile, daemonLogFile } from '../lib/runtime-paths.mjs';
+import { queuePath, promptEventsPath, runtimeDir, bridgeLogFile, daemonLogFile, digestDir } from '../lib/runtime-paths.mjs';
 import { createReqId, withReq, logEvent } from '../lib/log.mjs';
 import { writeDigest, digestPath } from '../lib/prompt-digest.mjs';
 
@@ -391,6 +395,98 @@ export function refreshDigestForJob(job, statusOverride = null) {
     log('WARN', 'refreshDigestForJob failed:', job.jobId, err.message);
     return null;
   }
+}
+
+const DIGEST_RESOURCE_SCHEME = 'copilot-digest';
+const DIGEST_RESOURCE_MIME_TYPE = 'text/markdown';
+const DIGEST_RESOURCE_FILE_RE = /^copilot-digest-([a-zA-Z0-9._-]+)\.md$/;
+const DIGEST_RESOURCE_URI_RE = /^copilot-digest:\/\/([a-zA-Z0-9._-]+)$/;
+
+export function digestResourceUri(jobId) {
+  if (!digestPath(jobId)) return null;
+  return `${DIGEST_RESOURCE_SCHEME}://${jobId}`;
+}
+
+export function digestJobIdFromResourceUri(uri) {
+  const match = DIGEST_RESOURCE_URI_RE.exec(String(uri || ''));
+  return match ? match[1] : null;
+}
+
+function digestJobIdsFromDisk() {
+  const ids = new Set();
+  try {
+    for (const name of readdirSync(digestDir())) {
+      const match = DIGEST_RESOURCE_FILE_RE.exec(name);
+      if (match) ids.add(match[1]);
+    }
+  } catch {}
+  for (const jobId of jobs.keys()) ids.add(jobId);
+  return [...ids].sort();
+}
+
+export function digestResourceForJobId(jobId) {
+  const path = digestPath(jobId);
+  const uri = digestResourceUri(jobId);
+  if (!path || !uri || !existsSync(path)) return null;
+  let stat;
+  try { stat = statSync(path); }
+  catch { return null; }
+  if (!stat.isFile()) return null;
+  const job = jobs.get(jobId);
+  const status = job?.status ? ` (${job.status})` : '';
+  return {
+    uri,
+    name: `copilot-digest-${jobId}`,
+    title: `Copilot digest ${jobId}`,
+    description: `Smart transcript digest for Copilot job ${jobId}${status}.`,
+    mimeType: DIGEST_RESOURCE_MIME_TYPE,
+    size: stat.size,
+    _meta: {
+      job_id: jobId,
+      digest_path: path,
+      updated_at: stat.mtime.toISOString(),
+    },
+  };
+}
+
+export function listDigestResources() {
+  return digestJobIdsFromDisk()
+    .map((jobId) => digestResourceForJobId(jobId))
+    .filter(Boolean);
+}
+
+export function listDigestResourceTemplates() {
+  return [{
+    uriTemplate: `${DIGEST_RESOURCE_SCHEME}://{job_id}`,
+    name: 'copilot-digest',
+    title: 'Copilot job digest',
+    description: 'Read a smart transcript digest for a Copilot companion job by job_id.',
+    mimeType: DIGEST_RESOURCE_MIME_TYPE,
+  }];
+}
+
+export function readDigestResource(uri) {
+  const jobId = digestJobIdFromResourceUri(uri);
+  if (!jobId) throw new Error(`unknown digest resource uri: ${uri}`);
+  const resource = digestResourceForJobId(jobId);
+  if (!resource) throw new Error(`digest not found for job_id: ${jobId}`);
+  return {
+    contents: [{
+      uri: resource.uri,
+      mimeType: DIGEST_RESOURCE_MIME_TYPE,
+      text: readFileSync(resource._meta.digest_path, 'utf8'),
+    }],
+  };
+}
+
+function digestResourceLinkForResult(obj) {
+  const jobId = obj?.job_id || obj?.meta?.job_id;
+  const advertisedPath = obj?.digest_path || obj?.meta?.digest_path;
+  if (!jobId || !advertisedPath) return null;
+  const expectedPath = digestPath(jobId);
+  if (!expectedPath || expectedPath !== advertisedPath) return null;
+  const resource = digestResourceForJobId(jobId);
+  return resource ? { type: 'resource_link', ...resource } : null;
 }
 
 export function buildJobResponse(job, inspect = null, { includeTimeline = false } = {}) {
@@ -1130,8 +1226,11 @@ function failedToolsFromJsonl(promptId) {
 // --- Action handlers --------------------------------------------------------
 
 function asJson(obj) {
+  const content = [{ type: 'text', text: JSON.stringify(obj) }];
+  const digestResourceLink = digestResourceLinkForResult(obj);
+  if (digestResourceLink) content.push(digestResourceLink);
   const result = {
-    content: [{ type: 'text', text: JSON.stringify(obj) }],
+    content,
     structuredContent: obj,
   };
   if (obj?.ok === false) result.isError = true;
@@ -1431,7 +1530,7 @@ async function handleStatus({ job_id, verbose }) {
 const mcp = new Server(
   { name: 'copilot-bridge', version: '0.0.1' },
   {
-    capabilities: { tools: {} },
+    capabilities: { tools: {}, resources: {} },
     instructions:
       'Internal MCP server for the copilot-companion subagent. Spawned inline ' +
       'per invocation by the companion agent. Actions: send (returns ' +
@@ -1443,6 +1542,18 @@ const mcp = new Server(
       `queue live under the private directory ${runtimeDir()}.`,
   },
 );
+
+mcp.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: listDigestResources(),
+}));
+
+mcp.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  resourceTemplates: listDigestResourceTemplates(),
+}));
+
+mcp.setRequestHandler(ReadResourceRequestSchema, async (req) => (
+  readDigestResource(req.params.uri)
+));
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [

@@ -308,8 +308,15 @@ Contents (each section auto-skipped when empty):
 
 The path is surfaced via `meta.digest_path` on every terminal response
 and via `digest_path` on the `still_running` wait response and on every
-`status` reply. Reading the digest file is the canonical way for the
-parent agent to track progress without making another bridge round-trip.
+`status` reply. When the digest file exists, the MCP tool result also includes
+a `resource_link` content block for `copilot-digest://<jobId>`. The bridge
+advertises the same digest files through MCP `resources/list`,
+`resources/templates/list`, and `resources/read`, so hosts that support MCP
+resources can read the markdown digest without relying on local filesystem
+paths. The file paths remain in the JSON payload for debugging and for hosts
+whose resource UX still needs live verification. Reading the digest is the
+canonical way for the parent agent to track progress without making another
+bridge round-trip.
 
 ## Thread continuity
 
