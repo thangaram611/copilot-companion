@@ -1,130 +1,129 @@
 # Copilot Companion
 
-GitHub Copilot delegation for Claude Code **and Codex CLI** — **dual-host plugin with subagent-isolated architecture**.
+GitHub Copilot delegation for Claude Code **and Codex CLI** — a dual-host plugin with a subagent-isolated architecture.
 
-The entire public surface is a single subagent shipped inside this plugin (one
-Markdown variant for Claude Code, one TOML variant for Codex CLI). Main Claude
-or main Codex has **zero** direct MCP visibility into copilot-bridge; the MCP
-server is declared only in the subagent's frontmatter and only the subagent
-sees it. There is no slash command, no user-scope MCP registration, no skill,
-no session opt-in, no pause. Host hooks are used only for materialization,
-dependency prewarm, heartbeat, and completion drain. Sends use
-`parallel: "auto"` by default: the bridge invokes Copilot's built-in `/fleet`
-orchestrator only when the task looks broad enough to benefit; see
-[Parallel orchestration](#parallel-orchestration).
+The entire public surface is a single subagent shipped inside this plugin (a
+Markdown variant for Claude Code, a TOML variant for Codex CLI). Main Claude /
+main Codex has **zero** direct MCP visibility into the bridge; the MCP server is
+declared only in the subagent's frontmatter, so only the subagent sees it. There
+is no slash command, no user-scope MCP registration, no skill, no session
+opt-in. Host hooks handle only materialization, dependency prewarm, heartbeat,
+and completion drain.
+
+Sends default to `parallel: "auto"`: the bridge invokes Copilot's built-in
+`/fleet` orchestrator only when the task looks broad enough to benefit (see
+[Parallel orchestration](#parallel-orchestration)).
 
 > **Host selection.** `setup.sh` defaults to `--host both`. Pass `--host claude`
-> or `--host codex` only when you intentionally want one host surface.
-
+> or `--host codex` to install one surface only.
+>
 > **Claude packaging caveat.** Claude plugin-bundled subagents ignore
-> `mcpServers`, `hooks`, and `permissionMode` frontmatter for security. This
-> product therefore materializes `templates/copilot-companion.md` into
-> `~/.claude/agents/copilot-companion.md`; that standalone agent is the one
-> that owns the private MCP bridge.
+> `mcpServers`, `hooks`, and `permissionMode` frontmatter for security. So the
+> Claude `SessionStart` hook materializes `templates/copilot-companion.md` into
+> `~/.claude/agents/copilot-companion.md`; that standalone agent owns the
+> private MCP bridge.
 
 ## Architecture at a glance
 
 ```
 copilot-companion/                            ← plugin root
 ├── .claude-plugin/
-│   └── plugin.json                           Claude Code plugin manifest
+│   ├── plugin.json                           Claude Code plugin manifest
+│   └── marketplace.json                      one-plugin marketplace (source "./")
 ├── .codex-plugin/
 │   └── plugin.json                           Codex CLI plugin manifest
 ├── templates/
-│   ├── copilot-companion.md                  Claude subagent template (Markdown + YAML frontmatter)
-│   └── copilot-companion.toml                Codex subagent template (TOML; runtime equivalent)
+│   ├── copilot-companion.md                  Claude subagent (Markdown + YAML frontmatter)
+│   └── copilot-companion.toml                Codex subagent (TOML; runtime equivalent)
 ├── hooks/
 │   ├── hooks.json                            Claude SessionStart + PostToolUse + UserPromptSubmit
 │   ├── hooks-codex.json                      Codex plugin-scoped lifecycle hooks
-│   ├── drain-completions.sh                  surfaces orphan Copilot completions (host-agnostic)
+│   ├── node-tools.sh                         shared Node/npm resolver (GUI-launched hosts)
+│   ├── drain-completions.sh                  surfaces orphan Copilot completions
 │   ├── install-deps.sh                       installs bridge-server node_modules
 │   ├── install-agent.sh                      Claude SessionStart: materialize Markdown subagent
 │   ├── install-agent-codex.sh                Codex SessionStart: materialize TOML subagent
 │   └── prewarm-daemon.sh                     starts copilot-acp-daemon early
 ├── bridge-server/
-│   ├── server.mjs                            `copilot` MCP tool, 5 actions:
-│   │                                         send | wait | status | reply | cancel
+│   ├── server.mjs                            5 split MCP tools: copilot_send | copilot_wait
+│   │                                         | copilot_status | copilot_reply | copilot_cancel
 │   ├── copilot-runtime.mjs                   runtime adapter boundary (ACP default)
 │   ├── copilot-sdk-runtime.mjs               experimental Copilot SDK adapter
-│   ├── validation.mjs                        per-action field allow-lists, schemas
+│   ├── validation.mjs                        per-action field allow-lists, schemas, templates
 │   └── package.json                          runtime deps (MCP + Copilot SDKs)
 ├── lib/                                      state + logging + prompt utilities
 │   ├── host.mjs                              host detection + per-host paths (claude | codex)
 │   ├── runtime-paths.mjs                     private runtime dirs for IPC, logs, digests
-│   ├── state.mjs                             default-model + threads/ state layer
-│   ├── log.mjs                               structured logging helper
-│   ├── prompt-supervisor.mjs                 wraps Copilot prompts (rubber-duck, etc.)
+│   ├── state.mjs                             default-model + threads/ + job state layer
+│   ├── log.mjs                               structured JSONL logger
+│   ├── heartbeat.mjs                         daemon/bridge heartbeat
+│   ├── prompt-digest.mjs                     smart transcript digest builder
+│   ├── prompt-supervisor.mjs                 wraps Copilot prompts (stuck detection, alerts)
 │   └── prompt-inspect.mjs                    diagnostic dump for a Copilot prompt
 ├── scripts/
 │   ├── copilot-acp-daemon.mjs                long-lived Copilot parent process
 │   ├── copilot-acp-client.mjs                daemon stop/status CLI
-│   ├── install-permissions.mjs               --host claude (Claude permissions); --host codex no-op
+│   ├── install-permissions.mjs               --host claude (writes allow rules); --host codex no-op
 │   ├── install-codex-hooks.mjs               source-checkout Codex hook materialization
-│   └── build-codex-marketplace.mjs           generated Codex marketplace package
+│   ├── build-codex-marketplace.mjs           builds the Codex marketplace package
+│   └── doctor.mjs                            environment diagnostics (--json supported)
 ├── setup.sh                                  --host claude|codex|both (default: both)
-└── ~/.{claude,codex}/copilot-companion/      per-host state + private runtime
+└── ~/.{claude,codex}/copilot-companion/      per-host state + private runtime/
 ```
 
-## Installation
+## Prerequisites
 
-`claude plugin install` only accepts plugins registered in a marketplace — there
-is no `--plugin-dir` flag on the install subcommand. For persistent local
-installs we ship a small `marketplace.json` alongside `plugin.json`, so adding
-this directory registers a one-plugin dev marketplace that you can install from.
+- **Node.js ≥ 22.**
+- **GitHub Copilot CLI authenticated.** `npm i -g @github/copilot`, then run
+  `copilot` once interactively to complete GitHub OAuth. The daemon resolves the
+  binary in order: `$COPILOT_BIN` → `command -v copilot` → `/opt/homebrew/bin/copilot`.
+  On Linux, export the absolute path: `export COPILOT_BIN=$(command -v copilot)`.
+- **`jq`** — required for hook delivery.
+- **Claude only:** `export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` (needed for
+  SendMessage-based thread continuity). On Codex this is unnecessary —
+  `features.multi_agent` is stable and on by default.
 
-### Persistent install from this directory
+## Install — Claude Code
+
+`claude plugin install` only accepts plugins registered in a marketplace. The
+repo is its own marketplace (`marketplace.json` has `source: "./"`), so adding
+this directory registers a one-plugin marketplace named `copilot-companion`.
 
 ```bash
-# Register the local directory as a marketplace (one-time)
+# one-time: register the local directory as a marketplace
 claude plugin marketplace add /path/to/copilot-companion
-
-# Install the plugin from that marketplace
-claude plugin install copilot-companion@copilot-companion-dev
+# install from it
+claude plugin install copilot-companion@copilot-companion
 ```
 
-Claude Code copies the plugin to `~/.claude/plugins/cache/`. On the first
-session after install, the `SessionStart` hook runs `hooks/install-deps.sh`,
-which installs the bridge-server's `node_modules` to
+On the first session after install, the `SessionStart` hook runs
+`hooks/install-deps.sh`, which installs the bridge-server's `node_modules` under
 `${CLAUDE_PLUGIN_DATA}/bridge-server/` (persistent across plugin updates) and
 symlinks it into `${CLAUDE_PLUGIN_ROOT}/bridge-server/node_modules` so Node's
-ESM resolver finds `@modelcontextprotocol/sdk` via ancestor-directory walk.
+ESM resolver finds `@modelcontextprotocol/sdk`.
 
-To pick up changes you make to this directory, bump `version` in
-`.claude-plugin/plugin.json`, then:
+To pick up local changes, bump `version` in `.claude-plugin/plugin.json`, then:
 
 ```bash
-claude plugin marketplace update copilot-companion-dev
-claude plugin update copilot-companion@copilot-companion-dev
+claude plugin marketplace update copilot-companion
+claude plugin update copilot-companion@copilot-companion
 ```
 
-### Session-scoped (no install, fastest iteration)
+**Session-scoped (no install, fastest iteration):**
 
 ```bash
 claude --plugin-dir /path/to/copilot-companion
 ```
 
-Loads the plugin for one session directly from source — no marketplace, no
-cache. Note that `${CLAUDE_PLUGIN_DATA}` is not created for `--plugin-dir`
-runs; `install-deps.sh` falls back to `${CLAUDE_PLUGIN_ROOT}/.plugin-data/`
-so ESM resolution still works. Alternatively run `bash setup.sh` once to
-install deps directly into `bridge-server/node_modules/`.
+Loads the plugin for one session from source. `${CLAUDE_PLUGIN_DATA}` is not
+created for `--plugin-dir` runs, so `install-deps.sh` falls back to
+`${CLAUDE_PLUGIN_ROOT}/.plugin-data/`. Or run `bash setup.sh` once to install
+deps directly into `bridge-server/node_modules/`.
 
-### Via a published marketplace (end users)
+## Install — Codex CLI
 
-Once submitted and approved:
-
-```
-/plugin marketplace add <marketplace-source>
-/plugin install copilot-companion@<marketplace-name>
-```
-
-## Install for Codex CLI
-
-Current Codex CLI supports plugin marketplaces and `codex plugin add`. Codex
-marketplaces must have `.agents/plugins/marketplace.json` at the marketplace
-root and plugin source under `./plugins/<name>`, so this dual-host source tree
-builds a Codex marketplace package before publishing or local marketplace
-testing:
+Codex marketplaces must have `.agents/plugins/marketplace.json` at the root and
+plugin source under `./plugins/<name>`, so build the package first:
 
 ```bash
 node scripts/build-codex-marketplace.mjs --out dist/codex-marketplace
@@ -135,127 +134,92 @@ codex plugin add copilot-companion@copilot-companion --json
 The generated package installs plugin-scoped Codex hooks from
 `hooks/hooks-codex.json`; it does not mutate `~/.codex/hooks.json`.
 
-For an already-published marketplace, the user-facing install path is:
+**Source-checkout dev path** (no marketplace round-trip) materializes the TOML
+agent and dev hooks directly:
 
 ```bash
-codex plugin marketplace add <marketplace-source>
-codex plugin add copilot-companion@<marketplace-name> --json
+bash setup.sh --host codex      # or --host both
 ```
 
-For this source checkout, use the local dev setup path when you do not want a
-marketplace package/install round trip. It materializes the custom TOML agent
-and dev hooks directly:
+What that does:
 
-```bash
-bash setup.sh --host codex
-```
+1. Materializes the TOML subagent to `~/.codex/agents/copilot-companion.toml`
+   (the only path Codex reads for unmanaged subagents). `${CLAUDE_PLUGIN_ROOT}`
+   in the bridge MCP `args` is substituted to the absolute install path at
+   materialization time, because Codex MCP `args` are runtime literals.
+2. Merges dev hook entries into `~/.codex/hooks.json` via
+   `scripts/install-codex-hooks.mjs` (read-merge-backup-write; each managed
+   entry carries `_managed_by: "copilot-companion"`, so `--uninstall` removes
+   only our entries).
+3. Skips Claude-specific steps (no `~/.claude/settings.json` permission
+   injection, no Agent Teams env var).
+4. Writes a diagnostic marker at `~/.codex/copilot-companion/.host` containing
+   the literal `codex`.
 
-What that does, end-to-end:
+After setup, run `codex` and ask main Codex to delegate (e.g. _"have copilot
+audit the auth module"_). Session continuity is handled server-side: Codex
+injects `_meta["x-codex-turn-metadata"].session_id` on every MCP request and the
+bridge reads it directly — no session id to forward by hand.
 
-1. **Materializes the TOML subagent** to `~/.codex/agents/copilot-companion.toml` (the only place Codex looks for unmanaged subagents — `~/.codex/agents/` and `<repo>/.codex/agents/` per `agent_roles.rs`). `${CLAUDE_PLUGIN_ROOT}` in the bridge MCP `args` is substituted to the absolute install path at materialization time, because Codex MCP `args` are runtime literals (no `${VAR}` expansion).
-2. **Merges source-checkout dev hook entries** into `~/.codex/hooks.json` via `scripts/install-codex-hooks.mjs`. Pre-existing user hooks are preserved (read-merge-backup-write); each managed entry carries `_managed_by: "copilot-companion"` so a later `--uninstall` only removes our entries. A timestamped backup is written before each modification. Published Codex packages use plugin-scoped hooks from `hooks/hooks-codex.json` instead.
-3. **Skips Claude-specific steps**: no `~/.claude/settings.json` permission injection (Codex's permission/sandbox/trust model is not addressed by this plan), no `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` (Codex's `features.multi_agent` is `Stable` and on by default).
-4. **Writes a diagnostic marker** at `~/.codex/copilot-companion/.host` containing the literal `codex` so you can `cat` it to confirm what was installed where.
+**Completion delivery (Codex V1 `multi_agent`).** When the subagent reaches a
+terminal status, Codex injects its terminal message into main's conversation but
+does not auto-resume. Send any prompt (`any updates?`) to give main a turn and
+the result surfaces. Enable `multi_agent_v2` only once its public behavior is
+stable and verified against this bridge.
 
-After setup, run `codex` and ask main Codex to delegate to Copilot (e.g. _"have copilot audit the auth module"_) — main Codex spawns the `copilot-companion` subagent via `spawn_agent`, the bridge starts inline, and the flow mirrors the Claude path. Session id continuity is handled server-side: Codex injects `_meta["x-codex-turn-metadata"].session_id` on every MCP request, and the bridge reads it directly — there is no `claude_session_id`/`host_session_id` to forward by hand.
-
-**Completion delivery on Codex V1 `multi_agent`.** When the `copilot-companion` subagent reaches a final status, Codex's V1 completion watcher injects the subagent's terminal message into main's session conversation, but main does not necessarily auto-resume. Main reads the previously-injected message on its next user prompt; send any prompt (`any updates?`) to give main a turn and the result surfaces in conversation history. `multi_agent_v2` is still treated as under-development for this product; do not enable it until its public behavior is stable and verified against this bridge.
-
-If you'd rather install for both hosts in one shot:
-
-```bash
-bash setup.sh --host both
-```
-
-To remove only the Codex hook entries from `~/.codex/hooks.json` without uninstalling anything else:
+To remove just the Codex hook entries:
 
 ```bash
 node scripts/install-codex-hooks.mjs --plugin-root "$(pwd)" --uninstall --yes
 ```
 
-## Prerequisites
+## Permissions (Claude)
 
-- **Node.js ≥ 22**
-- **GitHub Copilot CLI authenticated.** Install (`npm i -g @github/copilot`), then run `copilot` once interactively to complete GitHub OAuth. The daemon resolves the binary in order: `$COPILOT_BIN` → `command -v copilot` → `/opt/homebrew/bin/copilot`. On Linux, export the absolute path explicitly:
-  ```bash
-  export COPILOT_BIN=$(command -v copilot)
-  ```
-- **Agent Teams env var (Claude only)** — `export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the shell (required for SendMessage-based thread continuity). On Codex this is unnecessary: `features.multi_agent` is `Stable` and on by default.
-
-## Permissions (user setup)
-
-The subagent invokes five split MCP tools: `mcp__copilot-bridge__copilot_send`,
-`mcp__copilot-bridge__copilot_wait`, `mcp__copilot-bridge__copilot_status`,
-`mcp__copilot-bridge__copilot_reply`, and
-`mcp__copilot-bridge__copilot_cancel`. On Claude, it also runs one minimal
+The subagent invokes the five split MCP tools and, on Claude, one
 `echo "$CLAUDE_CODE_SESSION_ID"` probe so the bridge can tag queue rows to the
-current Claude session. Without explicit allow rules, the first invocation in a
-session can surface a permission prompt — even with `defaultMode: "auto"`.
-Plugin-level `settings.json` cannot declare permissions (Claude Code honors
-only `agent` and `subagentStatusLine` there), so the entries must live in your
-user or project settings.
+current session. Without explicit allow rules the first invocation can surface a
+prompt. Plugin `settings.json` cannot declare permissions, so the entries live
+in your user or project settings.
 
-**Pick whichever fits your install path:**
-
-### A. Source checkout (cloned repo, or running `--plugin-dir`)
-
-Run once from the repo root:
+**Source checkout / `--plugin-dir`** — run once from the repo root (also Step 5
+of `setup.sh`; idempotent, takes a timestamped backup, preserves allow-list
+order):
 
 ```bash
 node scripts/install-permissions.mjs --yes
 ```
 
-`setup.sh` already runs this as Step 5; the standalone command exists so you can re-run or pre-empt without re-running the full setup. The script is idempotent, takes a timestamped backup of `~/.claude/settings.json` before writing, and preserves the existing order of your allow list.
-
-### B. Marketplace install (`/plugin install copilot-companion@…`)
-
-The plugin source lives under `~/.claude/plugins/cache/<hash>/...`, which isn't a stable path to hand-type. Use either:
-
-1. **Click "Yes, don't ask again"** on the first permission prompt — Claude Code writes the entry to `~/.claude/settings.json` for you. One-time only.
-2. **Pre-populate `~/.claude/settings.json`** before your first session:
-   ```json
-   {
-     "permissions": {
-       "allow": [
-         "mcp__copilot-bridge__copilot_send",
-         "mcp__copilot-bridge__copilot_wait",
-         "mcp__copilot-bridge__copilot_status",
-         "mcp__copilot-bridge__copilot_reply",
-         "mcp__copilot-bridge__copilot_cancel",
-         "Bash(echo \"$CLAUDE_CODE_SESSION_ID\")"
-       ]
-     }
-   }
-   ```
-   Or use `/permissions` inside Claude Code to add the rule via UI.
-
-### Optional log-tailing diagnostics
-
-Only useful if you want to inspect the bridge or daemon logs without prompts:
+**Marketplace install** — the cached plugin path isn't stable to hand-type, so
+either click "Yes, don't ask again" on the first prompt, or pre-populate
+`~/.claude/settings.json` (or `/permissions` in the UI):
 
 ```json
 {
   "permissions": {
     "allow": [
-      "Bash(tail:*)",
-      "Bash(ps:*)",
-      "Read(//Users/<your-user>/.claude/copilot-companion/runtime/**)"
+      "mcp__copilot-bridge__copilot_send",
+      "mcp__copilot-bridge__copilot_wait",
+      "mcp__copilot-bridge__copilot_status",
+      "mcp__copilot-bridge__copilot_reply",
+      "mcp__copilot-bridge__copilot_cancel",
+      "Bash(echo \"$CLAUDE_CODE_SESSION_ID\")"
     ]
   }
 }
 ```
 
-> **Note on glob syntax**: the double slash marks an absolute path in Claude Code's permission syntax. Prefer the host-specific runtime directory over broad `/tmp` access.
+Use `.claude/settings.local.json` (gitignored) to scope this per repo.
 
-### Project-scope alternative
-
-Drop the same JSON into `.claude/settings.local.json` per repo if you'd rather only allow Copilot in specific projects (the file is gitignored by default and not checked in).
+Optional log-tailing diagnostics (only if you want to read logs without
+prompts): allow `Bash(tail:*)`, `Bash(ps:*)`, and
+`Read(//Users/<you>/.claude/copilot-companion/runtime/**)`. The double slash
+marks an absolute path in Claude Code's permission syntax.
 
 ## Public surface
 
-You don't call the MCP tool directly. Main Claude reads the subagent's
-`description` and spawns it via `Agent()` when the user asks for Copilot
-delegation, status checks, replies, or cancellation.
+You don't call the MCP tools directly. Main Claude / main Codex reads the
+subagent's `description` and spawns it via `Agent()` (Claude) / `spawn_agent`
+(Codex) when the user asks for Copilot delegation, status, reply, or cancel.
 
 ### Internal MCP surface (subagent-only)
 
@@ -267,222 +231,190 @@ copilot_reply({ job_id, message })
 copilot_cancel({ job_id })
 ```
 
-`cwd` is required on every `send` and must be the absolute target repo or
-worktree path. The bridge, CLI client, and daemon all reject missing `cwd`
-instead of defaulting to their own process working directory; this prevents a
-delegated review from silently running in the companion/plugin checkout.
+`cwd` is required on every `send` and must be the absolute target repo/worktree
+path. The bridge, CLI client, and daemon all reject a missing `cwd` rather than
+defaulting to their own process cwd, so a delegated review never silently runs
+in the plugin checkout.
 
-`send` enqueues the task and returns `status: "still_running"` with a
-`job_id` immediately — the worker runs in the background. The subagent
-then loops on `wait` (each up to `max_wait_sec`, default 480, max 1200 —
-a single 20-min cap for all modes, sized to accommodate `/fleet` runs
-that decompose into long-running sub-agents), emitting one short line
-between iterations to reset the host's 600s stream-idle watchdog. The
-underlying daemon caps each Copilot prompt at 25 min (`PROMPT_TIMEOUT_MS`
-in `scripts/copilot-acp-daemon.mjs`). Codex callers must set
-`tool_timeout_sec = 1320` on `[mcp_servers.copilot-bridge]`; environment
-variables only reach the server process and do not extend the host's MCP
-tool-call budget. Claude uses the subagent MCP env timeout.
+`send` enqueues the task and returns `status: "still_running"` with a `job_id`
+immediately; the worker runs in the background. The subagent then loops on
+`wait` (each up to `max_wait_sec`, default 480, max 1200 — one 20-min cap for
+all modes, sized for `/fleet` runs), emitting a short line between iterations to
+reset the host's 600s stream-idle watchdog. The daemon caps each Copilot prompt
+at 25 min (`PROMPT_TIMEOUT_MS` in `scripts/copilot-acp-daemon.mjs`). Codex
+callers must set `tool_timeout_sec = 1320` on `[mcp_servers.copilot-bridge]`
+(the shipped TOML template does this); env vars don't extend the host's MCP
+tool-call budget.
 
-Terminal statuses returned by the bridge: `completed`, `failed`,
-`cancelled`, `stuck` (supervisor trip — model misbehavior), **`timeout`**
-(model turn did not finish within the wait budget — recoverable; main
-should read `meta.digest_path` for partial sub-agent output before
-deciding whether to re-dispatch), and **`unreachable`** (bridge socket
-/ daemon process dead — `meta.detail` distinguishes `bridge_timeout`
-from `bridge_daemon_unreachable`).
+**Terminal statuses:** `completed`, `failed`, `cancelled`, `stuck` (supervisor
+trip — model misbehavior), `timeout` (model turn didn't finish within the wait
+budget — recoverable; read `meta.digest_path` for partial output before
+re-dispatching), and `unreachable` (bridge socket / daemon dead — `meta.detail`
+distinguishes `bridge_timeout` from `bridge_daemon_unreachable`).
+
+### Templates and modes
+
+Templates: `general` (default), `research`, `plan_review`. Modes (general only):
+`EXECUTE` (default), `PLAN`, `ANALYZE`. `template_args` keys are validated per
+template: `general` accepts `scope_hint`; `plan_review` requires `plan_path`
+(absolute, or `"latest"`) and accepts `focus_directive`; `research` accepts
+none.
 
 ### Runtime files and progress digest (`meta.digest_path`)
 
-For every job that gets far enough to register a Copilot prompt, the
-bridge maintains private runtime files under
-`~/.{claude,codex}/copilot-companion/runtime/` by default:
+For every job that registers a Copilot prompt, the bridge maintains private
+files under `~/.{claude,codex}/copilot-companion/runtime/` (override the root
+with `COPILOT_RUNTIME_DIR`; created `0700`):
 
 - `copilot-acp.sock` — user-private daemon socket.
-- `copilot-bridge.log` and `copilot-acp-daemon.log` — bridge/daemon logs.
+- `copilot-bridge.log`, `copilot-acp-daemon.log` — bridge/daemon logs.
 - `prompts/copilot-acp-<promptId>.jsonl` — prompt event streams.
 - `digests/copilot-digest-<jobId>.md` — smart transcript digests.
 - `completions.jsonl` — completion queue drained by hooks.
 
-Set `COPILOT_RUNTIME_DIR` to override the root for tests or advanced
-debugging. The bridge creates the directory with `0700` permissions and
-writes runtime files with private modes where applicable.
+The digest is refreshed on every `status` call, every supervisor interim alert
+(~60s during silence), and every terminal emit. It contains a header, the task,
+the final/partial assistant message, `/fleet` sub-agent reports, files touched,
+a tool-call summary, and the latest todos snapshot (empty sections are skipped).
 
-The bridge uses `COPILOT_RUNTIME_ADAPTER=acp` by default. Set
-`COPILOT_RUNTIME_ADAPTER=sdk` to opt into the experimental
-`@github/copilot-sdk` backend. The SDK backend uses SDK session events,
-`abort()`, `resumeSession()`, and the bundled Copilot runtime unless `COPILOT_BIN`
-is set, while preserving the bridge's existing `send`, `wait`, `status`,
-`reply`, and `cancel` response shapes. SDK reasoning effort is unset by default
-because support is model-specific; set `COPILOT_SDK_REASONING_EFFORT` only for
-models verified to accept it. The configured `default-model` must also be
-available to the SDK runtime for the signed-in Copilot account. SDK in-flight
-prompts are intentionally marked non-resumable after a bridge restart until the
-adapter persists enough SDK prompt state to reattach safely. ACP remains the
-default until live side-by-side parity checks cover completion drain, digest
-generation, cancel, reply, timeout, and host restart behavior.
-
-The digest is refreshed:
-
-- on every `status` call against the job,
-- on every supervisor interim alert (~60s during silence),
-- on every terminal emit (final snapshot).
-
-Contents (each section auto-skipped when empty):
-
-- Header (job id, status, mode, template, thread, started/terminal timestamps, age).
-- The task as dispatched.
-- Final / partial assistant message (concatenated `message` chunks; partial on timeout).
-- `/fleet` sub-agent reports (each paired with its `outputPreview`).
-- Files touched (deduped paths from `tool_call.locations`, with touch counts).
-- Tool-call summary (counts grouped by `kind`, plus sub-agent invocation count).
-- Todos snapshot (the latest `plan` event's entries).
-
-The path is surfaced via `meta.digest_path` on every terminal response
-and via `digest_path` on the `still_running` wait response and on every
-`status` reply. When the digest file exists, the MCP tool result also includes
-a `resource_link` content block for `copilot-digest://<jobId>`. The bridge
-advertises the same digest files through MCP `resources/list`,
-`resources/templates/list`, and `resources/read`, so hosts that support MCP
-resources can read the markdown digest without relying on local filesystem
-paths. The file paths remain in the JSON payload for debugging and for hosts
-whose resource UX still needs live verification. Reading the digest is the
-canonical way for the parent agent to track progress without making another
+The path is surfaced via `meta.digest_path` on terminal responses, `digest_path`
+on `still_running` waits and `status` replies, and a `resource_link` content
+block for `copilot-digest://<jobId>`. The bridge also advertises digests through
+MCP `resources/list`, `resources/templates/list`, and `resources/read`. Reading
+the digest is the canonical way for the parent to track progress without another
 bridge round-trip.
+
+### Runtime adapter (ACP default)
+
+The bridge uses `COPILOT_RUNTIME_ADAPTER=acp` by default. Set it to `sdk` to opt
+into the experimental `@github/copilot-sdk` backend, which preserves the same
+`send`/`wait`/`status`/`reply`/`cancel` response shapes. SDK reasoning effort is
+unset by default (model-specific); set `COPILOT_SDK_REASONING_EFFORT` only for
+models verified to accept it. SDK in-flight prompts are marked non-resumable
+after a bridge restart. ACP remains the default for restart-resumable jobs.
 
 ## Thread continuity
 
-Multi-turn Copilot conversations are preserved differently per host:
+Multi-turn Copilot conversations are preserved per host:
 
-1. Claude: first send omits `thread`; the bridge auto-generates `companion-<jobId>`, the subagent emits `MY_THREAD=<value>`, and later `SendMessage` resumes the subagent so it can pass that thread back.
-2. Codex: the TOML agent does not emit or parse `MY_THREAD`; the bridge reads Codex's MCP `_meta["x-codex-turn-metadata"].session_id` and persists a host-session-to-thread mapping under `~/.codex/copilot-companion/threads/by-host-session/`.
-3. Main's context only carries the opaque subagent handle; it never needs to carry the thread name.
+1. **Claude** — first send omits `thread`; the bridge auto-generates
+   `companion-<jobId>`, the subagent emits `MY_THREAD=<value>`, and later
+   `SendMessage` resumes the subagent so it passes that thread back.
+2. **Codex** — the bridge reads `_meta["x-codex-turn-metadata"].session_id` and
+   persists a host-session→thread mapping under
+   `~/.codex/copilot-companion/threads/by-host-session/`.
 
-### SendMessage invocation form (important)
+Main's context carries only the opaque subagent handle; it never carries the
+thread name.
 
-`SendMessage` validates its `message` param as a tagged union of *(a)* plain-text string or *(b)* a protocol object with `type ∈ {shutdown_request, shutdown_response, plan_approval_response}`. A raw `{"action":"send",...}` object matches neither and fails with `InputValidationError: path ["message"]` ("expected string" on one branch, "no matching discriminator" on the other). Always pass the payload as a **JSON-encoded string**, and always include a `summary`:
+### SendMessage invocation form (Claude)
+
+`SendMessage`'s `message` is a tagged union: plain-text string, or a protocol
+object (`shutdown_request` / `shutdown_response` / `plan_approval_response`). A
+raw `{"action":"send",...}` object matches neither and fails with
+`InputValidationError: path ["message"]`. Pass the payload as a **JSON-encoded
+string**, and always include a `summary`:
 
 ```js
-// correct — message is a STRING
 SendMessage({
   to:      <stored agentId>,
   summary: "follow-up task to copilot",      // 5-10 words, required
   message: '{"action":"send","task":"..."}'  // JSON-encoded string
 })
-
-// wrong — message is a raw object, fails schema validation
-SendMessage({ to: <id>, message: {"action": "send", "task": "..."} })
 ```
 
-The same rule applies to the Agent-spawn `prompt` field: pass the JSON payload as a string.
+The same rule applies to the Agent-spawn `prompt` field.
 
 ## Parallel orchestration
 
-Every `send` accepts `parallel: "auto" | "always" | "never"`.
+Every `send` accepts `parallel: "auto" | "always" | "never"`:
 
-- **`auto`** is the default. The bridge prepends `/fleet ` only when the task
-  looks broad enough to benefit.
-- **`always`** forces Copilot's built-in `/fleet` orchestrator.
-- **`never`** skips `/fleet` for strictly linear or single-source work.
+- **`auto`** (default) — the bridge prepends `/fleet ` only when the task looks
+  broad enough to benefit.
+- **`always`** — forces Copilot's `/fleet` orchestrator.
+- **`never`** — skips `/fleet`; use this for strictly linear or single-source
+  work (one-line fix, single-source research, trivial plan). `/fleet`'s
+  decomposition step costs turn budget even when it finds no parallelism, so
+  skipping it is faster for genuinely linear work.
 
-When `/fleet` is used, Copilot's orchestrator decomposes the task, dispatches
-isolated sub-agents in parallel where the work allows, polls for completion,
-and synthesizes a final answer. Each sub-agent runs in its own context window
-with shared filesystem access. Decomposition, dispatch, and synthesis all
-happen inside Copilot — the bridge's only contribution is the slash command.
-
-The natural fit is template-shaped:
-- **`general`** — multi-file refactors, cross-component features, parallel ANALYZE.
-- **`research`** — multi-source web research; sub-agents read different sources concurrently.
-- **`plan_review`** — per-claim verification of a plan against the codebase.
-
-Use `parallel: "never"` when the task is strictly linear or single-source
-(one-line typo fix, one-source research question, trivially small plan).
-`/fleet`'s decomposition-analysis step adds turn budget even when it concludes
-"no parallelism here", so skipping it is faster for genuinely linear work.
+When `/fleet` runs, Copilot decomposes the task, dispatches isolated sub-agents
+in parallel where the work allows, and synthesizes a final answer — all inside
+Copilot; the bridge's only contribution is the slash command. The natural fit is
+template-shaped: `general` for multi-file refactors / parallel ANALYZE,
+`research` for multi-source web research, `plan_review` for per-claim plan
+verification.
 
 ```jsonc
-// default — bridge decides whether /fleet is worth it
-copilot_send({ task: "refactor authentication across api/, ui/, and tests/" })
-
-// force /fleet for a broad audit
-copilot_send({ task: "audit auth, billing, and API routes", parallel: "always" })
-
-// skip /fleet for trivial linear work
-copilot_send({ task: "fix the typo in foo.ts:42", parallel: "never" })
+copilot_send({ task: "refactor authentication across api/, ui/, and tests/" })          // auto decides
+copilot_send({ task: "audit auth, billing, and API routes", parallel: "always" })       // force /fleet
+copilot_send({ task: "fix the typo in foo.ts:42", parallel: "never" })                   // skip /fleet
 ```
 
-When a task hits `status: "timeout"`, the bridge's `content` includes a
-`parallel: "never"` retry suggestion as one of several recovery options —
-main decides which to try.
+On `status: "timeout"`, the response `content` includes a `parallel: "never"`
+retry suggestion among several recovery options.
 
 ## Design invariants
 
-1. **Strict isolation.** The `copilot-bridge` MCP server is bundled with the plugin but the subagent's `tools:` list is the only path through which it's invoked. Main never calls the bridge directly.
-2. **No activation lifecycle.** The bridge is spawned per subagent invocation by Claude Code's plugin MCP machinery. There's nothing to `start`, `stop`, or `pause`.
-3. **Bounded blocking.** `send` returns immediately with `still_running`; each `wait` returns within `max_wait_sec ≤ 1200` (single 20-min cap for all modes). The companion's per-iteration "still running" emission resets Claude Code's 600s stream-idle watchdog; Codex callers raise `tool_timeout_sec` (the shipped TOML template sets `tool_timeout_sec = 1320`).
-4. **Orphan safety net.** Completion events are appended to the private runtime `completions.jsonl` queue with `consumed:false`; wait-terminal responses flip to `consumed:true`; the drain hook surfaces only unconsumed entries.
-5. **Rubber-duck always on.** Appended to every `send` server-side for every template except `plan_review` (which has its own critique instructions baked in). Not in the schema.
-6. **Model is config.** Read from the host-routed `default-model` at worker start; the bridge forwards that value to the daemon so the Copilot process respawns when the configured model changes. Never a user tool parameter.
-7. **Node deps persist, code doesn't.** `bridge-server/node_modules` lives under `${CLAUDE_PLUGIN_DATA}` and survives plugin updates; bundled code under `${CLAUDE_PLUGIN_ROOT}` is re-copied on update.
-
-## Subagent tool surface
-
-The subagent declares these tools (full list in this plugin's `agents/copilot-companion.md` frontmatter):
-
-```
-mcp__copilot-bridge__copilot_send, mcp__copilot-bridge__copilot_wait,
-mcp__copilot-bridge__copilot_status, mcp__copilot-bridge__copilot_reply,
-mcp__copilot-bridge__copilot_cancel, Bash, Read, Write, Edit, Grep, Glob,
-WebFetch, TodoWrite
-```
-
-The `mcp__copilot-bridge__copilot_*` tools are the canonical dispatch surface.
-All non-MCP tools exist for diagnostics, artifact handling, and
-self-sufficiency. See the frontmatter "Tool surface" and "Forbidden" sections
-for when each is appropriate.
+1. **Strict isolation.** The `copilot-bridge` MCP server is reachable only
+   through the subagent's `tools:` list. Main never calls it directly.
+2. **No activation lifecycle.** The bridge spawns per subagent invocation;
+   nothing to start, stop, or pause.
+3. **Bounded blocking.** `send` returns `still_running` immediately; each `wait`
+   returns within `max_wait_sec ≤ 1200`. The per-iteration emission resets
+   Claude Code's 600s watchdog; Codex raises `tool_timeout_sec`.
+4. **Orphan safety net.** Completion events append to `completions.jsonl` with
+   `consumed:false`; wait-terminal responses flip them to `consumed:true`; the
+   drain hook surfaces only unconsumed entries.
+5. **Rubber-duck always on.** Appended server-side to every `send` except
+   `plan_review` (which has its own critique baked in). Not in the schema.
+6. **Model is config.** Read from the host-routed `default-model` at worker
+   start (fallback `gpt-5.5`) and forwarded to the daemon, which respawns
+   Copilot when the configured model changes. Never a tool parameter.
+7. **Node deps persist, code doesn't.** `bridge-server/node_modules` lives under
+   `${CLAUDE_PLUGIN_DATA}` and survives updates; bundled code under
+   `${CLAUDE_PLUGIN_ROOT}` is re-copied on update.
 
 ## Diagnostics
 
-`setup.sh` writes a one-line marker file under each host's directory at install time, advisory-only, useful when a system has both hosts installed and you want to confirm what landed where:
+Install markers (advisory; useful when both hosts are installed):
 
 ```bash
 cat ~/.claude/copilot-companion/.host    # → "claude" if installed
 cat ~/.codex/copilot-companion/.host     # → "codex"  if installed
 ```
 
-Actual host-routing at runtime is decided by the `COPILOT_COMPANION_HOST` env var injected into the bridge's MCP `env:` block (set to `"codex"` literal in the materialized Codex TOML; not set on Claude, which falls back to the default). The marker files are NOT a fallback signal — with concurrent installs on both hosts, a fallback would be ambiguous.
-
-To inspect host selection from inside a bridge process:
+Runtime host-routing is decided by `COPILOT_COMPANION_HOST` in the bridge's MCP
+`env:` block (set to `"codex"` in the materialized Codex TOML; unset on Claude,
+which uses the default). Each bridge spawn logs its detected host once at startup
+to the structured JSONL log at the host's state-dir root:
 
 ```bash
-# Each bridge spawn logs its detected host once at startup.
 grep '"event":"bridge.startup"' ~/.claude/copilot-companion/daemon.log
 grep '"event":"bridge.startup"' ~/.codex/copilot-companion/daemon.log
 ```
 
-(The log file is the bridge's structured JSONL log under the host's `copilot-companion` state directory; each entry includes a `host_detected` field with `claude` or `codex`.)
+Each entry carries a `host_detected` field (`claude` or `codex`).
 
-For a compact environment report:
+Compact environment report:
 
 ```bash
-node scripts/doctor.mjs
-node scripts/doctor.mjs --json
+node scripts/doctor.mjs          # or --json
 ```
 
 ## Development
 
 - `node --check` should pass on every `.mjs` after edits.
-- `jq` is required for hook delivery.
-- Tests: `node --test $(find bridge-server lib scripts hooks templates -name '*.test.mjs')`
-  — covers `bridge-server/{server,validation}.test.mjs`, `lib/{state,host,log,prompt-inspect,prompt-supervisor,heartbeat}.test.mjs`, `scripts/{build-codex-marketplace,copilot-acp-daemon,install-codex-hooks}.test.mjs`, `hooks/drain-completions.test.mjs`, and `templates/copilot-companion.toml.test.mjs`.
-- Build and validate the generated Codex marketplace package:
-  `node scripts/build-codex-marketplace.mjs --out dist/codex-marketplace`, then install it in an isolated `CODEX_HOME` during release checks.
-- Validate the Claude plugin manifest: `claude plugin validate .` from the plugin root.
+- Tests:
+  `node --test $(find bridge-server lib scripts hooks templates -name '*.test.mjs')`
+- Build/validate the Codex marketplace package:
+  `node scripts/build-codex-marketplace.mjs --out dist/codex-marketplace`, then
+  install it in an isolated `CODEX_HOME` during release checks.
+- Validate the Claude plugin manifest: `claude plugin validate .` from the
+  plugin root.
 
-## Out of scope
+## Not supported
 
-- Main Claude speaking to the bridge directly.
-- Skill file / slash commands (gone in v6.1).
-- Session opt-in, pause (removed).
+- Main Claude / main Codex calling the bridge directly.
+- Slash commands or a skill file (the surface is the subagent only).
+- Session opt-in or pause.
 - MCP elicitation (`NEEDS_USER_INPUT:` flow) — deferred to a future version.
