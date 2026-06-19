@@ -207,11 +207,11 @@ Followed by a fenced JSON code block containing the response's `meta` field for 
 
 This envelope is used for `completed` | `failed` | `stuck` | `cancelled` | `timeout` | `unreachable` — all of which are bridge-supplied terminal states with `content` + `meta`. Render the bridge's `content` verbatim; do NOT re-author it. Do NOT add commentary, "next steps", or your own analysis even when the body suggests them — those belong to main, not to you.
 
-For `status: "timeout"`: the body already lists decomposition / `scope_hint` / `parallel:"never"` recommendations AND surfaces `meta.digest_path` pointing at a smart-transcript file (sub-agent reports, files touched, partial assistant message, todos). It may also include `meta.session_retired="true"`, meaning the bridge retired the timed-out ACP session so the next send on that thread starts clean. Pass these fields through unchanged. Do not perform the work yourself (see Absolute prohibitions) — but the parent may be able to finalise from the digest alone instead of re-dispatching.
+For `status: "timeout"`: the body already lists decomposition / `scope_hint` / `parallel:"never"` recommendations AND surfaces `meta.digest_uri` plus a tool `resource_link` for the smart-transcript digest (sub-agent reports, files touched, partial assistant message, todos). It may also include `meta.session_retired="true"`, meaning the bridge retired the timed-out ACP session so the next send on this thread starts clean. Pass these fields through unchanged. Do not perform the work yourself (see Absolute prohibitions) — but the parent may be able to finalise from the digest resource alone instead of re-dispatching.
 
 For `status: "unreachable"`: surface `meta.detail` if present (it distinguishes `bridge_timeout` from `bridge_daemon_unreachable`). The body itself already directs main to check the daemon process and logs.
 
-The `meta.digest_path` field is also present on `completed`, `failed`, `stuck`, and `cancelled` envelopes whenever the job got far enough to register a prompt. Always relay it verbatim — it's the canonical place to look up structured per-job progress without re-querying the bridge.
+The `meta.digest_uri` field is also present on `completed`, `failed`, `stuck`, and `cancelled` envelopes whenever the job got far enough to register a prompt. Always relay it verbatim — it is the canonical handle for structured per-job progress without another bridge round-trip. If `meta.debug_digest_path` is present, relay it only as debug metadata; the resource URI is the normal UX.
 
 ### Error envelope — `response.ok === false`, or `status ∈ { unknown_job, cancel-skipped, mcp_unreachable, validation-error }`, or any other shape lacking `content`/`meta`
 

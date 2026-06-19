@@ -435,18 +435,13 @@ export function digestResourceForJobId(jobId) {
   if (!stat.isFile()) return null;
   const job = jobs.get(jobId);
   const status = job?.status ? ` (${job.status})` : '';
+  // Keep the descriptor minimal. Codex 0.139 accepts this shape for
+  // list_mcp_resources; richer MCP metadata is still not portable across hosts.
   return {
     uri,
     name: `copilot-digest-${jobId}`,
-    title: `Copilot digest ${jobId}`,
     description: `Smart transcript digest for Copilot job ${jobId}${status}.`,
     mimeType: DIGEST_RESOURCE_MIME_TYPE,
-    size: stat.size,
-    _meta: {
-      job_id: jobId,
-      digest_path: path,
-      updated_at: stat.mtime.toISOString(),
-    },
   };
 }
 
@@ -471,21 +466,44 @@ export function readDigestResource(uri) {
   if (!jobId) throw new Error(`unknown digest resource uri: ${uri}`);
   const resource = digestResourceForJobId(jobId);
   if (!resource) throw new Error(`digest not found for job_id: ${jobId}`);
+  const path = digestPath(jobId);
   return {
     contents: [{
       uri: resource.uri,
       mimeType: DIGEST_RESOURCE_MIME_TYPE,
-      text: readFileSync(resource._meta.digest_path, 'utf8'),
+      text: readFileSync(path, 'utf8'),
     }],
   };
 }
 
+function digestUriForJobPrompt(jobId, promptId) {
+  return jobId && promptId ? digestResourceUri(jobId) : null;
+}
+
+function addDigestReference(obj, { jobId, promptId }) {
+  const digestUri = digestUriForJobPrompt(jobId, promptId);
+  if (!digestUri) return null;
+  obj.digest_uri = digestUri;
+  obj.debug = {
+    ...(obj.debug && typeof obj.debug === 'object' ? obj.debug : {}),
+    digest_path: digestPath(jobId),
+  };
+  return digestUri;
+}
+
+function addDigestMeta(meta, { jobId, promptId }) {
+  const digestUri = digestUriForJobPrompt(jobId, promptId);
+  if (!digestUri) return null;
+  meta.digest_uri = digestUri;
+  meta.debug_digest_path = digestPath(jobId);
+  return digestUri;
+}
+
 function digestResourceLinkForResult(obj) {
   const jobId = obj?.job_id || obj?.meta?.job_id;
-  const advertisedPath = obj?.digest_path || obj?.meta?.digest_path;
-  if (!jobId || !advertisedPath) return null;
-  const expectedPath = digestPath(jobId);
-  if (!expectedPath || expectedPath !== advertisedPath) return null;
+  const advertisedUri = obj?.digest_uri || obj?.meta?.digest_uri;
+  if (!jobId || !advertisedUri) return null;
+  if (advertisedUri !== digestResourceUri(jobId)) return null;
   const resource = digestResourceForJobId(jobId);
   return resource ? { type: 'resource_link', ...resource } : null;
 }
@@ -501,7 +519,7 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
   const bridgeStatus = job.status;
   const isBridgeRemap = bridgeStatus === 'timeout' || bridgeStatus === 'unreachable';
   const status = isBridgeRemap ? bridgeStatus : (data.status || bridgeStatus || 'unknown');
-  return {
+  const response = {
     ok: true,
     job_id: job.jobId,
     status,
@@ -538,11 +556,9 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
     activity_truncated: includeTimeline ? Boolean(data.activityTruncated) : undefined,
     session_reborn:     Boolean(job.sessionReborn),
     session_retired:    Boolean(job.sessionRetired),
-    // Path to the smart-transcript digest file. Always points at a stable
-    // location keyed by jobId; the file itself exists only if a digest has
-    // been written for this job (skipped when the prompt has no events yet).
-    digest_path: job.promptId ? digestPath(job.jobId) : null,
   };
+  addDigestReference(response, { jobId: job.jobId, promptId: job.promptId });
+  return response;
 }
 
 // --- Waiters (v6.1) --------------------------------------------------------
@@ -613,16 +629,16 @@ function buildWaitResponse(outcome) {
       fleet: Boolean(job.fleet),
       started_at: iso(job.startedAt),
       age_s: Math.round((Date.now() - (job.startedAt || Date.now())) / 1000),
-      // Mirror the terminal-path field so a poll that catches the job mid-run
+      // Mirror the terminal digest field so a poll that catches the job mid-run
       // still sees the rebirth signal — without this, callers using {wait,
       // max_wait_sec} would only learn about the lost context on the next
       // poll iteration that resolves terminally.
       session_reborn: Boolean(job.sessionReborn),
-      // Path to the smart-transcript digest the parent can read for an
+      // Resource URI for the smart-transcript digest the parent can read for an
       // up-to-date progress summary without making another status round-trip.
-      digest_path: job.promptId ? digestPath(job.jobId) : null,
       hint: 'call copilot_wait({ job_id, max_wait_sec }) again to continue blocking.',
     };
+    addDigestReference(stillRunning, { jobId: job.jobId, promptId: job.promptId });
     if (job.reattached) stillRunning.reattached = true;
     return asJson(stillRunning);
   }
@@ -631,7 +647,6 @@ function buildWaitResponse(outcome) {
   // companion's wait loop hits when a long job finishes; without this the
   // digest can lag behind by one supervisor-alert window (~60s).
   refreshDigestForJob(job, job.status);
-  const digestFilePath = job.promptId ? digestPath(job.jobId) : null;
   const meta = {
     job_id: job.jobId, status: job.status,
     mode: job.mode || 'EXECUTE',
@@ -648,12 +663,12 @@ function buildWaitResponse(outcome) {
   if (job.sessionRetired) meta.session_retired = 'true';
   if (job.reattached) meta.reattached = 'true';
   if (job.existingPromptId) meta.existing_prompt_id = String(job.existingPromptId);
-  if (digestFilePath) meta.digest_path = digestFilePath;
+  const digestUri = addDigestMeta(meta, { jobId: job.jobId, promptId: job.promptId });
   return asJson({
     ok: true, action: 'wait', status: job.status,
     job_id: job.jobId,
     duration_ms: job.durationMs || null,
-    content: formatTerminalContent({ ...job, digestFilePath }),
+    content: formatTerminalContent({ ...job, digestUri }),
     meta,
   });
 }
@@ -712,7 +727,7 @@ function emitRebirthAlert({ jobId, task, promptId, thread, previousSid, newSessi
 export function formatTerminalContent({
   jobId, status, task, mode, durationMs,
   summary, error, stuckReason, detail, failedTools, promptId,
-  sessionReborn = false, sessionRetired = false, digestFilePath = null,
+  sessionReborn = false, sessionRetired = false, digestUri = null,
 }) {
   const rebirthBanner = sessionReborn
     ? '> ⚠ Copilot session was respawned mid-thread; prior in-process conversation context was lost. ' +
@@ -767,8 +782,8 @@ export function formatTerminalContent({
   if (status === 'timeout') {
     const failedLine = (Array.isArray(failedTools) && failedTools.length)
       ? `\n\n**Failed tools:** ${failedTools.slice(0, 10).join(', ')}` : '';
-    const digestLine = digestFilePath
-      ? `\n\n**Partial transcript digest:** \`${digestFilePath}\` — read this BEFORE re-dispatching. ` +
+    const digestLine = digestUri
+      ? `\n\n**Partial transcript digest:** \`${digestUri}\` — read this MCP resource BEFORE re-dispatching. ` +
         'It contains the partial assistant message, /fleet sub-agent reports (often near-complete), files touched, and todos. ' +
         'You may be able to finalise from the digest alone, or use it to scope a much smaller follow-up send.'
       : '';
@@ -778,7 +793,7 @@ export function formatTerminalContent({
     return taskHeader +
       `Copilot's model turn did not finish within the wait budget (${Math.round(duration / 1000)}s).\n\n` +
       'The daemon is alive; the task was too large for one turn. Recommended next steps for the parent:\n' +
-      '- Read the partial-transcript digest (path below) — sub-agent reports may already cover the work.\n' +
+      '- Read the partial-transcript digest resource URI below — sub-agent reports may already cover the work.\n' +
       '- Decompose the task into smaller, explicitly-scoped sub-sends (target ≤ ~100 LOC of source per send).\n' +
       '- For ANALYZE on large files, pass `template_args.scope_hint` (e.g. "imports/types only", "lines 1-120") to bind the analysis to a specific section.\n' +
       '- Raise `max_wait_sec` (cap 1200s / 20 min for all modes) if the task is genuinely long.\n' +
@@ -865,9 +880,8 @@ export function emitNotification({
 
   // Final digest refresh on terminal. We pass the current `status` because
   // the job's stored status may not yet reflect a late remap (e.g. cancelled
-  // → stuck) we did above. Path is stable per jobId; surface it whether or
-  // not the write succeeded so the parent always knows where to look.
-  const digestFilePath = jobId ? digestPath(jobId) : null;
+  // → stuck) we did above. The resource URI is stable per jobId; surface it
+  // whether or not the write succeeded so the parent always knows where to look.
   if (promptId && jobId) {
     try {
       writeDigest(promptId, {
@@ -877,12 +891,12 @@ export function emitNotification({
       });
     } catch (err) { log('WARN', 'emit digest write failed:', jobId, err.message); }
   }
-  if (digestFilePath) meta.digest_path = digestFilePath;
+  const digestUri = addDigestMeta(meta, { jobId, promptId });
 
   const content = formatTerminalContent({
     jobId, status, task, mode, durationMs: duration,
     summary, error, stuckReason, detail, failedTools, promptId,
-    sessionReborn, sessionRetired, digestFilePath,
+    sessionReborn, sessionRetired, digestUri,
   });
 
   enqueueEvent({ kind: 'terminal', jobId, content, meta });
@@ -1600,7 +1614,8 @@ const COPILOT_OUTPUT_SCHEMA = {
     thread: { type: 'string' },
     prompt_id: { type: ['string', 'null'] },
     session_id: { type: ['string', 'null'] },
-    digest_path: { type: ['string', 'null'] },
+    digest_uri: { type: ['string', 'null'] },
+    debug: { type: 'object', additionalProperties: true },
     meta: { type: 'object', additionalProperties: true },
     content: { type: 'string' },
     fleet: { type: 'boolean' },

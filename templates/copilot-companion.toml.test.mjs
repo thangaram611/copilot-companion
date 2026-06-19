@@ -60,8 +60,11 @@ test('top-level TOML fields stay before the first table and use an allowlisted m
   assert.match(body, /send_input/);
   assert.match(body, /Status envelope/);
   assert.match(body, /never emit `undefined`/);
+  assert.match(body, /meta\.digest_uri/);
+  assert.match(body, /resource_link/);
   assert.doesNotMatch(body, /\bAgent\(\)/, 'Claude-specific Agent() call should be replaced');
   assert.doesNotMatch(body, /SendMessage\(\)/, 'Claude-specific SendMessage() should be replaced');
+  assert.doesNotMatch(body, /canonical place to look up structured per-job progress/);
 });
 
 test('mcp_servers.copilot-bridge declares the Codex-specific command, args, env, and timeout', () => {

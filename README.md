@@ -248,7 +248,7 @@ tool-call budget.
 
 **Terminal statuses:** `completed`, `failed`, `cancelled`, `stuck` (supervisor
 trip — model misbehavior), `timeout` (model turn didn't finish within the wait
-budget — recoverable; read `meta.digest_path` for partial output before
+budget — recoverable; read the `meta.digest_uri` MCP resource before
 re-dispatching), and `unreachable` (bridge socket / daemon dead — `meta.detail`
 distinguishes `bridge_timeout` from `bridge_daemon_unreachable`).
 
@@ -260,7 +260,7 @@ template: `general` accepts `scope_hint`; `plan_review` requires `plan_path`
 (absolute, or `"latest"`) and accepts `focus_directive`; `research` accepts
 none.
 
-### Runtime files and progress digest (`meta.digest_path`)
+### Runtime files and progress digest (`meta.digest_uri`)
 
 For every job that registers a Copilot prompt, the bridge maintains private
 files under `~/.{claude,codex}/copilot-companion/runtime/` (override the root
@@ -277,12 +277,15 @@ The digest is refreshed on every `status` call, every supervisor interim alert
 the final/partial assistant message, `/fleet` sub-agent reports, files touched,
 a tool-call summary, and the latest todos snapshot (empty sections are skipped).
 
-The path is surfaced via `meta.digest_path` on terminal responses, `digest_path`
-on `still_running` waits and `status` replies, and a `resource_link` content
-block for `copilot-digest://<jobId>`. The bridge also advertises digests through
-MCP `resources/list`, `resources/templates/list`, and `resources/read`. Reading
-the digest is the canonical way for the parent to track progress without another
-bridge round-trip.
+The digest is surfaced as `meta.digest_uri` on terminal responses, `digest_uri`
+on `still_running` waits and per-job `status` replies, and as a `resource_link`
+content block for `copilot-digest://<jobId>` whenever the digest file exists.
+The bridge also advertises digests through MCP `resources/list`,
+`resources/templates/list`, and `resources/read`. Reading that MCP resource is
+the canonical way for the parent to track progress without another bridge
+round-trip. Local filesystem paths are retained only as debug metadata
+(`debug.digest_path` on per-job status/still-running responses and
+`meta.debug_digest_path` on terminal envelopes).
 
 ### Runtime adapter (ACP default)
 

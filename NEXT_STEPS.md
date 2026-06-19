@@ -1,27 +1,19 @@
 # Copilot Companion Next Steps
 
 Compaction-safe queue for work that is still pending. The runtime hardening,
-runtime-adapter boundary, MCP tool-surface split, MCP digest resources, Codex
-marketplace packaging, and live host smokes are all merged and verified in
-code/commits; only the items below remain.
+runtime-adapter boundary, MCP tool-surface split, MCP digest resources,
+resource-first digest UX, Codex marketplace packaging, and live host smokes are
+all merged and verified in code/commits; only the items below remain.
 
 ## Remaining Work
 
-1. MCP resource UX verification.
-   - Run Claude-host and Codex-host digest `resources/read` from real companion
-     turns (the `resources/*` handlers and `resource_link` blocks already ship —
-     see `bridge-server/server.mjs` ~L1553-1561 and L490).
-   - Then decide whether `digest_path` can become debug-only. It is currently
-     returned unconditionally in send/wait/status results and in the public
-     schema (`bridge-server/server.mjs` L447, L544, L623, L651, L880, L1603).
-
-2. Repo-owned release validator.
+1. Repo-owned release validator.
    - Add a script that builds the Codex marketplace package and installs it into
      an isolated `CODEX_HOME` via `codex plugin marketplace add` + `codex plugin
      add`. Today `setup.sh` only probes `codex plugin add --help`; no automated
      end-to-end install validation exists.
 
-3. Optional: prompt-timeout envelope drill.
+2. Optional: prompt-timeout envelope drill.
    - Only run a full-window drill if we need proof of the 25-minute daemon
      timeout (`PROMPT_TIMEOUT_MS` in `scripts/copilot-acp-daemon.mjs` L70). The
      fast smoke already covered short-wait retry messaging, cancel, and reply.

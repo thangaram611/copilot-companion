@@ -181,14 +181,17 @@ test('wait response formatting covers timeout, digest metadata, unreachable deta
   assert.match(body.content, /parallel: "never"/);
   assert.match(body.content, /\*\*Failed tools:\*\* view, grep/);
   assert.match(body.content, /Partial transcript digest/);
-  assert.match(body.meta.digest_path, /copilot-digest-job-timeout\.md$/);
+  assert.equal(body.meta.digest_uri, 'copilot-digest://job-timeout');
+  assert.equal(body.meta.digest_path, undefined);
+  assert.match(body.meta.debug_digest_path, /copilot-digest-job-timeout\.md$/);
   jobs.delete('job-timeout');
 
   jobs.set('job-timeout-nopid', terminalJob('job-timeout-nopid', 'timeout', { promptId: null }));
   body = parse(await mod.dispatch({ action: 'wait', job_id: 'job-timeout-nopid', max_wait_sec: 1 }));
   assert.equal(body.status, 'timeout');
   assert.doesNotMatch(body.content, /Partial transcript digest/);
-  assert.equal(body.meta.digest_path, undefined);
+  assert.equal(body.meta.digest_uri, undefined);
+  assert.equal(body.meta.debug_digest_path, undefined);
   jobs.delete('job-timeout-nopid');
 
   jobs.set('job-unreachable', terminalJob('job-unreachable', 'unreachable', {
@@ -243,7 +246,9 @@ test('digest MCP resources list, read, template, and tool resource links', async
   const resource = digestResourceForJobId(jobId);
   assert.equal(resource.uri, `copilot-digest://${jobId}`);
   assert.equal(resource.mimeType, 'text/markdown');
-  assert.equal(resource._meta.digest_path, path);
+  assert.equal(resource.description.includes(jobId), true);
+  assert.equal(resource._meta, undefined);
+  assert.equal(resource.annotations, undefined);
   assert.equal(listDigestResources().some((r) => r.uri === resource.uri), true);
 
   const templates = listDigestResourceTemplates();
@@ -255,13 +260,31 @@ test('digest MCP resources list, read, template, and tool resource links', async
   assert.throws(() => readDigestResource('copilot-digest://missing-resource'), /digest not found/);
   assert.throws(() => readDigestResource('copilot-digest://bad/path'), /unknown digest resource uri/);
 
+  const listedViaMcp = await mod.mcp._requestHandlers.get('resources/list')({
+    method: 'resources/list',
+    params: {},
+  });
+  assert.equal(listedViaMcp.resources.some((r) => r.uri === resource.uri), true);
+  const templatesViaMcp = await mod.mcp._requestHandlers.get('resources/templates/list')({
+    method: 'resources/templates/list',
+    params: {},
+  });
+  assert.equal(templatesViaMcp.resourceTemplates[0].uriTemplate, 'copilot-digest://{job_id}');
+  const readViaMcp = await mod.mcp._requestHandlers.get('resources/read')({
+    method: 'resources/read',
+    params: { uri: resource.uri },
+  });
+  assert.match(readViaMcp.contents[0].text, /Resource body/);
+
   jobs.set(jobId, terminalJob(jobId, 'completed', {
     promptId: 'p-resource',
     summary: { message: 'done.\n\nRUBBER-DUCK: clean.', toolCalls: [] },
   }));
   const result = await mod.dispatch({ action: 'status', job_id: jobId, verbose: false });
   const body = parse(result);
-  assert.equal(body.digest_path, path);
+  assert.equal(body.digest_uri, resource.uri);
+  assert.equal(body.digest_path, undefined);
+  assert.equal(body.debug.digest_path, path);
   assert.equal(result.content[0].type, 'text');
   const link = result.content.find((entry) => entry.type === 'resource_link');
   assert.equal(link.uri, resource.uri);
@@ -311,7 +334,9 @@ test('still-running and terminal wait responses surface session_reborn and reatt
   let body = parse(await mod.dispatch({ action: 'wait', job_id: 'jr-still', max_wait_sec: 1 }));
   assert.equal(body.status, 'still_running');
   assert.equal(body.session_reborn, true);
-  assert.match(body.digest_path, /copilot-digest-jr-still\.md$/);
+  assert.equal(body.digest_uri, 'copilot-digest://jr-still');
+  assert.equal(body.digest_path, undefined);
+  assert.match(body.debug.digest_path, /copilot-digest-jr-still\.md$/);
   jobs.delete('jr-still');
 
   jobs.set('jr-wait', terminalJob('jr-wait', 'completed', {
