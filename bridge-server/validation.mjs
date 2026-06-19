@@ -86,7 +86,7 @@ export const DEFAULT_PARALLEL = 'auto';
 const ALLOWED_FIELDS = {
   send:   new Set(['action', 'task', 'mode', 'template', 'template_args', 'cwd', 'thread', 'max_wait_sec', 'parallel', 'claude_session_id', 'host_session_id']),
   wait:   new Set(['action', 'job_id', 'max_wait_sec', 'claude_session_id', 'host_session_id']),
-  status: new Set(['action', 'job_id', 'verbose', 'claude_session_id', 'host_session_id']),
+  status: new Set(['action', 'job_id', 'verbose', 'diagnostics', 'claude_session_id', 'host_session_id']),
   reply:  new Set(['action', 'job_id', 'message', 'claude_session_id', 'host_session_id']),
   cancel: new Set(['action', 'job_id', 'claude_session_id', 'host_session_id']),
 };
@@ -403,7 +403,14 @@ function validateWait(args) {
 function validateStatus(args) {
   assertString('job_id', args.job_id, { optional: true });
   assertBoolean('verbose', args.verbose);
-  return { action: 'status', job_id: args.job_id || null, verbose: !!args.verbose, host_session_id: normalizeHostSid(args) };
+  assertBoolean('diagnostics', args.diagnostics);
+  return {
+    action: 'status',
+    job_id: args.job_id || null,
+    verbose: !!args.verbose,
+    diagnostics: !!args.diagnostics,
+    host_session_id: normalizeHostSid(args),
+  };
 }
 
 function validateSend(args) {

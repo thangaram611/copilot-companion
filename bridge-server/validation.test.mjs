@@ -67,8 +67,11 @@ test('action schemas reject malformed inputs and normalize valid cancel/wait/sta
 
   const status = validateCopilotArgs({ action: 'status', job_id: 'j', verbose: true });
   assert.equal(status.verbose, true);
+  assert.equal(status.diagnostics, false);
   assert.equal(status.job_id, 'j');
+  assert.equal(validateCopilotArgs({ action: 'status', diagnostics: true }).diagnostics, true);
   assert.throws(() => validateCopilotArgs({ action: 'status', verbose: 'yes' }), /verbose must be a boolean/);
+  assert.throws(() => validateCopilotArgs({ action: 'status', diagnostics: 'yes' }), /diagnostics must be a boolean/);
 
   const reply = validateCopilotArgs({ action: 'reply', job_id: 'job-1', message: 'add tests' });
   assert.equal(reply.message, 'add tests');

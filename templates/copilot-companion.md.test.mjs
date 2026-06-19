@@ -14,5 +14,7 @@ test('Claude template documents status response rendering explicitly', () => {
   assert.match(text, /echo "\$CLAUDE_CODE_SESSION_ID"/);
   assert.match(text, /meta\.digest_uri/);
   assert.match(text, /resource_link/);
+  assert.match(text, /"diagnostics": true/);
+  assert.match(text, /MCP-native doctor report/);
   assert.doesNotMatch(text, /canonical place to look up structured per-job progress/);
 });

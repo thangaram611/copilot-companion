@@ -241,7 +241,7 @@ subagent's `description` and spawns it via `Agent()` (Claude) / `spawn_agent`
 ```
 copilot_send({ task, cwd, mode?, template?, template_args?, thread?, max_wait_sec?, parallel? })
 copilot_wait({ job_id, max_wait_sec? })
-copilot_status({ job_id?, verbose? })
+copilot_status({ job_id?, verbose?, diagnostics? })
 copilot_reply({ job_id, message })
 copilot_cancel({ job_id })
 ```
@@ -266,6 +266,11 @@ trip — model misbehavior), `timeout` (model turn didn't finish within the wait
 budget — recoverable; read the `meta.digest_uri` MCP resource before
 re-dispatching), and `unreachable` (bridge socket / daemon dead — `meta.detail`
 distinguishes `bridge_timeout` from `bridge_daemon_unreachable`).
+
+`copilot_status({ diagnostics: true })` adds the same environment/runtime doctor
+report as `node scripts/doctor.mjs --json` to the global status response. The
+companion should use this MCP-native path for routine diagnostics before falling
+back to raw shell/log inspection.
 
 ### Templates and modes
 
@@ -413,7 +418,13 @@ grep '"event":"bridge.startup"' ~/.codex/copilot-companion/daemon.log
 
 Each entry carries a `host_detected` field (`claude` or `codex`).
 
-Compact environment report:
+MCP-native environment report from the companion:
+
+```jsonc
+copilot_status({ diagnostics: true })
+```
+
+Direct CLI equivalent:
 
 ```bash
 node scripts/doctor.mjs          # or --json

@@ -99,6 +99,16 @@ test('server imports safely and dispatch handles the public boundary errors/stat
   }));
   assert.equal(statusViaTool.ok, true);
   assert.equal(statusViaTool.action, 'status');
+  assert.equal(statusViaTool.diagnostics, undefined);
+  const statusWithDiagnostics = parse(await mod.mcp._requestHandlers.get('tools/call')({
+    method: 'tools/call',
+    params: { name: 'copilot_status', arguments: { diagnostics: true } },
+  }));
+  assert.equal(statusWithDiagnostics.ok, true);
+  assert.equal(statusWithDiagnostics.action, 'status');
+  assert.equal(statusWithDiagnostics.diagnostics.runtime.adapter, process.env.COPILOT_RUNTIME_ADAPTER || 'acp');
+  assert.match(statusWithDiagnostics.diagnostics.runtime.dir, /copilot-state-server-|copilot-companion/);
+  assert.equal(typeof statusWithDiagnostics.diagnostics.node.ok, 'boolean');
   await assert.rejects(() => mod.dispatch({ action: 'frobnicate' }), /unhandled action/);
 
   const oldS = process.env.CLAUDE_CODE_SESSION_ID;

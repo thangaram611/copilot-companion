@@ -67,6 +67,7 @@ import { sanitizeHostSessionId } from '../lib/host.mjs';
 import { queuePath, promptEventsPath, runtimeDir, bridgeLogFile, daemonLogFile, digestDir } from '../lib/runtime-paths.mjs';
 import { createReqId, withReq, logEvent } from '../lib/log.mjs';
 import { writeDigest, digestPath } from '../lib/prompt-digest.mjs';
+import { buildDoctorReport } from '../lib/doctor.mjs';
 
 // --- Queue (replaces dev-channel notifications) -----------------------------
 
@@ -1504,7 +1505,7 @@ async function handleReply({ job_id, message }) {
   }
 }
 
-async function handleStatus({ job_id, verbose }) {
+async function handleStatus({ job_id, verbose, diagnostics }) {
   if (job_id) {
     const job = getJob(job_id);
     if (!job) return asJson({ ok: false, error: 'unknown job_id' });
@@ -1518,10 +1519,12 @@ async function handleStatus({ job_id, verbose }) {
     // without having to inspect the raw jsonl. This is the primary mechanism
     // the parent agent uses to track progress on long-running /fleet jobs.
     refreshDigestForJob(job);
-    return asJson(buildJobResponse(job, inspect, { includeTimeline: verbose }));
+    const response = buildJobResponse(job, inspect, { includeTimeline: verbose });
+    if (diagnostics) response.diagnostics = buildDoctorReport();
+    return asJson(response);
   }
   const modelInfo = readDefaultModel();
-  return asJson({
+  const response = {
     ok: true, action: 'status',
     runtime_adapter: selectedRuntimeAdapter(),
     default_model: modelInfo,
@@ -1542,7 +1545,9 @@ async function handleStatus({ job_id, verbose }) {
         age_s: Math.round((Date.now() - (j.startedAt || Date.now())) / 1000),
         reply_in_flight: !!j.replyInFlight,
       })),
-  });
+  };
+  if (diagnostics) response.diagnostics = buildDoctorReport();
+  return asJson(response);
 }
 
 // --- MCP server setup -------------------------------------------------------
@@ -1708,6 +1713,7 @@ const COPILOT_TOOLS = [
       properties: {
         job_id: JOB_ID_FIELD,
         verbose: { type: 'boolean', description: 'Include full activity timeline for a specific job.' },
+        diagnostics: { type: 'boolean', description: 'Include environment/runtime doctor output in the status response.' },
         ...HOST_SESSION_FIELDS,
       },
     },
