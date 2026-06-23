@@ -96,6 +96,33 @@ Manual smoke gates before a public tag:
 5. Codex marketplace build/install using `node scripts/validate-codex-release.mjs`.
 6. Claude marketplace install or `claude --plugin-dir` smoke.
 
+### Smoke evidence
+
+Recorded 2026-06-23 (macOS, Node 24.15.0). All six gates pass. The harness
+install smokes (1, 2, 6) were run under a sandboxed `$HOME` so the real
+`~/.claude` / `~/.codex` were never written, then the sandbox was deleted and
+the real config verified byte-identical.
+
+- **Gate 1 — Claude source install: PASS.** `bash setup.sh --host claude --target none`
+  (sandboxed `$HOME`) materialized the subagent, merged the `agent-bridge`
+  permission into `settings.json`, added the agent-teams env, and wrote the host
+  marker.
+- **Gate 2 — Codex source install: PASS.** `bash setup.sh --host codex --target none`
+  (sandboxed `$HOME`) materialized the TOML subagent, merged `hooks.json`, and
+  wrote the host marker.
+- **Gate 3 — OpenCode delegated send: PASS.** OpenCode `1.17.9` connected to
+  Ollama Cloud (free `gpt-oss:120b`). Drove the bridge `dispatch()`
+  (`agent_send` → still_running + job_id → `agent_wait` → `completed`); the
+  companion echoed the requested token, 0 tool calls, digest written. Cost $0.
+- **Gate 4 — Copilot delegated send: PASS.** Copilot CLI `1.0.61` authenticated;
+  bridge send→wait→`completed` through the ACP daemon using the default model
+  `claude-sonnet-4.6`, ACP session established, digest written.
+- **Gate 5 — Codex marketplace validate: PASS.** `node scripts/validate-codex-release.mjs`.
+- **Gate 6 — Claude marketplace install: PASS.** `claude plugin marketplace add .`
+  then `claude plugin install agent-companion@agent-companion` (sandboxed `$HOME`)
+  installed `agent-companion@agent-companion` v0.0.1, disabled by default (matches
+  `defaultEnabled: false`).
+
 Do not claim strength routing, companion profiles, multiple models per
 companion, OpenCode reply/re-steer, or OpenCode restart resume as implemented
 until those paths have code and tests.

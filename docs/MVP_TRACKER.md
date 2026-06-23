@@ -115,7 +115,12 @@ primary companion:
    - run full Node test suite.
    - run Codex marketplace validation.
    - run Claude plugin validation.
-   - manually smoke a real OpenCode install and a real Copilot install.
+   - manually smoke a real OpenCode install and a real Copilot install — done
+     2026-06-23: both companions pass a real bridge delegated send (OpenCode via
+     Ollama Cloud free `gpt-oss:120b`; Copilot via `claude-sonnet-4.6`).
+   - All six pre-tag smoke gates pass (harness install smokes ran under a
+     sandboxed `$HOME`, real config verified untouched). See
+     [docs/RELEASE_READINESS.md](RELEASE_READINESS.md) "Smoke evidence".
 
 2. Strength-routed companion profiles:
    - add a profile registry that can represent multiple profiles per companion.
