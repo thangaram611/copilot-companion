@@ -431,7 +431,8 @@ test('job ledger persistence, GC, and queue consumption protect resumed terminal
   persistJob('j-gc');
   const filePath = join(state.JOBS_DIR, 'j-gc.json');
   assert.equal(existsSync(filePath), true);
-  assert.equal(state.readJob('j-gc').copilotSessionId, 'cop-sid-1');
+  // The in-memory `sessionId` persists under the target-neutral key.
+  assert.equal(state.readJob('j-gc').companionSessionId, 'cop-sid-1');
   gcExpiredJobs();
   assert.equal(jobs.has('j-gc'), false);
   assert.equal(existsSync(filePath), false);
@@ -990,6 +991,269 @@ test('OpenCode timeout is terminal and target-specific', async () => {
     if (oldTimeout === undefined) delete process.env.AGENT_COMPANION_OPENCODE_TIMEOUT_MS;
     else process.env.AGENT_COMPANION_OPENCODE_TIMEOUT_MS = oldTimeout;
     rmSync(tmp, { recursive: true, force: true });
+    _resetForTest();
+  }
+});
+
+// --- OpenCode server-mode adapter (OPENCODE_RUNTIME_ADAPTER=server) ---------
+//
+// These drive the bridge through the server-runtime module's `_impl` seam: the
+// bridge calls the module wrappers, the wrappers call `_impl.fetchJson` /
+// `_impl.openEventStream` / `_impl.spawnServer`, so stubbing the module from the
+// test rewires the whole server-mode path with no socket and no real opencode.
+
+import { EventEmitter as _OcEmitter } from 'node:events';
+
+function _ocFrame(obj) { return `data: ${JSON.stringify(obj)}\n\n`; }
+function _ocSse(frames) {
+  return async () => (async function* () { for (const f of frames) yield f; })();
+}
+function _ocBootChild() {
+  const child = new _OcEmitter();
+  child.stdout = new _OcEmitter();
+  child.stderr = new _OcEmitter();
+  child.pid = 7777;
+  child.unref = () => {};
+  setImmediate(() => child.stdout.emit('data', Buffer.from('opencode server listening on http://127.0.0.1:4096\n')));
+  return child;
+}
+
+async function withOpenCodeServer(stubs, body) {
+  const ocServer = await import('./opencode-server-runtime.mjs');
+  const regDir = mkdtempSync(join(tmpdir(), 'oc-srv-reg-'));
+  const oldReg = process.env.AGENT_OPENCODE_SERVER_REGISTRY;
+  const oldAdapter = process.env.OPENCODE_RUNTIME_ADAPTER;
+  process.env.AGENT_OPENCODE_SERVER_REGISTRY = join(regDir, 'servers.json');
+  process.env.OPENCODE_RUNTIME_ADAPTER = 'server';
+  ocServer._resetForTest();
+  ocServer._setForTest({ spawnServer: _ocBootChild, ...stubs });
+  try { return await body(ocServer); }
+  finally {
+    ocServer._resetForTest();
+    if (oldReg === undefined) delete process.env.AGENT_OPENCODE_SERVER_REGISTRY; else process.env.AGENT_OPENCODE_SERVER_REGISTRY = oldReg;
+    if (oldAdapter === undefined) delete process.env.OPENCODE_RUNTIME_ADAPTER; else process.env.OPENCODE_RUNTIME_ADAPTER = oldAdapter;
+    rmSync(regDir, { recursive: true, force: true });
+  }
+}
+
+test('OpenCode server mode: send routes through the HTTP server and completes', async () => {
+  const mod = await bridge();
+  const { dispatch, jobs, _resetForTest } = mod;
+  _resetForTest();
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-oc-srv';
+  try {
+    await withOpenCodeServer({
+      fetchJson: async (url, opts = {}) => {
+        if (url.includes('/global/health')) return { ok: true, data: { healthy: true } };
+        if (url.endsWith('/session?directory=' + encodeURIComponent(TEST_CWD)) || (url.includes('/session?directory=') && opts.method === 'POST')) return { ok: true, data: { id: 'ses_send' } };
+        if (url.includes('/prompt_async')) return { ok: true, data: {} };
+        return { ok: true, data: {} };
+      },
+      openEventStream: _ocSse([
+        _ocFrame({ type: 'message.part.updated', properties: { sessionID: 'ses_send', part: { id: 'p1', messageID: 'm1', type: 'text', text: 'server adapter done' } } }),
+        _ocFrame({ type: 'session.idle', properties: { sessionID: 'ses_send' } }),
+      ]),
+    }, async () => {
+      const send = parse(await dispatch({
+        action: 'send', target: 'opencode', task: 'server-mode task', mode: 'EXECUTE',
+        template: 'general', cwd: TEST_CWD, host_session_id: 'sid-oc-srv', parallel: 'never', max_wait_sec: 5,
+      }));
+      assert.equal(send.ok, true);
+      assert.match(send.job_id, /^opencode-/);
+      const terminal = parse(await dispatch({ action: 'wait', job_id: send.job_id, host_session_id: 'sid-oc-srv', max_wait_sec: 5 }));
+      assert.equal(terminal.status, 'completed');
+      assert.equal(terminal.target, 'opencode');
+      assert.match(terminal.content, /server adapter done/);
+      const job = jobs.get(send.job_id);
+      assert.equal(job.opencodeAdapter, 'server');
+      assert.equal(job.sessionId, 'ses_send');
+      assert.equal(job.baseUrl, 'http://127.0.0.1:4096');
+    });
+  } finally {
+    for (const id of [...jobs.keys()]) if (jobs.get(id)?.claudeSessionId === 'sid-oc-srv') jobs.delete(id);
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('OpenCode server mode: reply re-steers and bumps the watch generation before aborting', async () => {
+  const mod = await bridge();
+  const { dispatch, jobs, _resetForTest } = mod;
+  _resetForTest();
+  let promptIdAtAbort = null;
+  try {
+    await withOpenCodeServer({
+      fetchJson: async (url) => {
+        if (url.includes('/abort')) { promptIdAtAbort = jobs.get('opencode-srv-reply')?.promptId; return { ok: true, data: true }; }
+        if (url.includes('/session/status')) return { ok: true, data: {} }; // idle after abort
+        if (url.includes('/prompt_async')) return { ok: true, data: {} };
+        return { ok: true, data: {} };
+      },
+      openEventStream: _ocSse([_ocFrame({ type: 'session.idle', properties: { sessionID: 'ses_reply' } })]),
+    }, async () => {
+      jobs.set('opencode-srv-reply', {
+        jobId: 'opencode-srv-reply', target: 'opencode', opencodeAdapter: 'server',
+        claudeSessionId: 'sid-oc-reply', status: 'running', promptId: 'opencode-srv-reply',
+        sessionId: 'ses_reply', baseUrl: 'http://127.0.0.1:4096', task: 't', mode: 'EXECUTE',
+        cwd: TEST_CWD, startedAt: Date.now(),
+      });
+      const reply = parse(await dispatch({ action: 'reply', job_id: 'opencode-srv-reply', message: 'revise', host_session_id: 'sid-oc-reply' }));
+      assert.equal(reply.ok, true);
+      assert.equal(reply.target, 'opencode');
+      assert.match(reply.new_prompt_id, /-r1$/);
+      assert.equal(reply.session_id, 'ses_reply');
+      // The generation must be bumped BEFORE the abort fires, so the old watcher
+      // discards its (cancelled) terminal instead of resolving waiters.
+      for (let i = 0; i < 50 && promptIdAtAbort == null; i++) await new Promise((r) => setImmediate(r));
+      assert.match(promptIdAtAbort || '', /-r1$/);
+    });
+  } finally {
+    jobs.delete('opencode-srv-reply');
+    _resetForTest();
+  }
+});
+
+test('OpenCode server mode: cancel aborts the turn and reports cancelled even when the stream goes idle without an abort error', async () => {
+  const mod = await bridge();
+  const { dispatch, jobs, _resetForTest } = mod;
+  _resetForTest();
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-oc-cancel2';
+  let resolveAbort;
+  const abortGate = new Promise((r) => { resolveAbort = r; });
+  try {
+    await withOpenCodeServer({
+      fetchJson: async (url, opts = {}) => {
+        if (url.includes('/global/health')) return { ok: true, data: { healthy: true } };
+        if (url.includes('/session?directory=') && opts.method === 'POST') return { ok: true, data: { id: 'ses_cancel2' } };
+        if (url.includes('/abort')) { resolveAbort(); return { ok: true, data: true }; }
+        return { ok: true, data: {} };
+      },
+      // The turn streams nothing until the abort lands, then goes idle with NO
+      // MessageAbortedError — exactly the case where the bridge's cancel intent
+      // is the only signal that this was a cancellation.
+      openEventStream: async () => (async function* () {
+        await abortGate;
+        yield _ocFrame({ type: 'session.idle', properties: { sessionID: 'ses_cancel2' } });
+      })(),
+    }, async () => {
+      const send = parse(await dispatch({
+        action: 'send', target: 'opencode', task: 'long task', mode: 'EXECUTE',
+        template: 'general', cwd: TEST_CWD, host_session_id: 'sid-oc-cancel2', parallel: 'never', max_wait_sec: 1,
+      }));
+      // wait until the worker has a live session/running status
+      for (let i = 0; i < 80 && jobs.get(send.job_id)?.status !== 'running'; i++) await new Promise((r) => setImmediate(r));
+      const cancel = parse(await dispatch({ action: 'cancel', job_id: send.job_id, host_session_id: 'sid-oc-cancel2' }));
+      // buildCancelFollowup waits up to 5s; the abort unblocks the stream → idle → terminal
+      let term = cancel;
+      for (let i = 0; i < 10 && (term.status === 'cancelling' || term.status === 'still_running'); i++) {
+        term = parse(await dispatch({ action: 'wait', job_id: send.job_id, host_session_id: 'sid-oc-cancel2', max_wait_sec: 5 }));
+      }
+      assert.equal(term.status, 'cancelled');
+      assert.equal(jobs.get(send.job_id).detail, 'cancelled');
+    });
+  } finally {
+    resolveAbort?.();
+    for (const id of [...jobs.keys()]) if (jobs.get(id)?.claudeSessionId === 'sid-oc-cancel2') jobs.delete(id);
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('OpenCode server mode: an empty completed turn is remapped to failed', async () => {
+  const mod = await bridge();
+  const { dispatch, jobs, _resetForTest } = mod;
+  _resetForTest();
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-oc-empty';
+  try {
+    await withOpenCodeServer({
+      fetchJson: async (url, opts = {}) => {
+        if (url.includes('/global/health')) return { ok: true, data: { healthy: true } };
+        if (url.includes('/session?directory=') && opts.method === 'POST') return { ok: true, data: { id: 'ses_empty' } };
+        return { ok: true, data: {} };
+      },
+      // session.idle with no message parts at all → empty completed
+      openEventStream: _ocSse([_ocFrame({ type: 'session.idle', properties: { sessionID: 'ses_empty' } })]),
+    }, async () => {
+      const send = parse(await dispatch({
+        action: 'send', target: 'opencode', task: 'produce nothing', mode: 'EXECUTE',
+        template: 'general', cwd: TEST_CWD, host_session_id: 'sid-oc-empty', parallel: 'never', max_wait_sec: 5,
+      }));
+      const terminal = parse(await dispatch({ action: 'wait', job_id: send.job_id, host_session_id: 'sid-oc-empty', max_wait_sec: 5 }));
+      assert.equal(terminal.status, 'failed');
+      assert.equal(jobs.get(send.job_id).detail, 'empty_completed');
+    });
+  } finally {
+    for (const id of [...jobs.keys()]) if (jobs.get(id)?.claudeSessionId === 'sid-oc-empty') jobs.delete(id);
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
+    _resetForTest();
+  }
+});
+
+test('OpenCode server mode: per-job status flags reflect reply/resume availability', async () => {
+  const mod = await bridge();
+  const { jobs, buildJobResponse, _resetForTest } = mod;
+  _resetForTest();
+  await withOpenCodeServer({}, async () => {
+    const live = buildJobResponse({
+      jobId: 'oc-live', target: 'opencode', opencodeAdapter: 'server',
+      status: 'running', sessionId: 'ses_x', baseUrl: 'http://h', promptId: 'opencode-oc-live', startedAt: Date.now(),
+    });
+    assert.equal(live.reply_available, true);
+    assert.equal(live.resume_available, true);
+    // A cli-mode opencode job advertises neither.
+    const cli = buildJobResponse({ jobId: 'oc-cli', target: 'opencode', status: 'running', promptId: 'opencode-oc-cli', startedAt: Date.now() });
+    assert.equal(cli.reply_available, false);
+    assert.equal(cli.resume_available, false);
+  });
+  _resetForTest();
+});
+
+test('OpenCode server mode: hydrate resumes a persisted job from its transcript', async () => {
+  const mod = await bridge();
+  const { jobs, _resetForTest } = mod;
+  _resetForTest();
+  const state = await import('../lib/state.mjs');
+  const oldS = process.env.CLAUDE_CODE_SESSION_ID;
+  process.env.CLAUDE_CODE_SESSION_ID = 'sid-oc-hydrate';
+  try {
+    await withOpenCodeServer({
+      fetchJson: async (url) => {
+        if (url.includes('/global/health')) return { ok: true, data: { healthy: true } };
+        if (url.includes('/session/status')) return { ok: true, data: {} }; // idle
+        if (url.includes('/message')) return { ok: true, data: [
+          { info: { role: 'assistant', time: { created: 1, completed: 2 } }, parts: [{ type: 'text', text: 'finished while bridge was down' }] },
+        ] };
+        return { ok: true, data: {} };
+      },
+      openEventStream: _ocSse([]),
+    }, async () => {
+      // Persist a non-terminal server-mode job, then drop it from memory.
+      jobs.set('opencode-hydrate', {
+        jobId: 'opencode-hydrate', target: 'opencode', opencodeAdapter: 'server',
+        claudeSessionId: 'sid-oc-hydrate', status: 'running', promptId: 'opencode-hydrate',
+        sessionId: 'ses_hyd', baseUrl: 'http://127.0.0.1:4096', task: 't', mode: 'EXECUTE',
+        cwd: TEST_CWD, startedAt: Date.now(),
+      });
+      mod.persistJob('opencode-hydrate');
+      jobs.delete('opencode-hydrate');
+      mod._resetForTest(); // clears the _hydrated guard; CLAUDE_CODE_SESSION_ID drives the claim
+
+      mod.hydrateJobsFromLedger();
+      // resume runs async; poll until terminal
+      for (let i = 0; i < 50 && !jobs.get('opencode-hydrate')?.terminalAt; i++) {
+        await new Promise((r) => setImmediate(r));
+      }
+      const job = jobs.get('opencode-hydrate');
+      assert.ok(job, 'job claimed from ledger');
+      assert.equal(job.status, 'completed');
+      assert.match(job.adapterResult?.summary?.message || '', /finished while bridge was down/);
+    });
+  } finally {
+    for (const id of [...jobs.keys()]) if (jobs.get(id)?.claudeSessionId === 'sid-oc-hydrate') { try { state.deleteJob(id); } catch {} jobs.delete(id); }
+    if (oldS === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = oldS;
     _resetForTest();
   }
 });

@@ -429,7 +429,9 @@ Future improvement:
 
 - Create or document an OpenCode agent profile for companion runs.
 - Expose `opencode agent` selection through `agent_send` only after the adapter supports it end to end.
-- Consider OpenCode server/SDK adapter for reply/resume and stronger readiness checks.
+- OpenCode server/SDK adapter for reply/resume: DONE (2026-06-23) — `OPENCODE_RUNTIME_ADAPTER=server`
+  drives `opencode serve` over HTTP. See `bridge-server/opencode-server-runtime.mjs` and the
+  Companion Matrix in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### Copilot
 

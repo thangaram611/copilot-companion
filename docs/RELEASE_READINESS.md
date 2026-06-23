@@ -48,17 +48,26 @@ Codex plugins:
 
 OpenCode companion:
 
-- The current adapter uses the documented non-interactive `opencode run` path.
-  OpenCode documents `--format`, `--model`, `--attach`, and `--dir` flags for
-  `run`: <https://opencode.ai/docs/cli/>.
+- The `cli` adapter (default) uses the documented non-interactive `opencode run`
+  path. OpenCode documents `--format`, `--model`, `--attach`, and `--dir` flags
+  for `run`: <https://opencode.ai/docs/cli/>.
+- The `server` adapter (`OPENCODE_RUNTIME_ADAPTER=server`) drives `opencode serve`
+  over HTTP for reply/resume/streamed digests. Verified against the live server
+  API (opencode 1.17.9): `POST /session?directory=<cwd>` roots a session at a cwd,
+  `POST /session/{id}/prompt_async` runs it, `POST /session/{id}/abort` cancels,
+  the directory-scoped `GET /event?directory=<cwd>` SSE stream carries
+  `message.part.updated` + a terminal `session.idle`, and `GET /session/status`
+  reports per-session busy/idle. One detached server is shared and reused across
+  restarts.
 - `opencode models` lists configured provider models in `provider/model` form,
   which is the right basis for future OpenCode companion profiles:
   <https://opencode.ai/docs/cli/>.
-- OpenCode documents `opencode acp` for ACP-compatible editors and IDEs:
-  <https://opencode.ai/docs/acp/>. That makes an OpenCode ACP adapter the
-  strongest next implementation path for reply/resume parity.
-- OpenCode permissions are configured as `allow`, `ask`, or `deny`; unattended
-  runs need explicit permission design rather than hidden auto-approval:
+- OpenCode also documents `opencode acp` for ACP-compatible editors:
+  <https://opencode.ai/docs/acp/>. The server adapter already covers reply/resume,
+  so an ACP stdio adapter is deferred.
+- OpenCode permissions are configured as `allow`, `ask`, or `deny`; the `cli`
+  adapter exposes opt-in `--dangerously-skip-permissions`, while the `server`
+  adapter follows OpenCode's own permission config (no hidden auto-approval):
   <https://opencode.ai/docs/permissions/>.
 
 GitHub Copilot CLI companion:
@@ -123,6 +132,19 @@ the real config verified byte-identical.
   installed `agent-companion@agent-companion` v0.0.1, disabled by default (matches
   `defaultEnabled: false`).
 
-Do not claim strength routing, companion profiles, multiple models per
-companion, OpenCode reply/re-steer, or OpenCode restart resume as implemented
-until those paths have code and tests.
+OpenCode server adapter (added 2026-06-23, same environment):
+
+- **Send: PASS.** `OPENCODE_RUNTIME_ADAPTER=server` with free `ollama-cloud/gpt-oss:120b`.
+  Drove the real bridge `dispatch()` against a live detached `opencode serve`:
+  `agent_send` → still_running → `agent_wait` → `completed`; assistant token echoed,
+  digest written, server pool observable in `agent_status`, no orphaned server.
+- **Reply (re-steer): PASS.** Sent a long turn, re-steered it mid-flight; the
+  follow-up (`-r1` prompt on the same session) overrode the original task and
+  completed. The superseded original turn did not terminalize the job.
+- **Cancel: PASS.** Aborted a running turn via the HTTP session abort; the job
+  reported `cancelled` even though OpenCode emitted no MessageAbortedError (the
+  bridge's cancel intent is authoritative).
+
+Strength routing, companion profiles, multiple models per companion, and the
+OpenCode `acp` stdio adapter remain unimplemented; do not claim them until those
+paths have code and tests.

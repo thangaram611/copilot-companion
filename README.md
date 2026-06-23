@@ -77,19 +77,28 @@ companion runtime boundary.
 
 ## Supported Companions
 
-![Agent Companion companion matrix](assets/readme/target-matrix.png)
-
 | Companion | Runtime | Send | Wait | Status | Cancel | Reply | Restart resume |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| OpenCode | `opencode run --format json --dir <cwd>` | yes | yes | yes | yes | no | no |
+| OpenCode (cli, default) | `opencode run --format json --dir <cwd>` | yes | yes | yes | yes | no | no |
+| OpenCode (server) | `opencode serve` over HTTP | yes | yes | yes | yes | yes | yes |
 | GitHub Copilot CLI | ACP daemon path | yes | yes | yes | yes | yes | yes, with ACP |
 
 Notes:
 
-- OpenCode is a single-shot CLI adapter in the MVP. Reply/re-steer and restart
-  resume require a future server or ACP adapter.
+- OpenCode ships two adapters, selected by `OPENCODE_RUNTIME_ADAPTER`:
+  - `cli` (default) is the single-shot `opencode run` adapter.
+  - `server` drives a long-lived `opencode serve` HTTP server and adds in-flight
+    reply/re-steer, restart resume, and streamed event digests. One shared server
+    roots each job at its own `cwd` via the `?directory=` query param. The server
+    is detached and survives bridge restarts (like the Copilot daemon) so a
+    respawned bridge reattaches instead of re-spawning; set
+    `AGENT_COMPANION_OPENCODE_MODEL=provider/model` to pin a model, otherwise the
+    server's configured default is used.
+  - Server-mode binds `127.0.0.1` and is unsecured; permission handling follows
+    OpenCode's own config (the `AGENT_COMPANION_OPENCODE_PERMISSION_MODE=skip`
+    flag applies to the cli adapter only).
 - Copilot keeps `/fleet` parallel orchestration. `parallel: "auto"` can prepend
-  `/fleet` for broad Copilot tasks; OpenCode remains single-shot.
+  `/fleet` for broad Copilot tasks; OpenCode remains single-job.
 - Goose and Aider are tracked as future companion adapter candidates.
 
 ## Strength Routing Roadmap

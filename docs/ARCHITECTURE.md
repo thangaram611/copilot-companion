@@ -67,10 +67,21 @@ identity is complete.
 
 | Companion | Status | Send | Wait | Status | Cancel | Reply | Restart Resume |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| OpenCode | Implemented CLI adapter | yes | yes | yes | yes | no | no |
+| OpenCode (cli) | Implemented CLI adapter (default) | yes | yes | yes | yes | no | no |
+| OpenCode (server) | Implemented HTTP server adapter | yes | yes | yes | yes | yes | yes |
 | Copilot CLI | Implemented ACP adapter | yes | yes | yes | yes | yes | yes with ACP |
 | Goose | Planned | no | no | no | no | no | no |
 | Aider | Planned | no | no | no | no | no | no |
+
+The OpenCode adapter is selected by `OPENCODE_RUNTIME_ADAPTER` (`cli` default,
+`server` opt-in), mirroring how Copilot selects `acp`/`sdk`. Server mode drives a
+single detached `opencode serve` and roots each job's session at its own `cwd`
+via the `?directory=` query param; terminal detection consumes the directory-
+scoped `/event` SSE stream (`session.idle` is the per-turn terminal marker) with a
+`/session/status` + transcript level-check as the resume/stream-drop backstop. A
+job records the adapter it started with (`opencodeAdapter`), and per-job
+`reply_available` / `resume_available` flags on the status response report what
+that specific job can do — independent of the current env.
 
 ## Current Routing Contract
 
@@ -142,8 +153,14 @@ State lives under the host-routed companion home `~/.{claude,codex}/agent-compan
 - `default-target`: configured default target (written by onboarding).
 - `threads/`: logical companion thread names.
 - `threads/by-host-session/`: Codex host-session to companion-thread mapping.
-- `jobs/`: persisted in-flight/recent jobs for restart recovery.
+- `jobs/`: persisted in-flight/recent jobs for restart recovery. OpenCode
+  server jobs persist their `ses_` session id (under the target-neutral
+  `companionSessionId` key) and the server `baseUrl` so a respawned bridge can
+  resume them.
 - `runtime/`: logs, queue, prompt streams, and digests.
+- `runtime/opencode-servers.json`: registry of the shared detached
+  `opencode serve` process so a respawned bridge reattaches instead of
+  re-spawning.
 
 ## Naming
 

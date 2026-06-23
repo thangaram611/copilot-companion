@@ -103,10 +103,16 @@ primary companion:
 - Multiple model profiles inside the same companion are not implemented yet.
 - Strength labels such as `reviewer`, `web_researcher`, `planner`, or
   `fast_executor` are roadmap vocabulary, not current MCP fields.
-- OpenCode adapter is single-shot CLI mode, not OpenCode server/ACP mode.
-- OpenCode reply/re-steer is not supported yet.
-- OpenCode restart resume is not supported yet; persisted nonterminal OpenCode jobs are marked `unreachable` after bridge restart.
-- OpenCode permission auto-approval is opt-in only because it uses `--dangerously-skip-permissions`.
+- OpenCode has two adapters selected by `OPENCODE_RUNTIME_ADAPTER`: `cli`
+  (default, single-shot `opencode run`) and `server` (`opencode serve` HTTP).
+- OpenCode reply/re-steer and restart resume work in `server` mode only; in `cli`
+  mode they are unsupported and persisted nonterminal cli jobs are marked
+  `unreachable` after bridge restart.
+- OpenCode `cli` permission auto-approval is opt-in via
+  `--dangerously-skip-permissions`; `server` mode follows OpenCode's own
+  permission config (the bridge does not auto-approve).
+- OpenCode `acp` stdio mode is not implemented; server mode covers reply, resume,
+  and streamed digests.
 - Goose and Aider are not implemented yet.
 
 ## Next Backlog
@@ -133,10 +139,20 @@ primary companion:
    - route each send by explicit target/profile/strength with deterministic
      conflict handling and no silent fallback.
 
-3. OpenCode server/ACP adapter:
-   - support in-flight reply/re-steer.
-   - support restart resume.
-   - stream events into richer digests.
+3. OpenCode server/ACP adapter — DONE (2026-06-23, server mode):
+   - `bridge-server/opencode-server-runtime.mjs` drives `opencode serve` over HTTP
+     behind `OPENCODE_RUNTIME_ADAPTER=server`.
+   - in-flight reply/re-steer via abort + re-prompt on the same session.
+   - restart resume by reattaching to the surviving detached server +
+     persisted `ses_` id / `baseUrl`, with a transcript level-check.
+   - streamed `/event` digests via a directory-scoped SSE accumulator
+     (`session.idle` terminal marker).
+   - per-job `reply_available` / `resume_available` flags; one shared server
+     pooled in `runtime/opencode-servers.json`.
+   - ACP stdio mode (`opencode acp`) intentionally deferred — server mode covers
+     all three goals.
+   - Verified end to end against a real `opencode serve` + free `ollama-cloud`
+     model: send→completed, reply re-steer, and cancel→cancelled all pass.
 
 4. Additional companion adapters:
    - Goose first candidate for desktop/CLI/API plus MCP/ACP fit.
@@ -148,6 +164,7 @@ primary companion:
 ```bash
 node --check bridge-server/server.mjs
 node --check bridge-server/opencode-runtime.mjs
+node --check bridge-server/opencode-server-runtime.mjs
 node --check lib/target-registry.mjs
 node --check lib/target-diagnostics.mjs
 node --check scripts/onboard.mjs

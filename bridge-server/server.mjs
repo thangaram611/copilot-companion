@@ -79,6 +79,23 @@ import {
   writeOpenCodeDigest,
 } from './opencode-runtime.mjs';
 import {
+  resolveOpenCodeAdapter,
+  openCodeServerActive,
+  openCodeServerRuntimeInfo,
+  openCodeServerPromptId,
+  resolveOpenCodeServerModel,
+  ensureOpenCodeServer,
+  createOpenCodeSession,
+  startOpenCodeServerPrompt,
+  abortOpenCodeSession,
+  getOpenCodeSessionStatus,
+  openOpenCodeTurnWatcher,
+  loadOpenCodeTranscript,
+  probeOpenCodeServerHealth,
+  openCodeServerPoolSnapshot,
+  reapIdleOpenCodeServer,
+} from './opencode-server-runtime.mjs';
+import {
   defaultTargetInfo,
   defaultTargetId,
   getTarget,
@@ -243,7 +260,20 @@ const jobs = new Map();
 const JOB_RETENTION_MS = 60 * 60 * 1000;
 const JOB_GC_INTERVAL_MS = 60 * 1000;
 
-const jobsGcTimer = setInterval(() => gcExpiredJobs(), JOB_GC_INTERVAL_MS);
+// Dispose the shared `opencode serve` after it has been idle this long with no
+// live opencode-server job. The server is detached and survives bridge restarts
+// by design (that enables resume), so without a reaper it would persist forever.
+const OPENCODE_SERVER_IDLE_TTL_MS = 30 * 60 * 1000;
+
+const jobsGcTimer = setInterval(() => {
+  gcExpiredJobs();
+  // Fire-and-forget; never let a dispose HTTP call disrupt the GC tick.
+  const hasLiveOpenCodeServerJob = [...jobs.values()].some(
+    (j) => j.target === 'opencode' && j.opencodeAdapter === 'server' && !j.terminalAt,
+  );
+  Promise.resolve(reapIdleOpenCodeServer({ idleMs: OPENCODE_SERVER_IDLE_TTL_MS, hasLiveJobs: hasLiveOpenCodeServerJob }))
+    .catch(() => {});
+}, JOB_GC_INTERVAL_MS);
 if (jobsGcTimer.unref) jobsGcTimer.unref();
 
 function gcExpiredJobs(now = Date.now()) {
@@ -256,18 +286,21 @@ function gcExpiredJobs(now = Date.now()) {
   }
 }
 
-// In-memory jobs use `sessionId` for the Copilot ACP session; persisted form
-// renames it to `copilotSessionId` so it cannot be confused with the Claude
-// Code session id (`claudeSessionId`) that the drain hook keys on. Best-effort:
-// failures don't abort the action — the in-memory map is still authoritative
-// for the current bridge process.
+// In-memory jobs use `sessionId` for the companion runtime session (a Copilot
+// ACP session or an OpenCode `ses_` id). The persisted form renames it to the
+// target-neutral `companionSessionId` so it cannot be confused with the Claude
+// Code session id (`claudeSessionId`) that the drain hook keys on, and so an
+// OpenCode session id is not stored under a Copilot-specific key. Legacy ledgers
+// written before the rename used `copilotSessionId`; hydrate still reads it.
+// Best-effort: failures don't abort the action — the in-memory map is still
+// authoritative for the current bridge process.
 function persistJob(jobId) {
   const job = jobs.get(jobId);
   if (!job || !job.claudeSessionId) return;
   try {
     const { sessionId, ...rest } = job;
     const data = { ...rest };
-    if (sessionId !== undefined) data.copilotSessionId = sessionId;
+    if (sessionId !== undefined) data.companionSessionId = sessionId;
     writeJob(jobId, data);
   } catch (err) {
     log('WARN', 'persistJob failed:', jobId, err.message);
@@ -536,6 +569,27 @@ function digestResourceLinkForResult(obj) {
   return resource ? { type: 'resource_link', ...resource } : null;
 }
 
+// Per-job re-steer availability. Copilot can reply on any live (non-terminal)
+// prompt; OpenCode can reply only in server mode with a live session.
+function jobReplyAvailable(job) {
+  if (!job || job.terminalAt) return false;
+  const target = job.target || 'copilot';
+  if (target === 'copilot') return Boolean(job.promptId);
+  if (target === 'opencode') return Boolean(job.opencodeAdapter === 'server' && job.baseUrl && job.sessionId);
+  return false;
+}
+
+// Per-job restart-resume availability — whether a respawned bridge could
+// reattach to this job. Copilot resumes via the detached daemon; OpenCode server
+// jobs resume via the surviving server + persisted session id.
+function jobResumeAvailable(job) {
+  if (!job) return false;
+  const target = job.target || 'copilot';
+  if (target === 'copilot') return Boolean(job.promptId && runtimeSupportsDetachedPromptResume());
+  if (target === 'opencode') return Boolean(job.opencodeAdapter === 'server' && job.baseUrl && job.sessionId);
+  return false;
+}
+
 export function buildJobResponse(job, inspect = null, { includeTimeline = false } = {}) {
   const data = inspect || {};
   // Status precedence: when the worker has emitted a bridge-level remap
@@ -579,6 +633,12 @@ export function buildJobResponse(job, inspect = null, { includeTimeline = false 
       data.inspectAvailable ?? job.inspectAvailable ??
       (job.promptId && (!job.retentionExpiresAt || job.retentionExpiresAt > Date.now()))
     ),
+    // Per-job capability: whether THIS job can be re-steered / resumed right now,
+    // computed from the real predicate rather than the target descriptor. A
+    // cli-mode OpenCode job or one without a live session reports false even
+    // when the target advertises the capability.
+    reply_available: jobReplyAvailable(job),
+    resume_available: jobResumeAvailable(job),
     retention_expires_at: data.retentionExpiresAt || iso(job.retentionExpiresAt),
     activity:           includeTimeline ? (Array.isArray(data.activity) ? data.activity : []) : undefined,
     activity_count:     includeTimeline ? (data.activityCount ?? 0) : undefined,
@@ -1096,7 +1156,264 @@ async function runWorker({ jobId, reqId, task, mode, template, template_args, cw
   }
 }
 
-async function runOpenCodeWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, parallel, target }) {
+async function runOpenCodeWorker(args) {
+  // CLI single-shot vs HTTP server mode. Server mode (OPENCODE_RUNTIME_ADAPTER=
+  // server) unlocks reply/resume/streaming; CLI mode stays the default.
+  if (openCodeServerActive()) return runOpenCodeServerWorker(args);
+  return runOpenCodeCliWorker(args);
+}
+
+// Server-mode worker: ensure a pooled `opencode serve`, create a persisted
+// session, subscribe to /event BEFORE prompting (so session.idle can't be
+// missed), then drive the turn through the reusable watch helper.
+async function runOpenCodeServerWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, parallel, target }) {
+  const startedAt = Date.now();
+  const rlog = withReq(reqId, { job_id: jobId, target });
+  rlog.info('worker.start', { mode, template, thread: thread || null, cwd: cwd || null, parallel_strategy: parallel, target, adapter: 'server' });
+  log('INFO', 'opencode-server worker start:', jobId, `req=${reqId} mode=${mode} template=${template} thread=${thread || '-'} cwd=${cwd}`);
+  try {
+    const { baseUrl } = await ensureOpenCodeServer();
+    const sessionId = await createOpenCodeSession({ baseUrl, directory: cwd, title: thread || jobId });
+    const promptId = openCodeServerPromptId(jobId);
+    // The session is rooted at `cwd` via ?directory=; mark the adapter so reply/
+    // cancel/hydrate gate on what THIS job started with, not the live env.
+    updateJob(jobId, { promptId, sessionId, baseUrl, opencodeAdapter: 'server', pid: null, status: 'running', inspectAvailable: false });
+    writeOpenCodeDigest(jobs.get(jobId), null);
+    rlog.info('worker.session_created', { session_id: sessionId, base_url: baseUrl });
+    log('INFO', 'opencode-server session:', jobId, `session=${sessionId} base=${baseUrl} dir=${cwd}`);
+
+    const formatted = formatPrompt({ template, task, mode, template_args, parallel: 'never' });
+    await runOpenCodeServerWatch({
+      jobId, reqId, baseUrl, sessionId, promptId, directory: cwd,
+      prompt: formatted, task, mode, cwd, thread, startedAt, fresh: true,
+    });
+  } catch (err) {
+    const duration = Date.now() - startedAt;
+    retainTerminalJob(jobId, {
+      status: 'failed', summary: null, error: err.message,
+      stuckReason: null, detail: 'opencode_server_worker_error',
+      failedTools: [], durationMs: duration, terminalAt: Date.now(),
+    });
+    writeOpenCodeDigest(jobs.get(jobId), { stdout: '', stderr: err.message, summary: null });
+    emitNotification({
+      jobId, status: 'failed', summary: null, error: err.message,
+      stuckReason: null, detail: 'opencode_server_worker_error',
+      duration, task, mode, cwd, thread,
+      promptId: jobs.get(jobId)?.promptId || null, sessionId: jobs.get(jobId)?.sessionId || null,
+      failedTools: [], reqId, target, fleet: false,
+    });
+    rlog.warn('worker.catch', { error: err.message });
+    log('WARN', 'opencode-server worker catch:', jobId, `err="${err.message}"`);
+  } finally {
+    rlog.info('worker.end', { duration_ms: Date.now() - startedAt });
+  }
+}
+
+// Drive one OpenCode server turn to terminal. Reused by the fresh worker, by
+// reply (re-steer), and by restart resume. `fresh`/`reply` fire prompt_async
+// after the watcher subscribes; resume omits the prompt and reattaches.
+// A per-job watch generation guard (job.promptId === promptId) ensures a
+// superseded turn (after a reply aborts it) never writes a terminal/notification
+// over the live one — mirrors the Copilot superseding-prompt logic.
+async function runOpenCodeServerWatch({ jobId, reqId, baseUrl, sessionId, promptId, directory = null, prompt = null, task, mode, cwd, thread, startedAt, fresh = false, reply = false, abortFirst = false }) {
+  const rlog = withReq(reqId, { job_id: jobId });
+  const timeoutMs = resolveOpenCodeServerTimeoutMs();
+  let watcher;
+  try {
+    // Reply path: abort the in-flight turn and wait for the session to settle
+    // BEFORE subscribing/prompting, so the follow-up does not race the old turn
+    // or hit SessionBusyError. The handler already bumped job.promptId, so the
+    // old watcher discards its terminal when this abort's session.idle lands.
+    if (abortFirst) {
+      const ab = await abortOpenCodeSession({ baseUrl, sessionId, directory });
+      if (!ab.aborted) rlog.warn('reply.abort_unconfirmed', { error: ab.error || null });
+      const settled = await waitOpenCodeSessionIdle({ baseUrl, sessionId, directory });
+      if (!settled) rlog.warn('reply.session_still_busy', {});
+    }
+    // Subscribe to the directory-scoped event stream BEFORE prompting so the
+    // terminal session.idle can't be missed. Resume omits the prompt and asks
+    // the watcher to level-check whether the turn already finished.
+    watcher = await openOpenCodeTurnWatcher({
+      baseUrl, sessionId, directory, timeoutMs,
+      initialLevelCheck: !fresh && !reply,
+      onEvent: (snapshot) => {
+        const job = jobs.get(jobId);
+        if (!job || job.promptId !== promptId) return;
+        job.adapterResult = { stdout: snapshot.message || '', stderr: '', summary: snapshot };
+        refreshDigestForJob(job);
+      },
+    });
+    if (fresh || reply) {
+      await startOpenCodeServerPrompt({ baseUrl, sessionId, directory, prompt, model: resolveOpenCodeServerModel() });
+    }
+    const result = await watcher.done;
+
+    // Supersede guard: if a reply bumped job.promptId while we waited, this turn
+    // is obsolete — drop its terminal so the replacement watch owns the job.
+    const currentJob = jobs.get(jobId);
+    if (currentJob && currentJob.promptId !== promptId) {
+      rlog.info('worker.prompt_obsolete', { prompt_id: promptId, current_prompt_id: currentJob.promptId });
+      log('INFO', 'opencode-server obsolete turn ignored:', jobId, `old=${promptId} current=${currentJob.promptId}`);
+      return;
+    }
+
+    // Cancel verdict: if the bridge requested an abort for this job, the turn is
+    // cancelled regardless of how the stream reported it (OpenCode does not
+    // reliably emit MessageAbortedError when aborted mid-reasoning).
+    if (currentJob?.cancelRequested && result.status !== 'unreachable') {
+      result.status = 'cancelled';
+      result.error = null;
+      result.detail = 'cancelled';
+    }
+
+    // Empty-completed remap: a 'completed' turn with no assistant message, tools,
+    // or plan is a failure, matching emitNotification's own remap — keep the
+    // retained/persisted status in sync with the notification + digest.
+    if (result.status === 'completed' && isEmptyCompletedSummary(result.summary)) {
+      result.status = 'failed';
+      result.error = 'OpenCode returned completed without any assistant message or tool calls.';
+      result.detail = 'empty_completed';
+    }
+
+    const duration = Date.now() - startedAt;
+    const detail = result.detail
+      || (result.status === 'completed' ? null
+      : result.status === 'cancelled' ? 'cancelled'
+      : result.status === 'timeout' ? 'opencode_server_timeout'
+      : result.status === 'unreachable' ? 'opencode_server_unreachable'
+      : 'opencode_server_failed');
+    const job = jobs.get(jobId);
+    if (job) job.adapterResult = result;
+    retainTerminalJob(jobId, {
+      status: result.status, summary: result.summary, error: result.error,
+      stuckReason: null, detail, failedTools: [],
+      durationMs: duration, terminalAt: Date.now(), adapterResult: result,
+    });
+    writeOpenCodeDigest(jobs.get(jobId), result);
+    emitNotification({
+      jobId, status: result.status, summary: result.summary, error: result.error,
+      stuckReason: null, detail, duration, task, mode, cwd, thread,
+      promptId, sessionId, failedTools: [], reqId, target: 'opencode', fleet: false,
+    });
+    rlog.info('worker.terminal', { status: result.status, duration_ms: duration });
+    log('INFO', 'opencode-server worker terminal:', jobId, `status=${result.status} duration_ms=${duration}`);
+  } catch (err) {
+    try { watcher?.close(); } catch {}
+    const currentJob = jobs.get(jobId);
+    if (currentJob && currentJob.promptId !== promptId) return;
+    const duration = Date.now() - startedAt;
+    retainTerminalJob(jobId, {
+      status: 'failed', summary: null, error: err.message,
+      stuckReason: null, detail: 'opencode_server_watch_error',
+      failedTools: [], durationMs: duration, terminalAt: Date.now(),
+    });
+    writeOpenCodeDigest(jobs.get(jobId), { stdout: '', stderr: err.message, summary: null });
+    emitNotification({
+      jobId, status: 'failed', summary: null, error: err.message,
+      stuckReason: null, detail: 'opencode_server_watch_error',
+      duration, task, mode, cwd, thread, promptId, sessionId,
+      failedTools: [], reqId, target: 'opencode', fleet: false,
+    });
+    rlog.warn('worker.watch_catch', { error: err.message });
+    log('WARN', 'opencode-server watch catch:', jobId, `err="${err.message}"`);
+  }
+}
+
+function resolveOpenCodeServerTimeoutMs() {
+  // Reuse the same timeout knob as the CLI adapter for parity.
+  return openCodeServerRuntimeInfo().timeout_ms;
+}
+
+// Poll /session/status until the session leaves 'busy' (or a short budget
+// elapses). Used between a reply's abort and its re-prompt so OpenCode does not
+// reject the follow-up with SessionBusyError.
+async function waitOpenCodeSessionIdle({ baseUrl, sessionId, directory, attempts = 20, intervalMs = 150 }) {
+  for (let i = 0; i < attempts; i++) {
+    const status = await getOpenCodeSessionStatus({ baseUrl, sessionId, directory });
+    if (status !== 'busy') return true;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return false;
+}
+
+// Restart resume for an OpenCode server job. An in-flight turn only keeps
+// running on the exact server process that started it, so probe the recorded
+// base URL first. If it survived, reattach (or harvest a turn that finished
+// while the bridge was down). If it is gone, replay the persisted transcript
+// from a fresh server; an unfinished turn is unrecoverable.
+async function resumeOpenCodeServerJob(job) {
+  const jobId = job.jobId;
+  const reqId = job.reqId || createReqId();
+  const startedAt = job.startedAt || Date.now();
+  const promptId = job.promptId || openCodeServerPromptId(jobId);
+  log('INFO', 'opencode-server resume:', jobId, `session=${job.sessionId} base=${job.baseUrl}`);
+
+  if (await probeOpenCodeServerHealth(job.baseUrl)) {
+    // Surviving server: the watcher's initial level-check harvests a turn that
+    // finished while the bridge was down, or reattaches a still-running one.
+    await runOpenCodeServerWatch({
+      jobId, reqId, baseUrl: job.baseUrl, sessionId: job.sessionId, promptId, directory: job.cwd || null,
+      task: job.task || '', mode: job.mode || 'EXECUTE', cwd: job.cwd || null,
+      thread: job.thread || null, startedAt,
+    });
+    return;
+  }
+
+  // Original server gone. Sessions persist on disk, so a fresh server can still
+  // serve the transcript; but an unfinished turn cannot be observed anymore.
+  let baseUrl = null;
+  try { ({ baseUrl } = await ensureOpenCodeServer()); }
+  catch (err) {
+    retainTerminalJob(jobId, {
+      status: 'unreachable',
+      error: `opencode server gone and respawn failed: ${err.message}`,
+      detail: 'opencode_server_gone', terminalAt: Date.now(),
+    });
+    writeOpenCodeDigest(jobs.get(jobId), jobs.get(jobId)?.adapterResult || null);
+    return;
+  }
+  updateJob(jobId, { baseUrl });
+  let transcript = null;
+  try { transcript = await loadOpenCodeTranscript({ baseUrl, sessionId: job.sessionId, directory: job.cwd || null }); }
+  catch (err) { log('WARN', 'opencode-server resume transcript failed:', jobId, err.message); }
+  if (transcript?.completed) {
+    finalizeResumedOpenCodeTranscript(job, transcript, reqId, startedAt);
+    return;
+  }
+  retainTerminalJob(jobId, {
+    status: 'unreachable',
+    error: 'the opencode server that ran this turn is gone; the in-flight turn was lost (session transcript preserved on disk)',
+    detail: 'opencode_server_gone', terminalAt: Date.now(),
+  });
+  writeOpenCodeDigest(jobs.get(jobId), jobs.get(jobId)?.adapterResult || null);
+}
+
+function finalizeResumedOpenCodeTranscript(job, transcript, reqId, startedAt) {
+  const jobId = job.jobId;
+  const status = transcript.aborted ? 'cancelled' : (transcript.error ? 'failed' : 'completed');
+  const result = {
+    status, summary: transcript.summary, error: transcript.error,
+    stdout: transcript.summary?.message || '', stderr: '',
+  };
+  const duration = Date.now() - startedAt;
+  const detail = status === 'completed' ? 'resumed_completed'
+    : status === 'cancelled' ? 'cancelled' : 'opencode_server_failed';
+  job.adapterResult = result;
+  retainTerminalJob(jobId, {
+    status, summary: transcript.summary, error: transcript.error,
+    detail, durationMs: duration, terminalAt: Date.now(), adapterResult: result,
+  });
+  writeOpenCodeDigest(jobs.get(jobId), result);
+  emitNotification({
+    jobId, status, summary: transcript.summary, error: transcript.error, detail,
+    duration, task: job.task, mode: job.mode, cwd: job.cwd, thread: job.thread,
+    promptId: job.promptId, sessionId: job.sessionId, failedTools: [], reqId,
+    target: 'opencode', fleet: false,
+  });
+  log('INFO', 'opencode-server resume terminal:', jobId, `status=${status} (from transcript)`);
+}
+
+async function runOpenCodeCliWorker({ jobId, reqId, task, mode, template, template_args, cwd, thread, parallel, target }) {
   const startedAt = Date.now();
   const rlog = withReq(reqId, { job_id: jobId, target });
   rlog.info('worker.start', { mode, template, thread: thread || null, cwd: cwd || null, parallel_strategy: parallel, target });
@@ -1656,6 +1973,26 @@ async function handleCancel({ job_id }) {
   if (!job.promptId || job.status === 'starting') return asJson({ ok: false, error: 'job is not yet cancellable' });
   if (job.status !== 'running')                   return asJson({ ok: false, error: `job is ${job.status}` });
   if (target !== 'copilot') {
+    // OpenCode server mode aborts the HTTP session turn; the watch loop then
+    // observes session.idle with MessageAbortedError and maps it to cancelled.
+    // CLI mode signals the spawned `opencode run` child.
+    if (target === 'opencode' && job.opencodeAdapter === 'server' && job.baseUrl && job.sessionId) {
+      // Record the intent BEFORE aborting: OpenCode's abort does not always emit
+      // a MessageAbortedError (a turn aborted mid-reasoning just goes idle), so
+      // the watch can't infer cancellation from the stream alone. The bridge
+      // initiated it, so it owns the verdict.
+      updateJob(job_id, { cancelRequested: true });
+      const resp = await abortOpenCodeSession({ baseUrl: job.baseUrl, sessionId: job.sessionId, directory: job.cwd || null });
+      if (resp.aborted) {
+        return buildCancelFollowup(job_id, target, { reason: 'aborted opencode session turn' });
+      }
+      return asJson({
+        ok: false, action: 'cancel', job_id, target,
+        status: 'cancel_failed', cancelled: false,
+        reason: resp.error || 'opencode session abort not confirmed',
+        error: resp.error || 'opencode session abort not confirmed',
+      });
+    }
     const resp = cancelOpenCodeRun(job_id, job.pid || null);
     if (resp.ok) {
       return buildCancelFollowup(job_id, target, {
@@ -1688,6 +2025,61 @@ async function handleCancel({ job_id }) {
   });
 }
 
+// OpenCode server re-steer: abort the in-flight turn, bump the per-job watch
+// generation so the old watcher drops its (cancelled) terminal, then prompt the
+// same session again under a fresh watch. Mirrors Copilot's cancel-then-reprompt
+// reply without the daemon socket.
+async function handleOpenCodeServerReply(job, message) {
+  const job_id = job.jobId;
+  if (!job.sessionId || !job.baseUrl) return asJson({ ok: false, action: 'reply', error: 'job has no live opencode session yet — wait for status: running' });
+  if (job.terminalAt) return asJson({ ok: false, action: 'reply', error: `job is already ${job.status} — start a new send` });
+  if (job.replyInFlight) return asJson({ ok: false, action: 'reply', error: 'reply already in flight for this job' });
+
+  const originalPromptId = job.promptId;
+  const replyTurn = (job.replyTurn || 0) + 1;
+  const replacementPromptId = openCodeServerPromptId(job_id, replyTurn);
+  // Bump the watch generation SYNCHRONOUSLY, before any await. The original
+  // turn's watcher is parked on `await watcher.done`; when the abort's
+  // session.idle lands it reaches its supersede guard, which must already see
+  // the new promptId so it discards the (cancelled) terminal instead of
+  // resolving waiters / emitting a spurious cancelled notification over the
+  // re-steer. Abort + settle then run inside the background watch so a failed
+  // abort or a still-busy session surfaces as the new turn's terminal rather
+  // than racing here. (Mirror of Copilot's atomic cancel-then-reprompt.)
+  job.replyInFlight = true;
+  updateJob(job_id, {
+    promptId: replacementPromptId,
+    replyTurn,
+    status: 'running',
+    inspectAvailable: false,
+    terminalAt: null,
+    retentionExpiresAt: null,
+    error: null,
+    stuckReason: null,
+    detail: null,
+  });
+
+  const reqId = job.reqId || createReqId();
+  runOpenCodeServerWatch({
+    jobId: job_id, reqId,
+    baseUrl: job.baseUrl, sessionId: job.sessionId, promptId: replacementPromptId, directory: job.cwd || null,
+    prompt: message, task: job.task || message, mode: job.mode || 'EXECUTE',
+    cwd: job.cwd || null, thread: job.thread || null,
+    startedAt: job.startedAt || Date.now(), reply: true, abortFirst: true,
+  })
+    .catch((err) => log('ERROR', 'opencode-server reply watch error:', job_id, err.message))
+    .finally(() => { const j = jobs.get(job_id); if (j) { j.replyInFlight = false; persistJob(job_id); } });
+
+  log('INFO', 'agent:reply opencode-server', `job=${job_id} old_prompt=${originalPromptId} new_prompt=${replacementPromptId}`);
+  return asJson({
+    ok: true, action: 'reply', job_id, target: 'opencode',
+    original_prompt_id: originalPromptId,
+    new_prompt_id: replacementPromptId,
+    session_id: job.sessionId,
+    hint: 'reply accepted. The original turn was aborted; the follow-up runs as a new prompt on the same OpenCode session.',
+  });
+}
+
 async function handleReply({ job_id, message }) {
   // Re-steer an in-flight job. Triple guard: validation rejects missing
   // message; this handler rejects unknown/terminal jobs locally (cheap fast
@@ -1696,6 +2088,15 @@ async function handleReply({ job_id, message }) {
   const job = getJob(job_id);
   if (!job) return asJson({ ok: false, action: 'reply', error: 'unknown job_id' });
   const target = job.target || 'copilot';
+  if (target === 'opencode') {
+    if (job.opencodeAdapter === 'server' && job.baseUrl && job.sessionId) {
+      return handleOpenCodeServerReply(job, message);
+    }
+    return asJson({
+      ok: false, action: 'reply', job_id, target, code: 'TARGET_UNSUPPORTED',
+      error: 'OpenCode reply requires server mode (OPENCODE_RUNTIME_ADAPTER=server) and a live session; the CLI adapter cannot re-steer — cancel or start a new send.',
+    });
+  }
   if (target !== 'copilot') {
     return asJson({
       ok: false,
@@ -1802,7 +2203,7 @@ async function handleStatus({ job_id, verbose, diagnostics }) {
     default_target: defaultTargetInfo(),
     targets: listTargets(),
     runtime_adapter: selectedRuntimeAdapter(),
-    opencode_runtime: openCodeRuntimeInfo(),
+    opencode_runtime: { ...openCodeRuntimeInfo(), ...openCodeServerRuntimeInfo(), server_pool: openCodeServerPoolSnapshot() },
     default_model: modelInfo,
     threads: listThreads(),
     jobs_in_memory: jobs.size,
@@ -2138,9 +2539,10 @@ export function hydrateJobsFromLedger() {
   let resumed = 0;
   const canResumeDetachedPrompts = runtimeSupportsDetachedPromptResume();
   for (const persisted of entries) {
-    const { copilotSessionId, ...rest } = persisted;
+    const { companionSessionId, copilotSessionId, ...rest } = persisted;
     const job = { ...rest };
-    if (copilotSessionId !== undefined) job.sessionId = copilotSessionId;
+    const restoredSessionId = companionSessionId ?? copilotSessionId;
+    if (restoredSessionId !== undefined) job.sessionId = restoredSessionId;
     jobs.set(job.jobId, job);
     claimed++;
 
@@ -2157,6 +2559,15 @@ export function hydrateJobsFromLedger() {
     }
 
     if (target !== 'copilot') {
+      // OpenCode server jobs survive a bridge restart: the detached `opencode
+      // serve` is still listening and the session is persisted on disk. Resume
+      // reattaches by base URL + session id. Everything else (CLI single-shot,
+      // or a server job with no session yet) is non-resumable.
+      if (!isTerminal && target === 'opencode' && job.opencodeAdapter === 'server' && job.sessionId && job.baseUrl) {
+        resumeOpenCodeServerJob(job).catch((err) => log('ERROR', 'opencode-server resume error:', job.jobId, err.message));
+        resumed++;
+        continue;
+      }
       if (!isTerminal) {
         retainTerminalJob(job.jobId, {
           status: 'unreachable',

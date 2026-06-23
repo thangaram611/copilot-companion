@@ -1,0 +1,655 @@
+// OpenCode server-mode adapter.
+//
+// Unlike opencode-runtime.mjs (single-shot `opencode run`), this adapter drives
+// a long-lived `opencode serve` HTTP server so the bridge gains:
+//   - in-flight reply / re-steer (abort the turn, prompt the same session again),
+//   - restart resume (reattach to a surviving server + persisted session id),
+//   - streamed events into richer digests (the `/event` SSE stream).
+//
+// Lifecycle mirrors the Copilot ACP daemon: the `opencode serve` process is
+// spawned DETACHED and unref'd so it SURVIVES bridge restarts. A respawned
+// bridge reattaches by probing the recorded base URL instead of spawning a
+// duplicate. There is ONE shared server (not one per cwd): a single
+// `opencode serve` roots each job's session at its own working directory via
+// the `?directory=<cwd>` query param, which the server honours on session
+// create, prompt, abort, the `/event` stream, and `/session/status`. (Verified
+// against opencode 1.17.9: the no-param `/event` stream carries only events for
+// the server's own launch cwd, so the directory param is mandatory.)
+//
+// Test seam: every side-effecting primitive (HTTP JSON, the SSE event stream,
+// and server spawn) routes through module-local impl pointers that tests swap
+// via `_setForTest` — reachable from server.test.mjs too, since the bridge calls
+// these wrappers. The SSE parser is a pure accumulator (`createTurnAccumulator`)
+// that can be unit-tested with plain strings — no socket required.
+
+import { spawn } from 'node:child_process';
+import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+
+import { resolveOpenCodeBin, resolveOpenCodePermissionMode, resolveOpenCodeTimeoutMs } from './opencode-runtime.mjs';
+import { openCodeServerRegistryPath } from '../lib/runtime-paths.mjs';
+
+const PRIVATE_FILE_MODE = 0o600;
+const MAX_SUMMARY_CHARS = 64 * 1024;
+const MAX_TRANSCRIPT_CHARS = 12_000;
+const SERVER_BOOT_TIMEOUT_MS = 15_000;
+const HEALTH_PROBE_TIMEOUT_MS = 2_000;
+const DEFAULT_ADAPTER = 'cli';
+// One server for the whole bridge; sessions are scoped per cwd via ?directory=.
+const SHARED_SERVER_KEY = 'shared';
+
+// ---------------------------------------------------------------------------
+// Adapter selection
+// ---------------------------------------------------------------------------
+
+export function resolveOpenCodeAdapter(env = process.env) {
+  const raw = String(env.OPENCODE_RUNTIME_ADAPTER || DEFAULT_ADAPTER).trim().toLowerCase();
+  return raw === 'server' ? 'server' : 'cli';
+}
+
+export function openCodeServerActive(env = process.env) {
+  return resolveOpenCodeAdapter(env) === 'server';
+}
+
+// Split a `provider/model` string into the server prompt API's
+// { providerID, modelID } shape. Returns null when unset (server uses its own
+// configured default model).
+export function resolveOpenCodeServerModel(env = process.env) {
+  const raw = String(env.AGENT_COMPANION_OPENCODE_MODEL || '').trim();
+  if (!raw) return null;
+  const slash = raw.indexOf('/');
+  if (slash <= 0 || slash === raw.length - 1) return null;
+  return { providerID: raw.slice(0, slash), modelID: raw.slice(slash + 1) };
+}
+
+export function openCodeServerRuntimeInfo(env = process.env) {
+  return {
+    adapter: resolveOpenCodeAdapter(env),
+    bin: resolveOpenCodeBin(env),
+    model: resolveOpenCodeServerModel(env),
+    permission: resolveOpenCodePermissionMode(env),
+    timeout_ms: resolveOpenCodeTimeoutMs(env),
+  };
+}
+
+export function openCodeServerPromptId(jobId, replyTurn = 0) {
+  return replyTurn > 0 ? `opencode-${jobId}-r${replyTurn}` : `opencode-${jobId}`;
+}
+
+// ---------------------------------------------------------------------------
+// Injectable I/O seam (default impls use global fetch / spawn)
+// ---------------------------------------------------------------------------
+
+async function realFetchJson(url, { method = 'GET', body = null, signal = null, timeoutMs = 30_000 } = {}) {
+  const ac = signal ? null : new AbortController();
+  const finalSignal = signal || ac?.signal;
+  const timer = ac ? setTimeout(() => ac.abort(), timeoutMs) : null;
+  if (timer?.unref) timer.unref();
+  try {
+    const res = await fetch(url, {
+      method,
+      signal: finalSignal,
+      headers: body != null ? { 'content-type': 'application/json' } : undefined,
+      body: body != null ? JSON.stringify(body) : undefined,
+    });
+    let data = null;
+    const text = await res.text();
+    if (text) { try { data = JSON.parse(text); } catch { data = text; } }
+    return { ok: res.ok, status: res.status, data };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Open the `/event` SSE stream. Resolves once the HTTP connection is established
+// (so the caller can sequence subscribe-then-prompt), returning an async iterable
+// of decoded text chunks. The caller aborts `signal` to stop; we never buffer the
+// whole stream. TCP/stream buffering preserves events that arrive between connect
+// and the first iteration, so a session.idle just after connect is not lost.
+async function realOpenEventStream(url, { signal = null } = {}) {
+  const res = await fetch(url, { signal, headers: { accept: 'text/event-stream' } });
+  if (!res.ok || !res.body) {
+    throw new Error(`opencode /event stream failed: HTTP ${res.status}`);
+  }
+  return (async function* () {
+    const decoder = new TextDecoder();
+    for await (const chunk of res.body) {
+      yield typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+    }
+  })();
+}
+
+function realSpawnServer({ bin, args, env }) {
+  const child = spawn(bin, args, { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  return child;
+}
+
+let _impl = {
+  fetchJson: realFetchJson,
+  openEventStream: realOpenEventStream,
+  spawnServer: realSpawnServer,
+};
+
+export function _setForTest(overrides = {}) {
+  _impl = { ..._impl, ...overrides };
+}
+
+export function _resetForTest() {
+  _impl = { fetchJson: realFetchJson, openEventStream: realOpenEventStream, spawnServer: realSpawnServer };
+  _serverCache.clear();
+  _spawnLocks.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Pure SSE accumulator — terminal detection + transcript assembly
+// ---------------------------------------------------------------------------
+//
+// Feed it raw `/event` stream text via push(); it tracks the assistant message
+// for one session and reports a terminal verdict once `session.idle` (or
+// `session.error`) arrives for that session. No I/O — unit-testable directly.
+
+export function createTurnAccumulator(sessionId) {
+  let pending = '';
+  // assistant message id -> { textParts: Map(partId->text), reasoning: Map, tools: Map }
+  const messages = new Map();
+  let latestAssistantId = null;
+  let aborted = false;
+  let messageError = null; // { name, message }
+  let terminal = null; // { status }
+  let sawEvent = false;
+
+  function partText(map) {
+    return [...map.values()].map((s) => String(s || '')).join('');
+  }
+
+  function snapshotMessage(id) {
+    const m = messages.get(id);
+    if (!m) return { text: '', thoughts: '', tools: [] };
+    return {
+      text: partText(m.textParts),
+      thoughts: partText(m.reasoning),
+      tools: [...m.tools.values()],
+    };
+  }
+
+  function ensureMessage(id) {
+    if (!messages.has(id)) messages.set(id, { textParts: new Map(), reasoning: new Map(), tools: new Map() });
+    return messages.get(id);
+  }
+
+  function onEvent(evt) {
+    if (!evt || typeof evt !== 'object') return;
+    const type = String(evt.type || '');
+    const props = evt.properties || {};
+    // Global noise (no sessionID, or a different session) is ignored.
+    if (props.sessionID && props.sessionID !== sessionId) return;
+    sawEvent = true;
+
+    if (type === 'message.updated') {
+      const info = props.info || {};
+      if (info.role === 'assistant') {
+        latestAssistantId = info.id || latestAssistantId;
+        if (info.id) ensureMessage(info.id);
+        if (info.error) {
+          const name = info.error.name || info.error.type || 'error';
+          messageError = { name, message: info.error.message || info.error.data?.message || name };
+          if (/abort/i.test(name)) aborted = true;
+        }
+      }
+      return;
+    }
+
+    if (type === 'message.part.updated') {
+      const part = props.part || {};
+      const mid = part.messageID;
+      if (!mid) return;
+      const m = ensureMessage(mid);
+      // Any part (text/tool/reasoning) belongs to the assistant message, so a
+      // tool-only or reasoning-only turn still resolves to the right snapshot.
+      latestAssistantId = mid;
+      if (part.id == null) return;
+      if (part.type === 'text' && typeof part.text === 'string') {
+        if (!part.synthetic && !part.ignored) m.textParts.set(part.id, part.text);
+      } else if (part.type === 'reasoning' && typeof part.text === 'string') {
+        m.reasoning.set(part.id, part.text);
+      } else if (part.type === 'tool') {
+        m.tools.set(part.id, {
+          name: part.tool || part.name || 'tool',
+          input: part.state?.input || part.input || {},
+          status: part.state?.status || null,
+        });
+      }
+      return;
+    }
+
+    if (type === 'session.error') {
+      const err = props.error || {};
+      const name = err.name || err.type || 'session.error';
+      messageError = { name, message: err.message || err.data?.message || name };
+      if (/abort/i.test(name)) aborted = true;
+      terminal = { status: aborted ? 'cancelled' : 'failed' };
+      return;
+    }
+
+    if (type === 'session.idle') {
+      if (aborted || (messageError && /abort/i.test(messageError.name))) {
+        terminal = { status: 'cancelled' };
+      } else if (messageError) {
+        terminal = { status: 'failed' };
+      } else {
+        terminal = { status: 'completed' };
+      }
+    }
+  }
+
+  return {
+    // Feed raw SSE text; parses complete `\n\n`-delimited frames.
+    push(text) {
+      pending += text;
+      let idx;
+      while ((idx = pending.indexOf('\n\n')) !== -1) {
+        const frame = pending.slice(0, idx);
+        pending = pending.slice(idx + 2);
+        consumeFrame(frame);
+      }
+    },
+    // Flush a trailing partial frame (used on stream close).
+    flush() {
+      if (pending.trim()) consumeFrame(pending);
+      pending = '';
+    },
+    get terminal() { return terminal; },
+    get sawEvent() { return sawEvent; },
+    snapshot() {
+      const snap = latestAssistantId ? snapshotMessage(latestAssistantId) : { text: '', thoughts: '', tools: [] };
+      return {
+        message: truncate(snap.text, MAX_SUMMARY_CHARS),
+        thoughts: truncate(snap.thoughts, MAX_SUMMARY_CHARS),
+        toolCalls: snap.tools.map((t) => ({ name: t.name, input: t.input })),
+        error: messageError ? messageError.message : null,
+      };
+    },
+  };
+
+  function consumeFrame(frame) {
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const json = trimmed.slice(5).trim();
+      if (!json) continue;
+      let evt;
+      try { evt = JSON.parse(json); } catch { continue; }
+      onEvent(evt);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server pool — one detached `opencode serve` per working directory
+// ---------------------------------------------------------------------------
+
+const _serverCache = new Map(); // key -> { baseUrl, pid }
+const _spawnLocks = new Map();  // key -> Promise
+
+function readRegistry() {
+  try {
+    const path = openCodeServerRegistryPath();
+    if (!existsSync(path)) return {};
+    const data = JSON.parse(readFileSync(path, 'utf8'));
+    return data && typeof data === 'object' ? data : {};
+  } catch { return {}; }
+}
+
+function writeRegistry(reg) {
+  try {
+    const path = openCodeServerRegistryPath();
+    writeFileSync(path, JSON.stringify(reg, null, 2), { mode: PRIVATE_FILE_MODE });
+    try { chmodSync(path, PRIVATE_FILE_MODE); } catch {}
+  } catch { /* registry is best-effort */ }
+}
+
+function recordServer(key, entry) {
+  const reg = readRegistry();
+  reg[key] = { ...entry, lastUsedAt: Date.now() };
+  writeRegistry(reg);
+}
+
+function forgetServer(key) {
+  const reg = readRegistry();
+  if (key in reg) { delete reg[key]; writeRegistry(reg); }
+  _serverCache.delete(key);
+}
+
+async function probeHealth(baseUrl) {
+  try {
+    const r = await _impl.fetchJson(`${baseUrl}/global/health`, { timeoutMs: HEALTH_PROBE_TIMEOUT_MS });
+    return !!(r.ok && r.data && r.data.healthy);
+  } catch { return false; }
+}
+
+// Is a specific server base URL still listening? Used by restart resume to tell
+// "the original server (and its in-flight turn) survived" from "it is gone".
+export async function probeOpenCodeServerHealth(baseUrl) {
+  if (!baseUrl) return false;
+  return probeHealth(baseUrl);
+}
+
+// Resolve the shared server base URL, reusing a surviving server (this process,
+// then the on-disk registry from a prior bridge) when one is still listening,
+// otherwise spawning a fresh detached one. Concurrent callers share one spawn.
+export async function ensureOpenCodeServer({ env = process.env } = {}) {
+  const key = SHARED_SERVER_KEY;
+
+  const cached = _serverCache.get(key);
+  if (cached && await probeHealth(cached.baseUrl)) {
+    recordServer(key, { ...readRegistry()[key], baseUrl: cached.baseUrl, pid: cached.pid });
+    return { baseUrl: cached.baseUrl, pid: cached.pid, reused: true };
+  }
+
+  const recorded = readRegistry()[key];
+  if (recorded?.baseUrl && await probeHealth(recorded.baseUrl)) {
+    _serverCache.set(key, { baseUrl: recorded.baseUrl, pid: recorded.pid });
+    recordServer(key, recorded);
+    return { baseUrl: recorded.baseUrl, pid: recorded.pid, reused: true };
+  }
+  if (recorded) forgetServer(key);
+
+  if (_spawnLocks.has(key)) return _spawnLocks.get(key);
+  const spawnPromise = spawnServer(key, env).finally(() => _spawnLocks.delete(key));
+  _spawnLocks.set(key, spawnPromise);
+  return spawnPromise;
+}
+
+async function spawnServer(key, env) {
+  const bin = resolveOpenCodeBin(env);
+  const args = ['serve', '--port', '0', '--hostname', '127.0.0.1'];
+  const child = _impl.spawnServer({ bin, args, env });
+  let baseUrl;
+  try {
+    baseUrl = await waitForBootUrl(child);
+  } catch (err) {
+    // Boot timed out or the server exited before listening. Don't leak the
+    // detached child — kill it (SIGTERM, then SIGKILL) before propagating.
+    try { child.kill?.('SIGTERM'); } catch {}
+    const hardKill = setTimeout(() => { try { child.kill?.('SIGKILL'); } catch {} }, 2_000);
+    if (hardKill.unref) hardKill.unref();
+    throw err;
+  }
+  try { child.unref?.(); } catch {}
+  const pid = child.pid || null;
+  _serverCache.set(key, { baseUrl, pid });
+  recordServer(key, { baseUrl, pid, startedAt: Date.now() });
+  return { baseUrl, pid, reused: false };
+}
+
+// Snapshot of the shared server for status/observability.
+export function openCodeServerPoolSnapshot() {
+  const reg = readRegistry();
+  const entry = reg[SHARED_SERVER_KEY] || null;
+  return entry ? { ...entry } : null;
+}
+
+// Best-effort idle reaper: dispose the shared server if it has not been used
+// within `idleMs` and the bridge tracks no live jobs on it. Called opportunisti-
+// cally; failures are swallowed (the server is detached and self-contained).
+export async function reapIdleOpenCodeServer({ idleMs, hasLiveJobs = false } = {}) {
+  if (hasLiveJobs) return false;
+  const reg = readRegistry();
+  const entry = reg[SHARED_SERVER_KEY];
+  if (!entry?.baseUrl || !entry.lastUsedAt) return false;
+  if (Date.now() - entry.lastUsedAt < idleMs) return false;
+  try { await _impl.fetchJson(`${entry.baseUrl}/global/dispose`, { method: 'POST', timeoutMs: HEALTH_PROBE_TIMEOUT_MS }); }
+  catch { /* server may already be gone */ }
+  forgetServer(SHARED_SERVER_KEY);
+  return true;
+}
+
+// Parse the `listening on http://host:port` boot line from the server's stdout.
+function waitForBootUrl(child) {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    let settled = false;
+    const done = (fn, arg) => { if (!settled) { settled = true; cleanup(); fn(arg); } };
+    const onData = (chunk) => {
+      buf += chunk.toString('utf8');
+      const m = buf.match(/listening on\s+(https?:\/\/[^\s]+)/i);
+      if (m) done(resolve, m[1].replace(/\/+$/, ''));
+    };
+    const onErr = (err) => done(reject, err);
+    const onClose = (code) => done(reject, new Error(`opencode serve exited before listening (code ${code})`));
+    const timer = setTimeout(() => done(reject, new Error('opencode serve did not report a listening URL in time')), SERVER_BOOT_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+    function cleanup() {
+      clearTimeout(timer);
+      child.stdout?.off?.('data', onData);
+      child.stderr?.off?.('data', onData);
+      child.off?.('error', onErr);
+      child.off?.('close', onClose);
+    }
+    child.stdout?.on('data', onData);
+    child.stderr?.on('data', onData);
+    child.on('error', onErr);
+    child.on('close', onClose);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Session operations  (all directory-scoped: opencode roots/serves a session by
+// the ?directory= param, NOT by the server's launch cwd)
+// ---------------------------------------------------------------------------
+
+function dirQuery(directory) {
+  return directory ? `?directory=${encodeURIComponent(directory)}` : '';
+}
+
+export async function createOpenCodeSession({ baseUrl, directory = null, title = null }) {
+  const body = {};
+  if (title) body.title = title;
+  const r = await _impl.fetchJson(`${baseUrl}/session${dirQuery(directory)}`, { method: 'POST', body });
+  if (!r.ok || !r.data?.id) {
+    throw new Error(`opencode session create failed: HTTP ${r.status}`);
+  }
+  return r.data.id;
+}
+
+export async function startOpenCodeServerPrompt({ baseUrl, sessionId, directory = null, prompt, model = null, agent = null }) {
+  const body = { parts: [{ type: 'text', text: prompt }] };
+  if (model) body.model = model;
+  if (agent) body.agent = agent;
+  const r = await _impl.fetchJson(`${baseUrl}/session/${encodeURIComponent(sessionId)}/prompt_async${dirQuery(directory)}`, {
+    method: 'POST', body,
+  });
+  if (!r.ok) throw new Error(`opencode prompt_async failed: HTTP ${r.status}`);
+  return r.data || { ok: true };
+}
+
+export async function abortOpenCodeSession({ baseUrl, sessionId, directory = null }) {
+  try {
+    const r = await _impl.fetchJson(`${baseUrl}/session/${encodeURIComponent(sessionId)}/abort${dirQuery(directory)}`, { method: 'POST' });
+    return { ok: r.ok, aborted: r.data === true || r.ok };
+  } catch (err) {
+    return { ok: false, aborted: false, error: err.message };
+  }
+}
+
+// session-level busy/idle, directory-scoped. Returns 'busy' | 'idle' | 'unknown'.
+// `/session/status` reports `{ "<sessionID>": { type: "busy" } }` for running
+// sessions and `{}` when idle.
+export async function getOpenCodeSessionStatus({ baseUrl, sessionId, directory = null }) {
+  try {
+    const r = await _impl.fetchJson(`${baseUrl}/session/status${dirQuery(directory)}`, { timeoutMs: HEALTH_PROBE_TIMEOUT_MS });
+    if (!r.ok || !r.data || typeof r.data !== 'object') return 'unknown';
+    const entry = r.data[sessionId];
+    if (!entry) return 'idle';
+    return entry.type === 'busy' ? 'busy' : 'idle';
+  } catch { return 'unknown'; }
+}
+
+// Build a terminal/partial transcript snapshot from the persisted message list.
+// Used for resume (turn already finished while bridge was down) and digests.
+// The message list reads without the directory param.
+export async function loadOpenCodeTranscript({ baseUrl, sessionId, directory = null }) {
+  const r = await _impl.fetchJson(`${baseUrl}/session/${encodeURIComponent(sessionId)}/message${dirQuery(directory)}`, { timeoutMs: 10_000 });
+  if (!r.ok || !Array.isArray(r.data)) return { completed: false, summary: emptySummary(), found: false };
+  const assistant = [...r.data].reverse().find((m) => m?.info?.role === 'assistant');
+  if (!assistant) return { completed: false, summary: emptySummary(), found: r.data.length > 0 };
+  const parts = assistant.parts || [];
+  const text = parts.filter((p) => p.type === 'text' && !p.synthetic && !p.ignored).map((p) => p.text).join('');
+  const thoughts = parts.filter((p) => p.type === 'reasoning').map((p) => p.text).join('');
+  const tools = parts.filter((p) => p.type === 'tool').map((p) => ({ name: p.tool || p.name || 'tool', input: p.state?.input || p.input || {} }));
+  const err = assistant.info.error;
+  return {
+    found: true,
+    completed: !!assistant.info?.time?.completed || !!err,
+    aborted: !!(err && /abort/i.test(err.name || err.type || '')),
+    error: err ? (err.message || err.name || 'error') : null,
+    summary: {
+      message: truncate(text, MAX_SUMMARY_CHARS),
+      thoughts: truncate(thoughts, MAX_SUMMARY_CHARS),
+      toolCalls: tools,
+      stopReason: 'idle',
+      error: err ? (err.message || err.name || 'error') : null,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Turn watcher — subscribe to /event?directory, resolve on terminal
+// ---------------------------------------------------------------------------
+//
+// `openOpenCodeTurnWatcher` is async: it resolves once the directory-scoped SSE
+// connection is established, so the caller can safely fire prompt_async without
+// racing session.idle. It returns a `done` promise that settles with the
+// terminal envelope. Detection is level- AND edge-triggered:
+//   - level: an optional immediate /session/status + transcript check closes the
+//     "session.idle fired before we subscribed" race (the /event stream has no
+//     replay/since cursor), needed by restart resume.
+//   - edge: the SSE accumulator resolves on session.idle / session.error.
+//   - fallback: a stream that drops without a terminal frame re-probes status +
+//     health to distinguish a finished turn from a dead server.
+
+export async function openOpenCodeTurnWatcher({ baseUrl, sessionId, directory = null, onEvent = null, timeoutMs = null, initialLevelCheck = false }) {
+  const ac = new AbortController();
+  const acc = createTurnAccumulator(sessionId);
+
+  // Establish the subscription first (this await = "connected"). Stream/TCP
+  // buffering preserves any frames that land before we start iterating.
+  const stream = await _impl.openEventStream(`${baseUrl}/event${dirQuery(directory)}`, { signal: ac.signal });
+
+  // Resume path: the turn may already be terminal. Check level state up front.
+  let preTerminal = null;
+  if (initialLevelCheck) {
+    preTerminal = await levelTerminal({ baseUrl, sessionId, directory });
+  }
+
+  let timer = null;
+  let timedOut = false;
+
+  const done = (async () => {
+    if (preTerminal) { try { ac.abort(); } catch {} return preTerminal; }
+    if (timeoutMs && timeoutMs > 0) {
+      timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
+      if (timer?.unref) timer.unref();
+    }
+    try {
+      for await (const chunk of stream) {
+        acc.push(chunk);
+        if (onEvent) { try { onEvent(acc.snapshot()); } catch {} }
+        if (acc.terminal) break;
+      }
+      acc.flush();
+    } catch (err) {
+      if (!timedOut) {
+        return acc.terminal
+          ? finalize(acc, { status: acc.terminal.status, stopReason: 'idle' })
+          : streamDropFallback(acc, { baseUrl, sessionId, directory, error: err.message });
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+      try { ac.abort(); } catch {}
+    }
+    if (timedOut && !acc.terminal) {
+      return finalize(acc, { status: 'timeout', error: 'opencode turn watch timed out', stopReason: 'timeout' });
+    }
+    if (!acc.terminal) {
+      return streamDropFallback(acc, { baseUrl, sessionId, directory, error: 'opencode /event stream closed before session.idle' });
+    }
+    return finalize(acc, { status: acc.terminal.status, stopReason: 'idle' });
+  })();
+
+  return { done, close: () => { try { ac.abort(); } catch {} } };
+}
+
+// Level check: if the session is idle/absent and its transcript shows a completed
+// (or errored/aborted) assistant message, return a terminal envelope from the
+// transcript. Otherwise null (turn still running or indeterminate).
+async function levelTerminal({ baseUrl, sessionId, directory }) {
+  const status = await getOpenCodeSessionStatus({ baseUrl, sessionId, directory });
+  if (status === 'busy') return null;
+  let transcript = null;
+  try { transcript = await loadOpenCodeTranscript({ baseUrl, sessionId, directory }); } catch { return null; }
+  if (!transcript?.completed) return null;
+  return transcriptEnvelope(transcript);
+}
+
+// Stream dropped without a terminal frame. Distinguish a finished turn (status
+// idle + completed transcript) from a dead server (health fails) from a genuinely
+// indeterminate drop.
+async function streamDropFallback(acc, { baseUrl, sessionId, directory, error }) {
+  const status = await getOpenCodeSessionStatus({ baseUrl, sessionId, directory });
+  if (status === 'idle') {
+    try {
+      const transcript = await loadOpenCodeTranscript({ baseUrl, sessionId, directory });
+      if (transcript?.completed) return transcriptEnvelope(transcript);
+    } catch { /* fall through */ }
+  }
+  const alive = await probeHealth(baseUrl);
+  if (!alive) {
+    return finalize(acc, { status: 'unreachable', error: 'opencode server is gone; the in-flight turn was lost', stopReason: 'server-gone' });
+  }
+  return finalize(acc, { status: 'unreachable', error: error || 'opencode /event stream closed before session.idle', stopReason: 'stream-closed' });
+}
+
+function transcriptEnvelope(transcript) {
+  const status = transcript.aborted ? 'cancelled' : (transcript.error ? 'failed' : 'completed');
+  return {
+    status,
+    summary: transcript.summary,
+    error: status === 'failed' ? transcript.error : null,
+    stdout: transcript.summary?.message || '',
+    stderr: '',
+  };
+}
+
+function finalize(acc, { status, error = null, stopReason }) {
+  const snap = acc.snapshot();
+  const message = snap.message || '';
+  const summary = {
+    message,
+    thoughts: snap.thoughts || '',
+    toolCalls: snap.toolCalls || [],
+    stopReason,
+    error: error || snap.error || null,
+  };
+  return {
+    status,
+    summary,
+    error: status === 'failed' || status === 'unreachable' || status === 'timeout' ? (error || snap.error || null) : null,
+    stdout: message,
+    stderr: '',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+function emptySummary() {
+  return { message: '', thoughts: '', toolCalls: [], stopReason: 'idle', error: null };
+}
+
+function truncate(s, n) {
+  const text = String(s || '');
+  return text.length > n ? `${text.slice(0, n)}\n\n[truncated ${text.length - n} chars]` : text;
+}
+
+export { MAX_TRANSCRIPT_CHARS };
